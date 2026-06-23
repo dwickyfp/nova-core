@@ -20,3 +20,7 @@ tonic = "0.12"
 sqlparser = "0.52"
 argon2 = "0.5"
 foyer = { workspace = true }
+object_store.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
