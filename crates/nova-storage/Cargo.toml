@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 foyer = { workspace = true }
 chrono = "0.4"
+sled = "0.34"
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

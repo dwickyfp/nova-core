@@ -4,5 +4,5 @@ pub mod error;
 pub mod types;
 
 // Re-exports
-pub use error::NovaError;
+pub use error::{NovaError, Result};
 pub use types::*;

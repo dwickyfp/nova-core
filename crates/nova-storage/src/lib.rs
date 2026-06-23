@@ -7,6 +7,6 @@ pub mod mp_writer;
 
 // Re-exports
 pub use cache::NovaCache;
-pub use metadata::MetadataStore;
+pub use metadata::{MetadataStore, sled_store::SledMetadataStore};
 pub use mp_reader::MpReader;
 pub use mp_writer::MpWriter;
