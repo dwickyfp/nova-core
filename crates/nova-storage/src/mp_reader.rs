@@ -15,6 +15,14 @@ pub struct MpReader {
     batch_size: usize,
 }
 
+impl std::fmt::Debug for MpReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("MpReader")
+            .field("batch_size", &self.batch_size)
+            .finish()
+    }
+}
+
 impl MpReader {
     /// Create a new MpReader.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {

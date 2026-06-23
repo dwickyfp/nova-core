@@ -17,3 +17,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 foyer = { workspace = true }
 tonic = "0.12"
+futures = "0.3.32"
+tokio-stream = "0.1.18"
+
+[dev-dependencies]
+tempfile = "3.27.0"
