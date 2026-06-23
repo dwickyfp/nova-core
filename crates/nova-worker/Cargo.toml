@@ -1,0 +1,19 @@
+[package]
+name = "nova-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-common = { path = "../nova-common" }
+nova-storage = { path = "../nova-storage" }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+foyer = { workspace = true }
+tonic = "0.12"

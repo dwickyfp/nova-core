@@ -1,0 +1,22 @@
+[package]
+name = "nova-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-common = { path = "../nova-common" }
+nova-storage = { path = "../nova-storage" }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+figment = { workspace = true }
+axum = "0.8"
+tonic = "0.12"
+sqlparser = "0.52"
+argon2 = "0.5"
+foyer = { workspace = true }

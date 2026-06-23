@@ -1,0 +1,22 @@
+[package]
+name = "nova-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nova-common = { path = "../nova-common" }
+arrow = { workspace = true }
+parquet = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+foyer = { workspace = true }
+chrono = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"

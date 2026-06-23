@@ -1,0 +1,37 @@
+# nova-core configuration
+# Copy to config.toml and adjust values.
+
+[coordinator]
+mysql_port = 4406
+http_port = 8080
+grpc_port = 50050
+raft_port = 50060
+
+[worker]
+grpc_port = 50051
+batch_size = 8192
+memory_limit_bytes = 8589934592  # 8GB
+cache_ssd_path = "/data/cache"
+
+[storage]
+bucket = "nova"
+endpoint = "http://localhost:9000"
+access_key = "minioadmin"
+secret_key = "minioadmin"
+region = "us-east-1"
+
+[metadata]
+fdb_cluster_file = "/etc/fdb/fdb.cluster"
+retention_days = 7
+
+[cache]
+result_cache_memory_bytes = 2147483648    # 2GB
+result_cache_ssd_bytes = 53687091200      # 50GB
+mp_cache_memory_bytes = 4294967296        # 4GB
+mp_cache_ssd_bytes = 107374182400         # 100GB
+meta_cache_memory_bytes = 536870912       # 512MB
+
+[auth]
+enabled = false
+default_username = "root"
+default_password_hash = ""
