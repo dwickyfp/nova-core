@@ -4,6 +4,7 @@ pub mod analyzer;
 pub mod auth;
 pub mod cache;
 pub mod executor;
+pub mod mp_pruning;
 pub mod mysql_server;
 pub mod optimizer;
 pub mod parser;
