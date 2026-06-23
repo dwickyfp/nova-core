@@ -291,4 +291,51 @@ mod tests {
         let n_partitions = exec.properties().partitioning.partition_count();
         assert_eq!(n_partitions, 1);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_parallel_multiple_mps() {
+        // Write 5 separate MPs (each with 3 rows = 15 total)
+        let dir = TempDir::new().unwrap();
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let writer = MpWriter::new(store.clone(), "test".to_string());
+        let schema = test_schema();
+
+        let mut mps = Vec::new();
+        for i in 0..5u64 {
+            let batch = test_batch(); // 3 rows each
+            let mp = writer.write(1, i + 1, i + 1, &[batch], 1).await.unwrap();
+            mps.push(mp);
+        }
+
+        let reader = Arc::new(MpReader::new(store));
+
+        // Verify: 5 MPs = 5 partitions
+        let exec = MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader.clone());
+        assert_eq!(exec.properties().partitioning.partition_count(), 5);
+
+        // Execute all 5 partitions in parallel and collect results
+        let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+        let mut handles = Vec::new();
+        for part in 0..5 {
+            let exec_clone =
+                MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader.clone());
+            let ctx_clone = ctx.clone();
+            handles.push(tokio::task::spawn(async move {
+                let mut stream = exec_clone.execute(part, ctx_clone).unwrap();
+                let mut rows = 0;
+                while let Some(batch) = futures::StreamExt::next(&mut stream).await {
+                    rows += batch.unwrap().num_rows();
+                }
+                rows
+            }));
+        }
+
+        // All 5 partitions should return 3 rows each = 15 total
+        let mut total = 0;
+        for h in handles {
+            total += h.await.unwrap();
+        }
+        assert_eq!(total, 15);
+    }
 }
