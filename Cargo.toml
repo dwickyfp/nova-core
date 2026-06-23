@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nova-common",
+    "crates/nova-storage",
+    "crates/nova-coordinator",
+    "crates/nova-worker",
+    "crates/nova-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["Dwicky Feriansyah Putra"]
+
+[workspace.dependencies]
+# Arrow + DataFusion
+arrow = { version = "54", features = ["prettyprint"] }
+parquet = { version = "54", features = ["async"] }
+datafusion = "45"
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Cache
+foyer = "0.16"
+
+# Config
+figment = { version = "0.10", features = ["toml", "env"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
