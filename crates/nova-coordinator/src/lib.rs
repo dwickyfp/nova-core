@@ -9,6 +9,7 @@ pub mod mysql_server;
 pub mod optimizer;
 pub mod parser;
 pub mod planner;
+pub mod raft;
 pub mod scheduler;
 pub mod statistics;
 pub mod txn_manager;
