@@ -11,6 +11,7 @@ pub mod parser;
 pub mod planner;
 pub mod scheduler;
 pub mod statistics;
+pub mod txn_manager;
 
 // Re-exports
 pub use executor::Executor;
