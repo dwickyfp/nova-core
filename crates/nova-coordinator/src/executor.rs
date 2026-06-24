@@ -1093,4 +1093,302 @@ mod tests {
             panic!("expected Rows");
         }
     }
+    #[tokio::test]
+    async fn test_update_cow() {
+        let (executor, _dir) = setup();
+
+        // Create database + table + insert data
+        executor
+            .execute(ResolvedStatement::CreateDatabase {
+                name: "db".to_string(),
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::CreateTable {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "users".to_string(),
+                columns: vec![
+                    ResolvedColumn {
+                        name: "id".to_string(),
+                        data_type: "INT".to_string(),
+                        nullable: false,
+                    },
+                    ResolvedColumn {
+                        name: "name".to_string(),
+                        data_type: "VARCHAR".to_string(),
+                        nullable: false,
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::Insert {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "users".to_string(),
+                values: vec![
+                    vec![
+                        ResolvedExpr::Int64(1),
+                        ResolvedExpr::String("alice".to_string()),
+                    ],
+                    vec![
+                        ResolvedExpr::Int64(2),
+                        ResolvedExpr::String("bob".to_string()),
+                    ],
+                ],
+            })
+            .await
+            .unwrap();
+
+        // UPDATE users SET name = 'updated' WHERE id = 1
+        let result = executor
+            .execute(ResolvedStatement::Update {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "users".to_string(),
+                assignments: vec![(
+                    "name".to_string(),
+                    ResolvedExpr::String("updated".to_string()),
+                )],
+                filter: Some(ResolvedFilter {
+                    column: "id".to_string(),
+                    op: "=".to_string(),
+                    value: ResolvedExpr::Int64(1),
+                }),
+            })
+            .await
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert!(rows[0][0].contains("UPDATE OK"));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_cow() {
+        let (executor, _dir) = setup();
+
+        executor
+            .execute(ResolvedStatement::CreateDatabase {
+                name: "db".to_string(),
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::CreateTable {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "items".to_string(),
+                columns: vec![ResolvedColumn {
+                    name: "id".to_string(),
+                    data_type: "INT".to_string(),
+                    nullable: false,
+                }],
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::Insert {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "items".to_string(),
+                values: vec![
+                    vec![ResolvedExpr::Int64(1)],
+                    vec![ResolvedExpr::Int64(2)],
+                    vec![ResolvedExpr::Int64(3)],
+                ],
+            })
+            .await
+            .unwrap();
+
+        // DELETE FROM items WHERE id = 2
+        let result = executor
+            .execute(ResolvedStatement::Delete {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "items".to_string(),
+                filter: Some(ResolvedFilter {
+                    column: "id".to_string(),
+                    op: "=".to_string(),
+                    value: ResolvedExpr::Int64(2),
+                }),
+            })
+            .await
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert!(rows[0][0].contains("DELETE OK"));
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clone_zero_copy() {
+        let (executor, _dir) = setup();
+
+        executor
+            .execute(ResolvedStatement::CreateDatabase {
+                name: "db".to_string(),
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::CreateTable {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "source".to_string(),
+                columns: vec![ResolvedColumn {
+                    name: "id".to_string(),
+                    data_type: "INT".to_string(),
+                    nullable: false,
+                }],
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::Insert {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "source".to_string(),
+                values: vec![vec![ResolvedExpr::Int64(42)]],
+            })
+            .await
+            .unwrap();
+
+        // CLONE source → clone_table
+        let result = executor
+            .execute(ResolvedStatement::CreateClone {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                clone_table: "clone_table".to_string(),
+                source_table: "source".to_string(),
+                at_timestamp: None,
+            })
+            .await
+            .unwrap();
+
+        match result {
+            QueryResult::Success { message } => {
+                assert!(message.contains("zero-copy"));
+                assert!(message.contains("1 MPs"));
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_stream() {
+        let (executor, _dir) = setup();
+
+        executor
+            .execute(ResolvedStatement::CreateDatabase {
+                name: "db".to_string(),
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::CreateTable {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "events".to_string(),
+                columns: vec![ResolvedColumn {
+                    name: "id".to_string(),
+                    data_type: "INT".to_string(),
+                    nullable: false,
+                }],
+            })
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute(ResolvedStatement::CreateStream {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                stream_name: "events_stream".to_string(),
+                table: "events".to_string(),
+                append_only: true,
+            })
+            .await
+            .unwrap();
+
+        match result {
+            QueryResult::Success { message } => {
+                assert!(message.contains("events_stream"));
+                assert!(message.contains("append_only=true"));
+            }
+            _ => panic!("expected Success"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_time_travel_select() {
+        let (executor, _dir) = setup();
+
+        executor
+            .execute(ResolvedStatement::CreateDatabase {
+                name: "db".to_string(),
+            })
+            .await
+            .unwrap();
+
+        executor
+            .execute(ResolvedStatement::CreateTable {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "history".to_string(),
+                columns: vec![ResolvedColumn {
+                    name: "id".to_string(),
+                    data_type: "INT".to_string(),
+                    nullable: false,
+                }],
+            })
+            .await
+            .unwrap();
+
+        // Insert data
+        executor
+            .execute(ResolvedStatement::Insert {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "history".to_string(),
+                values: vec![vec![ResolvedExpr::Int64(1)]],
+            })
+            .await
+            .unwrap();
+
+        // SELECT with at_timestamp = 0 (before any data) → should return empty
+        let result = executor
+            .execute(ResolvedStatement::Select {
+                db: "db".to_string(),
+                schema: "public".to_string(),
+                table: "history".to_string(),
+                projection: vec!["id".to_string()],
+                filter: None,
+                at_timestamp: Some(1), // very early timestamp
+            })
+            .await
+            .unwrap();
+
+        match result {
+            QueryResult::Rows { rows, .. } => {
+                assert!(rows.is_empty(), "Time Travel to t=1 should return no data");
+            }
+            _ => panic!("expected Rows"),
+        }
+    }
 }
