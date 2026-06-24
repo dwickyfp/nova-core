@@ -1,6 +1,6 @@
 // Analyzer — resolve table/column names, check types.
 
-use nova_common::{NovaError, Result};
+use nova_common::{NovaError, Result, Timestamp};
 use sqlparser::ast::Statement;
 
 /// Resolved SQL statement ready for execution.
@@ -27,6 +27,7 @@ pub enum ResolvedStatement {
         table: String,
         projection: Vec<String>,
         filter: Option<ResolvedFilter>,
+        at_timestamp: Option<Timestamp>,
     },
     Update {
         db: String,
@@ -182,6 +183,7 @@ impl Analyzer {
                         table: table_name,
                         projection,
                         filter: None,
+                        at_timestamp: None,
                     })
                 } else {
                     Err(NovaError::SqlAnalysisError {

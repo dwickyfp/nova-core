@@ -56,8 +56,12 @@ impl Executor {
                 schema,
                 table,
                 projection,
+                at_timestamp,
                 ..
-            } => self.exec_select(db, schema, table, projection).await,
+            } => {
+                self.exec_select(db, schema, table, projection, at_timestamp)
+                    .await
+            }
             ResolvedStatement::Update {
                 db,
                 schema,
@@ -212,11 +216,15 @@ impl Executor {
         schema: String,
         table: String,
         projection: Vec<String>,
+        at_timestamp: Option<u64>,
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(&db, &schema, &table).await?;
 
-        // Get active micro-partitions
-        let mps = self.meta.get_active_mps(table_meta.id).await?;
+        // Get MPs: active for current, or at specific timestamp for Time Travel
+        let mps = match at_timestamp {
+            Some(ts) => self.meta.get_mps_at_timestamp(table_meta.id, ts).await?,
+            None => self.meta.get_active_mps(table_meta.id).await?,
+        };
         if mps.is_empty() {
             let cols = if projection.contains(&"*".to_string()) {
                 table_meta.columns.iter().map(|c| c.name.clone()).collect()
@@ -906,6 +914,7 @@ mod tests {
                 table: "users".to_string(),
                 projection: vec!["id".to_string(), "name".to_string()],
                 filter: None,
+                at_timestamp: None,
             })
             .await
             .unwrap();
