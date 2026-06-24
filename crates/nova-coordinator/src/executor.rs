@@ -88,6 +88,16 @@ impl Executor {
                 self.exec_clone(&db, &schema, &clone_table, &source_table, at_timestamp)
                     .await
             }
+            ResolvedStatement::CreateStream {
+                db,
+                schema,
+                stream_name,
+                table,
+                append_only,
+            } => {
+                self.exec_create_stream(&db, &schema, &stream_name, &table, append_only)
+                    .await
+            }
         }
     }
 
@@ -680,6 +690,35 @@ impl Executor {
                 clone_table,
                 source_table,
                 source_mps.len()
+            ),
+        })
+    }
+
+    /// CREATE STREAM: register a CDC stream on a table.
+    /// Stream tracks changes (INSERT/UPDATE/DELETE) via MP version diffs.
+    async fn exec_create_stream(
+        &self,
+        db: &str,
+        schema: &str,
+        stream_name: &str,
+        table: &str,
+        append_only: bool,
+    ) -> Result<QueryResult> {
+        let table_meta = self.find_table(db, schema, table).await?;
+
+        let stream = StreamMeta {
+            stream_id: 0, // auto-assigned
+            table_id: table_meta.id,
+            name: stream_name.to_string(),
+            append_only,
+            created_at: now_micros(),
+        };
+        self.meta.create_stream(stream).await?;
+
+        Ok(QueryResult::Success {
+            message: format!(
+                "Stream '{}' created on table '{}' (append_only={})",
+                stream_name, table, append_only
             ),
         })
     }

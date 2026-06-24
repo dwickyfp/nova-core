@@ -49,6 +49,13 @@ pub enum ResolvedStatement {
         source_table: String,
         at_timestamp: Option<Timestamp>,
     },
+    CreateStream {
+        db: String,
+        schema: String,
+        stream_name: String,
+        table: String,
+        append_only: bool,
+    },
 }
 
 #[derive(Debug)]
