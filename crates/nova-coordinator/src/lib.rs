@@ -10,6 +10,7 @@ pub mod optimizer;
 pub mod parser;
 pub mod planner;
 pub mod scheduler;
+pub mod statistics;
 
 // Re-exports
 pub use executor::Executor;
