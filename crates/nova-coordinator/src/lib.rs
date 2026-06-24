@@ -2,6 +2,7 @@
 
 pub mod analyzer;
 pub mod auth;
+pub mod auto_scaling;
 pub mod cache;
 pub mod distributed;
 pub mod executor;
