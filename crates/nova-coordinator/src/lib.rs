@@ -4,6 +4,7 @@ pub mod analyzer;
 pub mod auth;
 pub mod auto_scaling;
 pub mod cache;
+pub mod cbo;
 pub mod distributed;
 pub mod executor;
 pub mod mp_pruning;
