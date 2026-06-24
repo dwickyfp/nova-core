@@ -3,6 +3,7 @@
 pub mod analyzer;
 pub mod auth;
 pub mod cache;
+pub mod distributed;
 pub mod executor;
 pub mod mp_pruning;
 pub mod mysql_server;
