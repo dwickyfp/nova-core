@@ -11,6 +11,7 @@ pub mod executor;
 pub mod mp_pruning;
 pub mod mysql_server;
 pub mod optimizer;
+pub mod optimizer_rules;
 pub mod parser;
 pub mod planner;
 pub mod raft;
