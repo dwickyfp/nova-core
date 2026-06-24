@@ -13,6 +13,7 @@ pub mod raft;
 pub mod scheduler;
 pub mod statistics;
 pub mod txn_manager;
+pub mod worker_pool;
 
 // Re-exports
 pub use executor::Executor;

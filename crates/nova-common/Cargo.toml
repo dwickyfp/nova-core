@@ -11,3 +11,5 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
+tonic = "0.14.6"
+prost = "0.14.4"
