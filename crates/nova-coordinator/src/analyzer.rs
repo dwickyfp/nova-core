@@ -42,6 +42,13 @@ pub enum ResolvedStatement {
         table: String,
         filter: Option<ResolvedFilter>,
     },
+    CreateClone {
+        db: String,
+        schema: String,
+        clone_table: String,
+        source_table: String,
+        at_timestamp: Option<Timestamp>,
+    },
 }
 
 #[derive(Debug)]

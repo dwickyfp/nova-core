@@ -78,6 +78,16 @@ impl Executor {
                 table,
                 filter,
             } => self.exec_delete(&db, &schema, &table, filter).await,
+            ResolvedStatement::CreateClone {
+                db,
+                schema,
+                clone_table,
+                source_table,
+                at_timestamp,
+            } => {
+                self.exec_clone(&db, &schema, &clone_table, &source_table, at_timestamp)
+                    .await
+            }
         }
     }
 
@@ -594,6 +604,84 @@ impl Executor {
         }
 
         Ok(mask)
+    }
+
+    /// CLONE: Zero-copy table duplication.
+    /// Copies metadata entries (same S3 paths, no data copy).
+    /// Supports AT(TIMESTAMP => ...) for cloning at a point in time.
+    async fn exec_clone(
+        &self,
+        db: &str,
+        schema: &str,
+        clone_table: &str,
+        source_table: &str,
+        at_timestamp: Option<u64>,
+    ) -> Result<QueryResult> {
+        let source_meta = self.find_table(db, schema, source_table).await?;
+
+        // Get source MPs (current or at timestamp)
+        let source_mps = match at_timestamp {
+            Some(ts) => self.meta.get_mps_at_timestamp(source_meta.id, ts).await?,
+            None => self.meta.get_active_mps(source_meta.id).await?,
+        };
+
+        // Create clone table with same schema as source
+        let clone_meta = TableMeta {
+            id: 0, // auto-assigned
+            db_id: source_meta.db_id,
+            schema_id: source_meta.schema_id,
+            name: clone_table.to_string(),
+            columns: source_meta.columns.clone(),
+            created_at: now_micros(),
+            owner: source_meta.owner,
+            comment: Some(format!("Clone of {}", source_table)),
+            version: 0,
+            properties: source_meta.properties.clone(),
+        };
+        self.meta.create_table(clone_meta).await?;
+
+        // Re-fetch to get the assigned table ID
+        let created = self.find_table(db, schema, clone_table).await?;
+
+        // Link source MPs to clone (zero-copy: same S3 paths)
+        for mp in &source_mps {
+            let clone_mp = MicroPartitionMeta {
+                mp_id: 0, // auto-assigned
+                table_id: created.id,
+                partition_id: mp.partition_id,
+                version: mp.version,
+                s3_path: mp.s3_path.clone(), // same S3 path — zero copy!
+                s3_temp_path: None,
+                row_count: mp.row_count,
+                byte_size: mp.byte_size,
+                compression: mp.compression,
+                column_stats: mp.column_stats.clone(),
+                commit_ts: mp.commit_ts,
+                txn_id: mp.txn_id,
+                supersedes: None,
+                superseded_by: None,
+                active: true,
+            };
+            self.meta.insert_mp(clone_mp).await?;
+        }
+
+        // Record clone relationship
+        self.meta
+            .create_clone(CloneMeta {
+                clone_table_id: created.id,
+                source_table_id: source_meta.id,
+                clone_ts: now_micros(),
+            })
+            .await?;
+
+        Ok(QueryResult::Success {
+            message: format!(
+                "Table {} cloned from {} ({} MPs, zero-copy)",
+                clone_table,
+                source_table,
+                source_mps.len()
+            ),
+        })
     }
 
     async fn find_table(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
