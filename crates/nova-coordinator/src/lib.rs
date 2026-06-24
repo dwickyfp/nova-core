@@ -13,6 +13,7 @@ pub mod optimizer;
 pub mod parser;
 pub mod planner;
 pub mod raft;
+pub mod runtime_filter;
 pub mod scheduler;
 pub mod statistics;
 pub mod txn_manager;
