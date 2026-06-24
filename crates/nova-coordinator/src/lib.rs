@@ -1,5 +1,6 @@
 //! nova-coordinator — SQL parsing, optimization, planning, scheduling.
 
+pub mod advanced_stats;
 pub mod analyzer;
 pub mod auth;
 pub mod auto_scaling;
