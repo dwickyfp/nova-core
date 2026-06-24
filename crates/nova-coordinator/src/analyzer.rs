@@ -28,6 +28,19 @@ pub enum ResolvedStatement {
         projection: Vec<String>,
         filter: Option<ResolvedFilter>,
     },
+    Update {
+        db: String,
+        schema: String,
+        table: String,
+        assignments: Vec<(String, ResolvedExpr)>,
+        filter: Option<ResolvedFilter>,
+    },
+    Delete {
+        db: String,
+        schema: String,
+        table: String,
+        filter: Option<ResolvedFilter>,
+    },
 }
 
 #[derive(Debug)]
@@ -176,9 +189,104 @@ impl Analyzer {
                     })
                 }
             }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => {
+                let table_name = match &table.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => {
+                        name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+                    }
+                    _ => {
+                        return Err(NovaError::SqlAnalysisError {
+                            message: "unsupported table in UPDATE".to_string(),
+                        });
+                    }
+                };
+                let resolved_assignments = assignments
+                    .iter()
+                    .map(|a| {
+                        let col = match &a.target {
+                            sqlparser::ast::AssignmentTarget::ColumnName(name) => {
+                                name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+                            }
+                            _ => String::new(),
+                        };
+                        let val = self.resolve_expr(&a.value)?;
+                        Ok((col, val))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let filter = selection.as_ref().and_then(|s| self.resolve_filter(s));
+                Ok(ResolvedStatement::Update {
+                    db: self.default_db.clone(),
+                    schema: self.default_schema.clone(),
+                    table: table_name,
+                    assignments: resolved_assignments,
+                    filter,
+                })
+            }
+            Statement::Delete(delete) => {
+                let from = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables)
+                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                        tables.first().ok_or_else(|| NovaError::SqlAnalysisError {
+                            message: "missing table in DELETE".to_string(),
+                        })?
+                    }
+                };
+                let table = match &from.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => {
+                        name.0.last().map(|i| i.value.clone()).unwrap_or_default()
+                    }
+                    _ => {
+                        return Err(NovaError::SqlAnalysisError {
+                            message: "unsupported table in DELETE".to_string(),
+                        });
+                    }
+                };
+                let filter = delete
+                    .selection
+                    .as_ref()
+                    .and_then(|s| self.resolve_filter(s));
+                Ok(ResolvedStatement::Delete {
+                    db: self.default_db.clone(),
+                    schema: self.default_schema.clone(),
+                    table,
+                    filter,
+                })
+            }
             _ => Err(NovaError::SqlAnalysisError {
                 message: format!("unsupported statement: {:?}", stmt),
             }),
+        }
+    }
+
+    fn resolve_filter(&self, expr: &sqlparser::ast::Expr) -> Option<ResolvedFilter> {
+        match expr {
+            sqlparser::ast::Expr::BinaryOp { left, op, right } => {
+                let col = match left.as_ref() {
+                    sqlparser::ast::Expr::Identifier(id) => id.value.clone(),
+                    _ => return None,
+                };
+                let val = self.resolve_expr(right).ok()?;
+                let op_str = match op {
+                    sqlparser::ast::BinaryOperator::Eq => "=",
+                    sqlparser::ast::BinaryOperator::NotEq => "!=",
+                    sqlparser::ast::BinaryOperator::Gt => ">",
+                    sqlparser::ast::BinaryOperator::GtEq => ">=",
+                    sqlparser::ast::BinaryOperator::Lt => "<",
+                    sqlparser::ast::BinaryOperator::LtEq => "<=",
+                    _ => return None,
+                };
+                Some(ResolvedFilter {
+                    column: col,
+                    op: op_str.to_string(),
+                    value: val,
+                })
+            }
+            _ => None,
         }
     }
 

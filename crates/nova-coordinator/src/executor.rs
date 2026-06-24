@@ -1,6 +1,6 @@
 // Executor — wire resolved SQL statements to storage layer.
 
-use crate::analyzer::{ResolvedExpr, ResolvedStatement};
+use crate::analyzer::{ResolvedExpr, ResolvedFilter, ResolvedStatement};
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use nova_common::*;
@@ -58,6 +58,22 @@ impl Executor {
                 projection,
                 ..
             } => self.exec_select(db, schema, table, projection).await,
+            ResolvedStatement::Update {
+                db,
+                schema,
+                table,
+                assignments,
+                filter,
+            } => {
+                self.exec_update(&db, &schema, &table, assignments, filter)
+                    .await
+            }
+            ResolvedStatement::Delete {
+                db,
+                schema,
+                table,
+                filter,
+            } => self.exec_delete(&db, &schema, &table, filter).await,
         }
     }
 
@@ -254,6 +270,322 @@ impl Executor {
             columns: result_columns,
             rows,
         })
+    }
+
+    /// UPDATE: Copy-on-Write. Read affected MPs → modify rows → write new MP → mark old superseded.
+    async fn exec_update(
+        &self,
+        db: &str,
+        schema: &str,
+        table: &str,
+        assignments: Vec<(String, ResolvedExpr)>,
+        filter: Option<ResolvedFilter>,
+    ) -> Result<QueryResult> {
+        let table_meta = self.find_table(db, schema, table).await?;
+        let mps = self.meta.get_active_mps(table_meta.id).await?;
+
+        // For each MP: read, apply UPDATE to matching rows, write new MP
+        for mp in &mps {
+            let batches = self.reader.read(mp, None).await?;
+            let mut modified_batches = Vec::new();
+            for batch in batches {
+                let modified =
+                    self.apply_update_to_batch(&batch, &assignments, &filter, &table_meta)?;
+                modified_batches.push(modified);
+            }
+            // Write new MP
+            let new_mp = self
+                .writer
+                .write(
+                    table_meta.id,
+                    mp.mp_id + 1000,
+                    mp.version + 1,
+                    &modified_batches,
+                    1,
+                )
+                .await?;
+            // Mark old MP as superseded
+            self.meta.mark_superseded(mp.mp_id, new_mp.mp_id).await?;
+        }
+
+        Ok(QueryResult::Rows {
+            columns: vec!["status".to_string()],
+            rows: vec![vec!["UPDATE OK".to_string()]],
+        })
+    }
+
+    /// DELETE: Copy-on-Write. Read affected MPs → filter out matching rows → write new MP → mark old superseded.
+    async fn exec_delete(
+        &self,
+        db: &str,
+        schema: &str,
+        table: &str,
+        filter: Option<ResolvedFilter>,
+    ) -> Result<QueryResult> {
+        let table_meta = self.find_table(db, schema, table).await?;
+        let mps = self.meta.get_active_mps(table_meta.id).await?;
+
+        for mp in &mps {
+            let batches = self.reader.read(mp, None).await?;
+            let mut kept_batches = Vec::new();
+            for batch in batches {
+                let kept = self.apply_delete_to_batch(&batch, &filter, &table_meta)?;
+                if kept.num_rows() > 0 {
+                    kept_batches.push(kept);
+                }
+            }
+            // Write new MP only if there are remaining rows
+            if !kept_batches.is_empty() {
+                let new_mp = self
+                    .writer
+                    .write(
+                        table_meta.id,
+                        mp.mp_id + 1000,
+                        mp.version + 1,
+                        &kept_batches,
+                        1,
+                    )
+                    .await?;
+                self.meta.mark_superseded(mp.mp_id, new_mp.mp_id).await?;
+            } else {
+                // All rows deleted — just mark old MP as superseded (no new MP)
+                self.meta.mark_superseded(mp.mp_id, mp.mp_id + 1000).await?;
+            }
+        }
+
+        Ok(QueryResult::Rows {
+            columns: vec!["status".to_string()],
+            rows: vec![vec!["DELETE OK".to_string()]],
+        })
+    }
+
+    /// Apply UPDATE assignments to a batch. Returns modified batch.
+    fn apply_update_to_batch(
+        &self,
+        batch: &RecordBatch,
+        assignments: &[(String, ResolvedExpr)],
+        filter: &Option<ResolvedFilter>,
+        table: &TableMeta,
+    ) -> Result<RecordBatch> {
+        use arrow::array::*;
+
+        let schema = batch.schema();
+        let n_rows = batch.num_rows();
+
+        // Determine which rows match the filter (or all if no filter)
+        let mask: Vec<bool> = match filter {
+            Some(f) => self.eval_filter_on_batch(batch, f, table)?,
+            None => vec![true; n_rows],
+        };
+
+        // For each column: either keep as-is or apply assignment
+        let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for (i, field) in schema.fields().iter().enumerate() {
+            let col = batch.column(i);
+            let assignment = assignments.iter().find(|(name, _)| name == field.name());
+            if let Some((_, expr)) = assignment {
+                // Replace values in matching rows
+                let new_col: ArrayRef = match field.data_type() {
+                    DataType::Int64 => {
+                        let val = match expr {
+                            ResolvedExpr::Int64(v) => *v,
+                            _ => 0,
+                        };
+                        let mut vals: Vec<i64> = col
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.unwrap_or(0))
+                            .collect();
+                        for (idx, &m) in mask.iter().enumerate() {
+                            if m {
+                                vals[idx] = val;
+                            }
+                        }
+                        Arc::new(Int64Array::from(vals))
+                    }
+                    DataType::Float64 => {
+                        let val = match expr {
+                            ResolvedExpr::Float64(v) => *v,
+                            _ => 0.0,
+                        };
+                        let mut vals: Vec<f64> = col
+                            .as_any()
+                            .downcast_ref::<Float64Array>()
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.unwrap_or(0.0))
+                            .collect();
+                        for (idx, &m) in mask.iter().enumerate() {
+                            if m {
+                                vals[idx] = val;
+                            }
+                        }
+                        Arc::new(Float64Array::from(vals))
+                    }
+                    DataType::Utf8 => {
+                        let val = match expr {
+                            ResolvedExpr::String(s) => s.clone(),
+                            _ => "".to_string(),
+                        };
+                        let mut vals: Vec<Option<String>> = col
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.map(|s| s.to_string()))
+                            .collect();
+                        for (idx, &m) in mask.iter().enumerate() {
+                            if m {
+                                vals[idx] = Some(val.clone());
+                            }
+                        }
+                        Arc::new(StringArray::from(vals))
+                    }
+                    _ => col.clone(),
+                };
+                new_columns.push(new_col);
+            } else {
+                new_columns.push(col.clone());
+            }
+        }
+
+        RecordBatch::try_new(schema, new_columns).map_err(|e| NovaError::Internal {
+            message: e.to_string(),
+        })
+    }
+
+    /// Apply DELETE filter to a batch. Returns batch with only non-matching rows.
+    fn apply_delete_to_batch(
+        &self,
+        batch: &RecordBatch,
+        filter: &Option<ResolvedFilter>,
+        table: &TableMeta,
+    ) -> Result<RecordBatch> {
+        use arrow::array::*;
+        use arrow::compute::take;
+
+        let n_rows = batch.num_rows();
+
+        // Determine which rows to KEEP (inverse of filter match)
+        let keep_mask: Vec<bool> = match filter {
+            Some(f) => {
+                let match_mask = self.eval_filter_on_batch(batch, f, table)?;
+                match_mask.into_iter().map(|m| !m).collect()
+            }
+            None => vec![false; n_rows], // DELETE all
+        };
+
+        // Collect indices of rows to keep
+        let indices: Vec<u32> = keep_mask
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k)
+            .map(|(i, _)| i as u32)
+            .collect();
+
+        if indices.is_empty() {
+            // No rows to keep — return empty batch
+            return Ok(RecordBatch::new_empty(batch.schema()));
+        }
+
+        let take_arr = UInt32Array::from(indices);
+        let mut new_columns = Vec::with_capacity(batch.num_columns());
+        for i in 0..batch.num_columns() {
+            let taken =
+                take(batch.column(i), &take_arr, None).map_err(|e| NovaError::Internal {
+                    message: e.to_string(),
+                })?;
+            new_columns.push(taken);
+        }
+
+        RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| NovaError::Internal {
+            message: e.to_string(),
+        })
+    }
+
+    /// Evaluate a filter on a batch. Returns a boolean mask (true = matches filter).
+    #[allow(clippy::needless_range_loop)]
+    fn eval_filter_on_batch(
+        &self,
+        batch: &RecordBatch,
+        filter: &ResolvedFilter,
+        _table: &TableMeta,
+    ) -> Result<Vec<bool>> {
+        use arrow::array::*;
+
+        let col_idx = batch
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name() == &filter.column)
+            .ok_or(NovaError::Internal {
+                message: format!("column {} not found", filter.column),
+            })?;
+
+        let col = batch.column(col_idx);
+        let n = batch.num_rows();
+        let mut mask = vec![false; n];
+
+        match col.data_type() {
+            arrow::datatypes::DataType::Int64 => {
+                let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                let target = match &filter.value {
+                    ResolvedExpr::Int64(v) => *v,
+                    _ => 0,
+                };
+                for i in 0..n {
+                    let v = arr.value(i);
+                    mask[i] = match filter.op.as_str() {
+                        "=" => v == target,
+                        "!=" => v != target,
+                        ">" => v > target,
+                        ">=" => v >= target,
+                        "<" => v < target,
+                        "<=" => v <= target,
+                        _ => false,
+                    };
+                }
+            }
+            arrow::datatypes::DataType::Float64 => {
+                let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                let target = match &filter.value {
+                    ResolvedExpr::Float64(v) => *v,
+                    _ => 0.0,
+                };
+                for i in 0..n {
+                    let v = arr.value(i);
+                    mask[i] = match filter.op.as_str() {
+                        "=" => v == target,
+                        "!=" => v != target,
+                        ">" => v > target,
+                        ">=" => v >= target,
+                        "<" => v < target,
+                        "<=" => v <= target,
+                        _ => false,
+                    };
+                }
+            }
+            arrow::datatypes::DataType::Utf8 => {
+                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                let target = match &filter.value {
+                    ResolvedExpr::String(s) => s.clone(),
+                    _ => "".to_string(),
+                };
+                for i in 0..n {
+                    let v = arr.value(i);
+                    mask[i] = match filter.op.as_str() {
+                        "=" => v == target,
+                        "!=" => v != target,
+                        _ => false,
+                    };
+                }
+            }
+            _ => {}
+        }
+
+        Ok(mask)
     }
 
     async fn find_table(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
