@@ -15,6 +15,8 @@ pub mod optimizer_rules;
 pub mod parser;
 pub mod planner;
 pub mod raft;
+pub mod rbac;
+pub mod result_cache;
 pub mod runtime_filter;
 pub mod scheduler;
 pub mod statistics;
