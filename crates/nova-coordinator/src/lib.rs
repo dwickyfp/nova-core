@@ -8,6 +8,8 @@ pub mod cache;
 pub mod cbo;
 pub mod distributed;
 pub mod executor;
+pub mod ha;
+pub mod monitoring;
 pub mod mp_pruning;
 pub mod mysql_server;
 pub mod optimizer;

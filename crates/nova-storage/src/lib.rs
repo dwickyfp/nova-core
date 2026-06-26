@@ -1,5 +1,6 @@
 //! nova-storage — Micro-partition read/write, metadata operations, cache.
 
+pub mod backup;
 pub mod cache;
 pub mod metadata;
 pub mod mp_reader;
