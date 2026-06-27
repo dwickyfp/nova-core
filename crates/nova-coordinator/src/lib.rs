@@ -11,6 +11,7 @@ pub mod executor;
 pub mod ha;
 pub mod monitoring;
 pub mod mp_pruning;
+pub mod mysql_protocol;
 pub mod mysql_server;
 pub mod optimizer;
 pub mod optimizer_rules;
