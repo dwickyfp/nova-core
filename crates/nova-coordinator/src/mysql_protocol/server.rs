@@ -10,20 +10,24 @@ use tokio::sync::Mutex;
 use nova_common::{NovaError, Result};
 
 use crate::mysql_protocol::auth::AuthPlugin;
+use crate::mysql_protocol::capabilities::ClientCapabilities;
 use crate::mysql_protocol::codec::PacketCodec;
 use crate::mysql_protocol::commands::{
-    Command, CommandResult, build_column_count_packet, build_column_def_packet, build_eof_packet,
-    build_error_packet, build_ok_packet, build_row_packet, handle_init_db, handle_ping,
-    handle_query, handle_quit, handle_reset_connection, handle_set_option, handle_stmt_close,
+    ColumnDef, Command, CommandResult, build_column_count_packet, build_column_def_packet,
+    build_eof_packet, build_error_packet, build_ok_packet, build_row_packet, handle_init_db,
+    handle_ping, handle_quit, handle_reset_connection, handle_set_option, handle_stmt_close,
     handle_stmt_execute, handle_stmt_prepare,
 };
 use crate::mysql_protocol::connection::Session;
 use crate::mysql_protocol::errors::MySqlError;
 use crate::mysql_protocol::packets::{build_handshake_packet, parse_handshake_response};
+use crate::mysql_protocol::query_engine::QueryEngine;
+use crate::mysql_protocol::types::ColumnType;
 
 /// MySQL protocol server
 pub struct MySqlServer {
     listener: TcpListener,
+    engine: Arc<dyn QueryEngine>,
     sessions: Arc<Mutex<Vec<u32>>>,
     next_connection_id: Arc<Mutex<u32>>,
 }
@@ -49,7 +53,7 @@ impl Default for MySqlServerConfig {
 
 impl MySqlServer {
     /// Bind to address and create server
-    pub async fn bind(addr: &str) -> Result<Self> {
+    pub async fn bind(addr: &str, engine: Arc<dyn QueryEngine>) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| NovaError::Internal {
@@ -58,6 +62,7 @@ impl MySqlServer {
 
         Ok(Self {
             listener,
+            engine,
             sessions: Arc::new(Mutex::new(Vec::new())),
             next_connection_id: Arc::new(Mutex::new(1)),
         })
@@ -74,9 +79,12 @@ impl MySqlServer {
                     drop(id_guard);
 
                     let sessions = Arc::clone(&self.sessions);
+                    let engine = Arc::clone(&self.engine);
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, connection_id, sessions).await {
+                        if let Err(e) =
+                            handle_connection(stream, connection_id, sessions, engine).await
+                        {
                             tracing::error!(
                                 connection_id = connection_id,
                                 addr = %addr,
@@ -99,6 +107,7 @@ async fn handle_connection(
     stream: TcpStream,
     connection_id: u32,
     sessions: Arc<Mutex<Vec<u32>>>,
+    engine: Arc<dyn QueryEngine>,
 ) -> Result<()> {
     let mut codec = PacketCodec::new(stream);
 
@@ -112,7 +121,20 @@ async fn handle_connection(
 
     // Read handshake response from client
     let response_packet = codec.read_packet().await?;
-    let handshake_response = parse_handshake_response(&response_packet.payload)?;
+    let handshake_response =
+        parse_handshake_response(&response_packet.payload).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Failed to parse handshake response, using defaults");
+            crate::mysql_protocol::packets::HandshakeResponse {
+                capabilities: ClientCapabilities::default_server_capabilities(),
+                max_packet_size: 16777216,
+                charset: 45,
+                username: "root".to_string(),
+                auth_response: Vec::new(),
+                database: None,
+                auth_plugin: None,
+                connect_attrs: Vec::new(),
+            }
+        });
 
     // Create session
     let mut session = Session::new(
@@ -173,10 +195,159 @@ async fn handle_connection(
             Command::ComQuit => handle_quit(&mut session),
             Command::ComPing => handle_ping(&mut session),
             Command::ComInitDb => handle_init_db(&mut session, payload),
-            Command::ComQuery => handle_query(&mut session, payload),
+            Command::ComQuery => {
+                // When CLIENT_QUERY_ATTRIBUTES is set, COM_QUERY payload has:
+                //   [flags:1] [iteration_count:1] [param_count: lenenc_int] [params...] [SQL]
+                // Some clients (C extension) omit param_count when 0 params:
+                //   [flags:1] [iteration_count:1] [SQL]
+                let sql = if session
+                    .client_capabilities
+                    .supports_query_attributes()
+                    && payload.len() >= 2
+                {
+                    let after_hdr = &payload[2..];
+                    // Try to skip param_count if it looks like a lenenc int (0x00 = 0 params)
+                    if !after_hdr.is_empty() && after_hdr[0] == 0x00 {
+                        &after_hdr[1..]
+                    } else {
+                        after_hdr
+                    }
+                } else {
+                    payload
+                };
+
+                let sql = String::from_utf8_lossy(sql).to_string();
+                let sql = sql.trim_end_matches('\0').trim();
+                tracing::debug!(sql = %sql, "Query received");
+
+                // Handle special commands first
+                let sql_lower = sql.to_lowercase();
+                if sql_lower.starts_with("use ") {
+                    let db = sql[4..].trim().trim_end_matches(';').to_string();
+                    session.set_database(&db);
+                    CommandResult::Ok {
+                        affected_rows: 0,
+                        last_insert_id: 0,
+                        message: String::new(),
+                    }
+                } else if sql_lower.starts_with("show databases")
+                    || sql_lower.starts_with("show schemas")
+                {
+                    CommandResult::ResultSet {
+                        columns: vec![ColumnDef {
+                            name: "Database".to_string(),
+                            col_type: ColumnType::VarString,
+                            flags: 0,
+                            decimals: 0,
+                        }],
+                        rows: vec![
+                            vec![Some("information_schema".to_string())],
+                            vec![Some("mysql".to_string())],
+                            vec![Some("performance_schema".to_string())],
+                            vec![Some("sys".to_string())],
+                            vec![Some("nova".to_string())],
+                        ],
+                    }
+                } else if sql_lower.starts_with("select @@version")
+                    || sql_lower.starts_with("select version()")
+                {
+                    CommandResult::ResultSet {
+                        columns: vec![ColumnDef {
+                            name: "@@version".to_string(),
+                            col_type: ColumnType::VarString,
+                            flags: 0,
+                            decimals: 0,
+                        }],
+                        rows: vec![vec![Some("8.0.35-nova".to_string())]],
+                    }
+                } else if sql_lower.starts_with("set ") {
+                    // Handle SET commands (e.g., SET NAMES utf8mb4, SET autocommit=1)
+                    CommandResult::Ok {
+                        affected_rows: 0,
+                        last_insert_id: 0,
+                        message: String::new(),
+                    }
+                } else if sql_lower.starts_with("show warnings")
+                    || sql_lower.starts_with("show status")
+                {
+                    CommandResult::ResultSet {
+                        columns: vec![ColumnDef {
+                            name: "Level".to_string(),
+                            col_type: ColumnType::VarString,
+                            flags: 0,
+                            decimals: 0,
+                        }],
+                        rows: vec![],
+                    }
+                } else if sql_lower.starts_with("show tables") {
+                    let col_name = format!("Tables_in_{}", session.current_db);
+                    CommandResult::ResultSet {
+                        columns: vec![ColumnDef {
+                            name: col_name,
+                            col_type: ColumnType::VarString,
+                            flags: 0,
+                            decimals: 0,
+                        }],
+                        rows: vec![],
+                    }
+                } else if sql_lower.starts_with("select 1") && !sql_lower.contains("from") {
+                    CommandResult::ResultSet {
+                        columns: vec![ColumnDef {
+                            name: "1".to_string(),
+                            col_type: ColumnType::Long,
+                            flags: 0,
+                            decimals: 0,
+                        }],
+                        rows: vec![vec![Some("1".to_string())]],
+                    }
+                } else {
+                    // Execute via query engine
+                    let current_db = if session.current_db.is_empty() {
+                        "nova"
+                    } else {
+                        &session.current_db
+                    };
+
+                    match engine.execute_sql(sql, current_db).await {
+                        Ok(result) => {
+                            use crate::executor::QueryResult;
+                            match result {
+                                QueryResult::Success { message } => CommandResult::Ok {
+                                    affected_rows: 0,
+                                    last_insert_id: 0,
+                                    message,
+                                },
+                                QueryResult::Rows { columns, rows } => CommandResult::ResultSet {
+                                    columns: columns
+                                        .into_iter()
+                                        .map(|name| ColumnDef {
+                                            name,
+                                            col_type: ColumnType::VarString,
+                                            flags: 0,
+                                            decimals: 0,
+                                        })
+                                        .collect(),
+                                    rows: rows
+                                        .into_iter()
+                                        .map(|r| r.into_iter().map(|v| Some(v)).collect())
+                                        .collect(),
+                                },
+                            }
+                        }
+                        Err(e) => CommandResult::Error {
+                            code: MySqlError::ER_PARSE_ERROR,
+                            message: e.to_string(),
+                        },
+                    }
+                }
+            }
             Command::ComStmtPrepare => handle_stmt_prepare(&mut session, payload),
             Command::ComStmtExecute => handle_stmt_execute(&mut session, payload),
-            Command::ComStmtClose => handle_stmt_close(&mut session, payload),
+            Command::ComStmtClose => {
+                // COM_STMT_CLOSE is silent — no response, just remove statement
+                handle_stmt_close(&mut session, payload);
+                CommandResult::Eof
+            }
             Command::ComSetOption => handle_set_option(&mut session, payload),
             Command::ComResetConnection => handle_reset_connection(&mut session),
             _ => CommandResult::Error {
@@ -241,8 +412,12 @@ async fn handle_connection(
                 }
             }
             CommandResult::Eof => {
-                let eof = build_eof_packet(session.server_status, session.warning_count);
-                codec.write_packet(&eof.payload).await?;
+                // For COM_STMT_CLOSE: send nothing (silent command)
+                // For other EOF: send EOF packet
+                if command != Command::ComStmtClose {
+                    let eof = build_eof_packet(session.server_status, session.warning_count);
+                    codec.write_packet(&eof.payload).await?;
+                }
             }
             CommandResult::Close => {
                 break;
