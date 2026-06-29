@@ -15,6 +15,7 @@ pub struct NovaEngine {
     parser: SqlParser,
     planner: QueryPlanner,
     scheduler: QueryScheduler,
+    result_cache: crate::result_cache::ResultCache,
 }
 
 impl NovaEngine {
@@ -23,6 +24,7 @@ impl NovaEngine {
             parser: SqlParser::new(),
             planner: QueryPlanner::new(),
             scheduler: QueryScheduler::new(executor),
+            result_cache: crate::result_cache::ResultCache::new(1000),
         }
     }
 }
@@ -30,6 +32,15 @@ impl NovaEngine {
 #[async_trait]
 impl QueryEngine for NovaEngine {
     async fn execute_sql(&self, sql: &str, current_db: &str) -> Result<QueryResult> {
+        // Check result cache for SELECT queries
+        if sql.trim().to_uppercase().starts_with("SELECT") {
+            let empty_versions = std::collections::HashMap::new();
+            if let Some((columns, rows)) = self.result_cache.get(sql, &empty_versions).await {
+                tracing::debug!(sql = %sql, "Result cache HIT");
+                return Ok(QueryResult::Rows { columns, rows });
+            }
+        }
+
         // 1. Parse
         let stmts = self.parser.parse(sql)?;
         let stmt = stmts
@@ -42,14 +53,20 @@ impl QueryEngine for NovaEngine {
         let analyzer = Analyzer::new(current_db.to_string(), "public".to_string());
         let resolved = analyzer.resolve(stmt)?;
 
-        // 3. Optimize (MP pruning, CBO rules)
-        // MP pruning happens inside executor.exec_select() via optimizer
-        // For now, optimizer is applied at the executor level (see Executor)
-
-        // 4. Plan (pass-through for single-node)
+        // 3. Plan (pass-through for single-node)
         let planned = self.planner.plan(resolved)?;
 
-        // 5. Schedule + Execute
-        self.scheduler.execute(planned).await
+        // 4. Schedule + Execute
+        let result = self.scheduler.execute(planned).await?;
+
+        // 5. Cache SELECT results
+        if let QueryResult::Rows { columns, rows } = &result {
+            let empty_versions = std::collections::HashMap::new();
+            self.result_cache
+                .put(sql, empty_versions, columns.clone(), rows.clone())
+                .await;
+        }
+
+        Ok(result)
     }
 }
