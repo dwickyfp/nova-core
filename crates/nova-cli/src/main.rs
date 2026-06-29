@@ -62,6 +62,7 @@ struct MetadataConfig {
     #[serde(default = "default_backend")]
     backend: String,
     sled_path: Option<String>,
+    #[allow(dead_code)]
     fdb_cluster_file: Option<String>,
 }
 
@@ -93,7 +94,9 @@ async fn main() -> anyhow::Result<()> {
                 "fdb" => {
                     #[cfg(feature = "fdb-backend")]
                     {
-                        let cluster_file = cfg.metadata.fdb_cluster_file
+                        let cluster_file = cfg
+                            .metadata
+                            .fdb_cluster_file
                             .as_deref()
                             .unwrap_or("docker:docker@127.0.0.1:4500");
                         tracing::info!(cluster = %cluster_file, "Using FoundationDB metadata store");
@@ -101,11 +104,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                     #[cfg(not(feature = "fdb-backend"))]
                     {
-                        anyhow::bail!("FDB backend not compiled. Rebuild with: cargo build --features nova-storage/fdb-backend");
+                        anyhow::bail!(
+                            "FDB backend not compiled. Rebuild with: cargo build --features nova-storage/fdb-backend"
+                        );
                     }
                 }
                 _ => {
-                    let sled_path = cfg.metadata.sled_path
+                    let sled_path = cfg
+                        .metadata
+                        .sled_path
                         .as_deref()
                         .unwrap_or("./data/nova-meta");
                     tracing::info!(path = %sled_path, "Using sled metadata store");

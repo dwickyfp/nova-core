@@ -18,9 +18,9 @@
 //   ("next_id", category)                -> u64  (auto-increment)
 
 use async_trait::async_trait;
-use foundationdb as fdb;
-use fdb::tuple::{Subspace, TuplePack};
 use fdb::RangeOption;
+use fdb::tuple::{Subspace, TuplePack};
+use foundationdb as fdb;
 use nova_common::{NovaError, Result, *};
 use std::sync::Arc;
 
@@ -147,7 +147,8 @@ impl FdbMetadataStore {
             .run(|trx, _maybe_committed| {
                 let opt = RangeOption::from((start.clone(), end.clone()));
                 async move {
-                    let values = trx.get_range(&opt, 1_000_000, false)
+                    let values = trx
+                        .get_range(&opt, 1_000_000, false)
                         .await
                         .map_err(fdb::FdbBindingError::from)?;
                     let result: Vec<(Vec<u8>, Vec<u8>)> = values
@@ -242,7 +243,11 @@ impl MetadataStore for FdbMetadataStore {
         self.fdb_set(key, val).await
     }
 
-    async fn get_schema(&self, db_id: DatabaseId, schema_id: SchemaId) -> Result<Option<SchemaMeta>> {
+    async fn get_schema(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+    ) -> Result<Option<SchemaMeta>> {
         let key = self.pack(&("schema", db_id, schema_id));
         match self.fdb_get(key).await? {
             Some(bytes) => Ok(Some(Self::deserialize(&bytes)?)),
@@ -279,7 +284,12 @@ impl MetadataStore for FdbMetadataStore {
         self.fdb_set(key, val).await
     }
 
-    async fn get_table(&self, db_id: DatabaseId, schema_id: SchemaId, table_id: TableId) -> Result<Option<TableMeta>> {
+    async fn get_table(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        table_id: TableId,
+    ) -> Result<Option<TableMeta>> {
         let key = self.pack(&("table", db_id, schema_id, table_id));
         match self.fdb_get(key).await? {
             Some(bytes) => Ok(Some(Self::deserialize(&bytes)?)),
@@ -310,7 +320,10 @@ impl MetadataStore for FdbMetadataStore {
             .run(|trx, _| {
                 let mp_start = mp_start.clone();
                 let mp_end = mp_end.clone();
-                let mp_keys: Vec<Vec<u8>> = active_mps.iter().map(|mp| self.pack(&("mp", mp.mp_id))).collect();
+                let mp_keys: Vec<Vec<u8>> = active_mps
+                    .iter()
+                    .map(|mp| self.pack(&("mp", mp.mp_id)))
+                    .collect();
                 async move {
                     trx.clear_range(&mp_start, &mp_end);
                     for k in &mp_keys {
@@ -371,12 +384,12 @@ impl MetadataStore for FdbMetadataStore {
         for (_, _) in &kvs {
             // Index entries have empty values. Key format: ("nova", "table_mps", table_id, mp_id)
             // Unpack mp_id from key
-            let unpacked: (String, TableId, MpId) = self
-                .subspace
-                .unpack(&kvs[0].0)
-                .map_err(|e| NovaError::Internal {
-                    message: format!("FDB tuple unpack failed: {}", e),
-                })?;
+            let unpacked: (String, TableId, MpId) =
+                self.subspace
+                    .unpack(&kvs[0].0)
+                    .map_err(|e| NovaError::Internal {
+                        message: format!("FDB tuple unpack failed: {}", e),
+                    })?;
             let mp_id = unpacked.2;
             {
                 if let Some(mp) = self.get_mp(mp_id).await? {
@@ -389,19 +402,23 @@ impl MetadataStore for FdbMetadataStore {
         Ok(mps)
     }
 
-    async fn get_mps_at_timestamp(&self, table_id: TableId, ts: Timestamp) -> Result<Vec<MicroPartitionMeta>> {
+    async fn get_mps_at_timestamp(
+        &self,
+        table_id: TableId,
+        ts: Timestamp,
+    ) -> Result<Vec<MicroPartitionMeta>> {
         // Get ALL MPs for table (including inactive/superseded)
         let (start, end) = self.category_range(&("table_mps", table_id));
         let kvs = self.fdb_get_range(start, end).await?;
 
         let mut all_mps = Vec::new();
         for (key_bytes, _) in &kvs {
-            let unpacked: (String, TableId, MpId) = self
-                .subspace
-                .unpack(key_bytes)
-                .map_err(|e| NovaError::Internal {
-                    message: format!("FDB tuple unpack failed: {}", e),
-                })?;
+            let unpacked: (String, TableId, MpId) =
+                self.subspace
+                    .unpack(key_bytes)
+                    .map_err(|e| NovaError::Internal {
+                        message: format!("FDB tuple unpack failed: {}", e),
+                    })?;
             let mp_id = unpacked.2;
             if let Some(mp) = self.get_mp(mp_id).await? {
                 all_mps.push(mp);
@@ -428,10 +445,10 @@ impl MetadataStore for FdbMetadataStore {
     }
 
     async fn mark_superseded(&self, old_mp_id: MpId, new_mp_id: MpId) -> Result<()> {
-        let old_mp = self
-            .get_mp(old_mp_id)
-            .await?
-            .ok_or(NovaError::MpNotFound { table_id: 0, mp_id: old_mp_id })?;
+        let old_mp = self.get_mp(old_mp_id).await?.ok_or(NovaError::MpNotFound {
+            table_id: 0,
+            mp_id: old_mp_id,
+        })?;
         let mut updated = old_mp;
         updated.superseded_by = Some(new_mp_id);
         updated.active = false;

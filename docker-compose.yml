@@ -1,22 +1,36 @@
-version: "3.9"
-
 services:
-  # ─── FoundationDB (metadata store for production) ───
+  # ─── FoundationDB coordinator + server ───
   fdb:
     image: foundationdb/foundationdb:7.4.0
     container_name: nova-fdb
     ports:
       - "4500:4500"
     environment:
-      FDB_NETWORKING_MODE: host
+      FDB_CLUSTER_FILE_CONTENTS: "docker:docker@nova-fdb:4500"
+      FDB_NETWORKING_MODE: container
     volumes:
       - nova-fdb-data:/var/lib/foundationdb
       - nova-fdb-logs:/var/log/foundationdb
     healthcheck:
-      test: ["CMD", "fdbcli", "--exec", "status", "--timeout", "5"]
+      test: ["CMD", "fdbcli", "-C", "/var/fdb/fdb.cluster", "--exec", "status", "--timeout", "5"]
       interval: 10s
       timeout: 10s
-      retries: 5
+      retries: 10
+      start_period: 20s
+    networks:
+      - nova-net
+
+  # ─── Initialize FDB database (run once) ───
+  fdb-init:
+    image: foundationdb/foundationdb:7.4.0
+    container_name: nova-fdb-init
+    depends_on:
+      fdb:
+        condition: service_healthy
+    environment:
+      FDB_CLUSTER_FILE_CONTENTS: "docker:docker@nova-fdb:4500"
+    entrypoint: ["/usr/bin/fdbcli", "-C", "/var/fdb/fdb.cluster", "--exec", "configure new single memory", "--timeout", "30"]
+    restart: "no"
     networks:
       - nova-net
 
@@ -38,24 +52,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-    networks:
-      - nova-net
-
-  # ─── Auto-create MinIO bucket + FDB database ───
-  init:
-    image: foundationdb/foundationdb:7.4.0
-    container_name: nova-init
-    depends_on:
-      fdb:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      fdbcli --cluster docker:docker@fdb:4500 --exec 'configure new single memory' --timeout 10;
-      echo 'FDB database configured';
-      "
-    restart: "no"
     networks:
       - nova-net
 

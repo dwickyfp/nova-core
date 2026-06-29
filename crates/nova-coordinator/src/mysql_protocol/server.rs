@@ -200,9 +200,7 @@ async fn handle_connection(
                 //   [flags:1] [iteration_count:1] [param_count: lenenc_int] [params...] [SQL]
                 // Some clients (C extension) omit param_count when 0 params:
                 //   [flags:1] [iteration_count:1] [SQL]
-                let sql = if session
-                    .client_capabilities
-                    .supports_query_attributes()
+                let sql = if session.client_capabilities.supports_query_attributes()
                     && payload.len() >= 2
                 {
                     let after_hdr = &payload[2..];
@@ -329,7 +327,7 @@ async fn handle_connection(
                                         .collect(),
                                     rows: rows
                                         .into_iter()
-                                        .map(|r| r.into_iter().map(|v| Some(v)).collect())
+                                        .map(|r| r.into_iter().map(Some).collect())
                                         .collect(),
                                 },
                             }

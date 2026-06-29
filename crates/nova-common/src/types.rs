@@ -310,17 +310,16 @@ pub struct AuthConfig {
 
 // ── Helpers ──
 
-/// Generate a new unique ID (based on UUID v4).
+/// Generate a new unique ID (based on UUID v4 + timestamp).
 pub fn generate_id() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    // Mix with random bits from UUID
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
     let uuid = uuid::Uuid::new_v4();
     let bytes = uuid.as_bytes();
-    let rand = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let rand = u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]));
     ts.wrapping_add(rand)
 }
 
@@ -329,6 +328,6 @@ pub fn now_micros() -> Timestamp {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(1)
 }

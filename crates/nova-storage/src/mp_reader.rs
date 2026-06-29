@@ -108,7 +108,7 @@ mod tests {
     use crate::mp_writer::MpWriter;
     use arrow::array::{Array, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use nova_common::Compression;
+
     use object_store::local::LocalFileSystem;
     use tempfile::TempDir;
 
