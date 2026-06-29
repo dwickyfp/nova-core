@@ -9,12 +9,14 @@
 
 | Phase | Name | Duration | Status | Focus |
 |---|---|---|---|---|
-| 1 | Foundation | Month 1-3 | 🟡 In Progress | Storage, metadata, basic SQL |
-| 2 | Query Engine | Month 4-5 | ⬜ Not Started | DataFusion, pruning, CBO basics |
-| 3 | Snowflake Features | Month 6-7 | ⬜ Not Started | Time Travel, Clone, Streams |
-| 4 | Distributed | Month 8-9 | ⬜ Not Started | Raft, worker pool, distributed JOIN |
-| 5 | CBO Enhancement | Month 8-9 | ⬜ Not Started | Advanced optimizer, TPC-DS |
-| 6 | Cache & Polish | Month 10 | ⬜ Not Started | Foyer cache, result cache, RBAC, HA |
+| 1 | Foundation | Month 1-3 | ✅ Complete | Storage, metadata, basic SQL, FDB + sled |
+| 2 | Query Engine | Month 4-5 | ✅ Complete | Optimizer, planner, scheduler, MP pruning, TableProvider |
+| 3 | Snowflake Features | Month 6-7 | ✅ Complete | Time Travel, Clone, Streams, GC, BEGIN/COMMIT/ROLLBACK |
+| 4 | Distributed | Month 8-9 | ✅ Single-node | WorkerPool, AutoScaler wired (gRPC future) |
+| 5 | CBO Enhancement | Month 8-9 | ✅ Complete | Late mat, stats, runtime filter wired to optimizer |
+| 6 | Cache & Polish | Month 10 | ✅ Complete | Auth, cache, RBAC, monitoring, HA, backup |
+| 7 | MySQL Protocol | — | ✅ Complete | Production-grade (40 tests) |
+| 8 | SQL Completeness | — | 🔴 In Progress | AGG, GROUP BY, ORDER BY, JOIN, DROP, multi-stmt |
 
 ---
 
@@ -482,3 +484,83 @@ Phase 1 (Foundation)
 | Repeated query (cache hit) | < 10ms | 600x faster than cold |
 | Coordinator failover | < 10 seconds | RTO |
 | Worker auto-scale | < 60 seconds | Spin up new worker |
+
+---
+
+## Phase 8: SQL Completeness (Gap Analysis — June 2026)
+
+> Audit result: Phases 1-7 wired but SQL feature gaps remain.
+> This phase closes all gaps between architecture spec and implementation.
+
+### P0: Critical SQL Features (blocking production)
+
+#### 8.1: DROP TABLE / DROP DATABASE
+- [ ] Parser: sqlparser native `Statement::Drop`
+- [ ] Analyzer: resolve to `ResolvedStatement::DropTable` / `DropDatabase`
+- [ ] Executor: call `meta.drop_table()` / `meta.drop_database()`
+- [ ] Tests: create → drop → verify gone
+
+#### 8.2: DataFusion SessionContext Integration
+- [ ] Replace direct storage reads in exec_select with DataFusion SessionContext
+- [ ] Register NovaTableProvider to SessionContext
+- [ ] Route SELECT queries through DataFusion SQL parser + optimizer
+- [ ] Tests: SELECT via DataFusion returns same results
+
+#### 8.3: Aggregate Functions (COUNT/SUM/AVG/MIN/MAX)
+- [ ] Via DataFusion SessionContext (built-in support)
+- [ ] Tests: COUNT(*), SUM(col), AVG(col), GROUP BY
+
+#### 8.4: ORDER BY + LIMIT/OFFSET
+- [ ] Via DataFusion SessionContext (built-in support)
+- [ ] Tests: ORDER BY col DESC LIMIT 10
+
+#### 8.5: Multi-statement SQL Execution
+- [ ] NovaEngine: execute ALL statements, not just first
+- [ ] Tests: "CREATE...; INSERT...; SELECT..." returns correct result
+
+### P1: Important SQL Features
+
+#### 8.6: JOIN Support (INNER/LEFT/RIGHT)
+- [ ] Analyzer: resolve JOIN syntax → multi-table ResolvedStatement
+- [ ] Executor: route to DataFusion for multi-table queries
+- [ ] CBO: join reordering active (cbo.rs already exists)
+- [ ] Tests: INNER JOIN, LEFT JOIN, 3-table join
+
+#### 8.7: Parallel MP Scan
+- [ ] Executor: read MPs in parallel (tokio::join_all) instead of sequential loop
+- [ ] Tests: verify parallel scan produces same results
+
+#### 8.8: Foyer HybridCache
+- [ ] Replace HashMap in NovaCache with Foyer HybridCache (RAM + SSD)
+- [ ] Add eviction policy (LRU)
+- [ ] Tests: cache hit/miss/eviction
+
+#### 8.9: ResultCache Table Version Tracking
+- [ ] Track table versions in NovaEngine (not empty HashMap)
+- [ ] Invalidate cache on INSERT/UPDATE/DELETE
+- [ ] Tests: insert → select (cache miss) → select (cache hit) → insert → select (cache miss)
+
+#### 8.10: Worker Executor (replace stub)
+- [ ] Implement nova-worker/src/executor.rs with DataFusion SessionContext
+- [ ] Register MicroPartitionScanExec
+- [ ] Tests: worker can execute query fragments
+
+### P2: E2E Test Suite
+
+#### 8.11: Full Lifecycle E2E Tests
+- [ ] CREATE DATABASE → CREATE TABLE → INSERT → SELECT → UPDATE → DELETE → DROP
+- [ ] AGG: COUNT/SUM/AVG/GROUP BY
+- [ ] ORDER BY + LIMIT
+- [ ] BEGIN → INSERT → COMMIT → SELECT
+- [ ] Time Travel: INSERT → SELECT AT TIMESTAMP
+- [ ] CLONE: CREATE TABLE CLONE → verify data
+- [ ] GC: INSERT → UPDATE → GC → verify old MPs deleted
+
+### Phase 8 Exit Criteria
+
+- [ ] All P0 features implemented with tests
+- [ ] All P1 features implemented with tests
+- [ ] E2E test suite passes
+- [ ] 300+ tests total
+- [ ] clippy clean, fmt clean
+- [ ] MySQL client can execute full SQL lifecycle
