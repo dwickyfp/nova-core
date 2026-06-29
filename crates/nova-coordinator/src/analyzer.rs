@@ -66,6 +66,14 @@ pub enum ResolvedStatement {
     Commit,
     /// ROLLBACK TRANSACTION
     Rollback,
+    /// BACKUP [TO <path>]
+    Backup {
+        path: Option<String>,
+    },
+    /// RESTORE FROM <path>
+    Restore {
+        path: String,
+    },
 }
 
 #[derive(Debug)]
@@ -340,6 +348,22 @@ impl Analyzer {
                     return Ok(ResolvedStatement::Gc {
                         retention_days: retention,
                     });
+                }
+                // Detect BACKUP: DROP TABLE __backup__[<path>]
+                if table_name.starts_with("__backup__") {
+                    let path = table_name
+                        .strip_prefix("__backup__")
+                        .filter(|p| !p.is_empty())
+                        .map(|p| p.to_string());
+                    return Ok(ResolvedStatement::Backup { path });
+                }
+                // Detect RESTORE: DROP TABLE __restore__<path>
+                if table_name.starts_with("__restore__") {
+                    let path = table_name
+                        .strip_prefix("__restore__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::Restore { path });
                 }
                 Err(NovaError::SqlAnalysisError {
                     message: format!("unsupported DROP: {}", table_name),

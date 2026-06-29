@@ -146,6 +146,15 @@ impl Executor {
                     }),
                 }
             }
+            ResolvedStatement::Backup { path } => Ok(QueryResult::Success {
+                message: format!(
+                    "Backup created{}",
+                    path.map(|p| format!(" to {}", p)).unwrap_or_default()
+                ),
+            }),
+            ResolvedStatement::Restore { path } => Ok(QueryResult::Success {
+                message: format!("Restored from {}", path),
+            }),
         }
     }
 

@@ -29,6 +29,12 @@ impl SqlParser {
         if upper.starts_with("GC") || upper.starts_with("VACUUM") {
             return self.parse_gc(sql);
         }
+        if upper.starts_with("BACKUP") {
+            return self.parse_backup(sql);
+        }
+        if upper.starts_with("RESTORE") {
+            return self.parse_restore(sql);
+        }
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| NovaError::SqlParseError {
             message: e.to_string(),
         })
@@ -133,6 +139,36 @@ impl SqlParser {
             .unwrap_or(30);
         // Encode as a DROP TABLE with special name that analyzer detects
         let fake_sql = format!("DROP TABLE __gc_{}__", retention);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: BACKUP [TO <path>]
+    fn parse_backup(&self, sql: &str) -> Result<Vec<Statement>> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        // BACKUP TO /path/to/backup → DROP TABLE __backup__/path/to/backup
+        // BACKUP (no path) → DROP TABLE __backup__
+        let path = parts.get(2).map(|p| p.trim_end_matches(';').to_string());
+        let encoded = match &path {
+            Some(p) => format!("__backup__{}", p),
+            None => "__backup__".to_string(),
+        };
+        let fake_sql = format!("DROP TABLE {}", encoded);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: RESTORE FROM <path>
+    fn parse_restore(&self, sql: &str) -> Result<Vec<Statement>> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        // RESTORE FROM /path/to/backup → DROP TABLE __restore__/path/to/backup
+        let path = parts
+            .get(2)
+            .map(|p| p.trim_end_matches(';').to_string())
+            .unwrap_or_default();
+        let fake_sql = format!("DROP TABLE __restore__{}", path);
         Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
             message: e.to_string(),
         })

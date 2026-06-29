@@ -45,6 +45,8 @@ struct Config {
     server: ServerConfig,
     storage: StorageConfig,
     metadata: MetadataConfig,
+    #[serde(default)]
+    auth: AuthConfig,
 }
 
 #[derive(serde::Deserialize)]
@@ -65,6 +67,24 @@ struct StorageConfig {
 
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AuthConfig {
+    #[serde(default = "default_auth_enabled")]
+    enabled: bool,
+    #[serde(default = "default_username")]
+    default_username: String,
+    #[serde(default)]
+    default_password_hash: String,
+}
+
+fn default_auth_enabled() -> bool {
+    false // dev mode: auth disabled by default
+}
+
+fn default_username() -> String {
+    "root".to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -149,8 +169,18 @@ async fn main() -> anyhow::Result<()> {
             let executor = Arc::new(Executor::new(meta, writer, reader));
 
             // Phase 6: Initialize Auth, Health, Monitoring
-            let _auth = AuthManager::new();
-            tracing::info!("Auth manager initialized (default user: root, no password)");
+            let _auth = if cfg.auth.enabled {
+                AuthManager::with_default_user(
+                    &cfg.auth.default_username,
+                    &cfg.auth.default_password_hash,
+                )
+            } else {
+                AuthManager::new()
+            };
+            tracing::info!(
+                enabled = cfg.auth.enabled,
+                "Auth manager initialized (default user: root)"
+            );
 
             let _health = HealthChecker::new("nova-coordinator-1");
             tracing::info!("Health checker initialized");
