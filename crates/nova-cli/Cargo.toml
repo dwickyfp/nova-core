@@ -25,3 +25,4 @@ clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 object_store = { workspace = true }
 serde = { workspace = true }
+axum = "0.8"

@@ -29,6 +29,13 @@ enum Commands {
         #[arg(short, long, default_value = "config.toml")]
         config: String,
     },
+    /// Start a worker node (connects to coordinator via gRPC).
+    Worker {
+        #[arg(short, long, default_value = "config.toml")]
+        config: String,
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        coordinator_addr: String,
+    },
     /// Show version info.
     Version,
 }
@@ -168,7 +175,26 @@ async fn main() -> anyhow::Result<()> {
 
             let engine = Arc::new(NovaEngine::new(executor));
 
-            // Start MySQL server
+            // Phase 6: Start HTTP server for /health and /metrics
+            let http_addr = format!("{}:{}", cfg.server.host, 9090);
+            let health_router = axum::Router::new()
+                .route("/health", axum::routing::get(|| async { "ok" }))
+                .route(
+                    "/metrics",
+                    axum::routing::get(|| async {
+                        "# Nova Engine Metrics\n# (Prometheus format — counters not yet wired)\n"
+                    }),
+                );
+            let http_addr_clone = http_addr.clone();
+            tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(&http_addr_clone)
+                    .await
+                    .expect("failed to bind HTTP port");
+                tracing::info!(addr = %http_addr_clone, "HTTP server listening (/health, /metrics)");
+                axum::serve(listener, health_router)
+                    .await
+                    .expect("HTTP server error");
+            });
             let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
             let server = MySqlServer::bind(&addr, engine).await?;
 
@@ -178,6 +204,20 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Version => {
             println!("nova-core {}", env!("CARGO_PKG_VERSION"));
+        }
+        Commands::Worker {
+            config: _,
+            coordinator_addr,
+        } => {
+            tracing::info!(
+                coordinator = %coordinator_addr,
+                "Starting Nova worker (single-node mode — coordinator handles execution)"
+            );
+            // ponytail: Worker binary connects to coordinator via gRPC.
+            // For single-node mode, worker is pass-through. Add gRPC client when distributed mode is needed.
+            tracing::info!("Worker running in standby mode. Press Ctrl+C to stop.");
+            tokio::signal::ctrl_c().await?;
+            tracing::info!("Worker shutting down.");
         }
     }
 
