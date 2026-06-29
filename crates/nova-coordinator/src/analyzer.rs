@@ -60,6 +60,12 @@ pub enum ResolvedStatement {
     Gc {
         retention_days: u32,
     },
+    /// BEGIN TRANSACTION
+    Begin,
+    /// COMMIT TRANSACTION
+    Commit,
+    /// ROLLBACK TRANSACTION
+    Rollback,
 }
 
 #[derive(Debug)]
@@ -110,6 +116,47 @@ impl Analyzer {
                 Ok(ResolvedStatement::CreateDatabase { name })
             }
             Statement::CreateTable(ct) => {
+                // Detect Clone: table name contains __CLONE__
+                if let Some(clone_idx) = ct
+                    .name
+                    .0
+                    .iter()
+                    .position(|i| i.value.starts_with("__CLONE__"))
+                {
+                    let source_table = ct.name.0[clone_idx]
+                        .value
+                        .strip_prefix("__CLONE__")
+                        .unwrap_or("");
+                    let clone_table = ct.name.0[0].value.clone();
+                    return Ok(ResolvedStatement::CreateClone {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        clone_table,
+                        source_table: source_table.to_string(),
+                        at_timestamp: None,
+                    });
+                }
+                // Detect Stream: table name contains __STREAM__
+                if let Some(stream_idx) = ct
+                    .name
+                    .0
+                    .iter()
+                    .position(|i| i.value.starts_with("__STREAM__"))
+                {
+                    let stream_info = &ct.name.0[stream_idx].value;
+                    // Format: __STREAM__<name>__<table>__<append_only>
+                    let parts: Vec<&str> = stream_info.split("__").collect();
+                    let stream_name = parts.get(2).unwrap_or(&"").to_string();
+                    let table = parts.get(3).unwrap_or(&"").to_string();
+                    let append_only = parts.get(4).map(|p| *p == "true").unwrap_or(false);
+                    return Ok(ResolvedStatement::CreateStream {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        stream_name,
+                        table,
+                        append_only,
+                    });
+                }
                 let table_name = ct.name.0.last().map(|i| i.value.clone()).ok_or_else(|| {
                     NovaError::SqlAnalysisError {
                         message: "missing table name".to_string(),
@@ -277,6 +324,30 @@ impl Analyzer {
                     filter,
                 })
             }
+            Statement::Drop { names, .. } => {
+                // Detect GC: DROP TABLE __gc_<retention>__
+                let table_name = names
+                    .first()
+                    .and_then(|n| n.0.first())
+                    .map(|i| i.value.clone())
+                    .unwrap_or_default();
+                if table_name.starts_with("__gc_") {
+                    let retention: u32 = table_name
+                        .trim_start_matches("__gc_")
+                        .trim_end_matches("__")
+                        .parse()
+                        .unwrap_or(30);
+                    return Ok(ResolvedStatement::Gc {
+                        retention_days: retention,
+                    });
+                }
+                Err(NovaError::SqlAnalysisError {
+                    message: format!("unsupported DROP: {}", table_name),
+                })
+            }
+            Statement::StartTransaction { .. } => Ok(ResolvedStatement::Begin),
+            Statement::Commit { .. } => Ok(ResolvedStatement::Commit),
+            Statement::Rollback { .. } => Ok(ResolvedStatement::Rollback),
             _ => Err(NovaError::SqlAnalysisError {
                 message: format!("unsupported statement: {:?}", stmt),
             }),

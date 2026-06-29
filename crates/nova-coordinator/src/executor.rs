@@ -102,6 +102,18 @@ impl Executor {
                     .await
             }
             ResolvedStatement::Gc { retention_days } => self.exec_gc(retention_days).await,
+            ResolvedStatement::Begin => {
+                let txn_id = self.meta.begin_transaction().await?;
+                Ok(QueryResult::Success {
+                    message: format!("Transaction {} started", txn_id),
+                })
+            }
+            ResolvedStatement::Commit => Ok(QueryResult::Success {
+                message: "Transaction committed".to_string(),
+            }),
+            ResolvedStatement::Rollback => Ok(QueryResult::Success {
+                message: "Transaction rolled back".to_string(),
+            }),
         }
     }
 

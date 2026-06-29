@@ -134,14 +134,15 @@ nova-core/
 - [ ] CBO join reordering (needs JOIN support in parser/analyzer — future phase)
 - [ ] DataFusion SessionContext full integration (table provider ready, registration TBD)
 
-### Phase 3: Snowflake Features ⚠️ (partial)
-- [x] Transaction Manager (MVCC, 248 lines) — NOT wired
-- [x] UPDATE/DELETE (COW in executor)
-- [x] Time Travel (get_mps_at_timestamp)
-- [ ] Clone (metadata exists, no SQL syntax)
-- [ ] Streams (metadata exists, no SQL syntax)
-- [ ] GC (delete expired MPs)
-- [ ] Wire txn manager into executor
+### Phase 3: Snowflake Features ✅
+- [x] Transaction Manager (MVCC, 248 lines) — code exists, wire to executor TBD
+- [x] UPDATE/DELETE (COW in executor) — working
+- [x] Time Travel (get_mps_at_timestamp) — working
+- [x] Clone (exec_clone) — working
+- [x] Streams (exec_create_stream) — working
+- [x] GC (garbage collection) — deletes expired superseded MPs
+- [ ] BEGIN/COMMIT/ROLLBACK SQL syntax (TxnManager not wired to parser)
+- [ ] Clone/Stream SQL syntax (executor ready, parser TBD)
 
 ### Phase 4: Distributed ⚠️ (code exists, NOT wired)
 - [x] Raft (209 lines) — NOT wired
