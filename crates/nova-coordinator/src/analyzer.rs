@@ -60,6 +60,21 @@ pub enum ResolvedStatement {
     Gc {
         retention_days: u32,
     },
+    /// DROP TABLE <name>
+    DropTable {
+        db: String,
+        schema: String,
+        table: String,
+    },
+    /// DROP DATABASE <name>
+    DropDatabase {
+        name: String,
+    },
+    /// DROP SCHEMA <name>
+    DropSchema {
+        db: String,
+        schema: String,
+    },
     /// BEGIN TRANSACTION
     Begin,
     /// COMMIT TRANSACTION
@@ -332,13 +347,16 @@ impl Analyzer {
                     filter,
                 })
             }
-            Statement::Drop { names, .. } => {
-                // Detect GC: DROP TABLE __gc_<retention>__
+            Statement::Drop {
+                names, object_type, ..
+            } => {
                 let table_name = names
                     .first()
                     .and_then(|n| n.0.first())
                     .map(|i| i.value.clone())
                     .unwrap_or_default();
+
+                // Detect GC: DROP TABLE __gc_<retention>__
                 if table_name.starts_with("__gc_") {
                     let retention: u32 = table_name
                         .trim_start_matches("__gc_")
@@ -365,9 +383,44 @@ impl Analyzer {
                         .to_string();
                     return Ok(ResolvedStatement::Restore { path });
                 }
-                Err(NovaError::SqlAnalysisError {
-                    message: format!("unsupported DROP: {}", table_name),
-                })
+
+                // Real DROP TABLE / DROP DATABASE / DROP SCHEMA
+                match object_type {
+                    sqlparser::ast::ObjectType::Table => {
+                        let table = names
+                            .first()
+                            .and_then(|n| n.0.last())
+                            .map(|i| i.value.clone())
+                            .unwrap_or_default();
+                        Ok(ResolvedStatement::DropTable {
+                            db: self.default_db.clone(),
+                            schema: self.default_schema.clone(),
+                            table,
+                        })
+                    }
+                    sqlparser::ast::ObjectType::Database => {
+                        let name = names
+                            .first()
+                            .and_then(|n| n.0.last())
+                            .map(|i| i.value.clone())
+                            .unwrap_or_default();
+                        Ok(ResolvedStatement::DropDatabase { name })
+                    }
+                    sqlparser::ast::ObjectType::Schema => {
+                        let schema = names
+                            .first()
+                            .and_then(|n| n.0.last())
+                            .map(|i| i.value.clone())
+                            .unwrap_or_default();
+                        Ok(ResolvedStatement::DropSchema {
+                            db: self.default_db.clone(),
+                            schema,
+                        })
+                    }
+                    _ => Err(NovaError::SqlAnalysisError {
+                        message: format!("unsupported DROP: {}", table_name),
+                    }),
+                }
             }
             Statement::StartTransaction { .. } => Ok(ResolvedStatement::Begin),
             Statement::Commit { .. } => Ok(ResolvedStatement::Commit),

@@ -158,6 +158,43 @@ impl Executor {
             ResolvedStatement::Restore { path } => Ok(QueryResult::Success {
                 message: format!("Restored from {}", path),
             }),
+            ResolvedStatement::DropTable { db, schema, table } => {
+                let table_meta = self.find_table(&db, &schema, &table).await?;
+                self.meta.drop_table(table_meta.id).await?;
+                Ok(QueryResult::Success {
+                    message: format!("Table '{}.{}.{}' dropped", db, schema, table),
+                })
+            }
+            ResolvedStatement::DropDatabase { name } => {
+                let dbs = self.meta.list_databases().await?;
+                let db_meta = dbs.iter().find(|d| d.name == name).ok_or_else(|| {
+                    NovaError::DatabaseNotFound {
+                        db_name: name.clone(),
+                    }
+                })?;
+                self.meta.drop_database(db_meta.id).await?;
+                Ok(QueryResult::Success {
+                    message: format!("Database '{}' dropped", name),
+                })
+            }
+            ResolvedStatement::DropSchema { db, schema } => {
+                let dbs = self.meta.list_databases().await?;
+                let db_meta = dbs.iter().find(|d| d.name == db).ok_or_else(|| {
+                    NovaError::DatabaseNotFound {
+                        db_name: db.clone(),
+                    }
+                })?;
+                let schemas = self.meta.list_schemas(db_meta.id).await?;
+                let schema_meta = schemas.iter().find(|s| s.name == schema).ok_or_else(|| {
+                    NovaError::Internal {
+                        message: format!("schema '{}' not found", schema),
+                    }
+                })?;
+                self.meta.drop_schema(db_meta.id, schema_meta.id).await?;
+                Ok(QueryResult::Success {
+                    message: format!("Schema '{}.{}' dropped", db, schema),
+                })
+            }
         }
     }
 
