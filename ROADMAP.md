@@ -17,6 +17,7 @@
 | 6 | Cache & Polish | Month 10 | ✅ Complete | Auth, cache, RBAC, monitoring, HA, backup |
 | 7 | MySQL Protocol | — | ✅ Complete | Production-grade (40 tests) |
 | 8 | SQL Completeness | — | ✅ Complete | AGG, GROUP BY, ORDER BY, JOIN, DROP, multi-stmt, DataFusion |
+| 9 | Production Hardening | — | 🔴 In Progress | COW fix, cache invalidation, auth, RBAC, E2E tests, Foyer |
 
 ---
 
@@ -564,3 +565,109 @@ Phase 1 (Foundation)
 - [x] 275+ tests total
 - [x] clippy clean, fmt clean
 - [x] MySQL client can execute full SQL lifecycle
+
+---
+
+## Phase 9: Production Hardening (Gap Analysis — June 2026)
+
+> Remaining gaps from architecture spec + production requirements.
+> These are the last items before 100% production-ready.
+
+### P0: Critical (correctness + verification)
+
+#### 9.1: E2E Tests for DataFusion Path
+- [ ] E2E: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col)
+- [ ] E2E: GROUP BY with aggregates
+- [ ] E2E: ORDER BY col DESC
+- [ ] E2E: LIMIT / OFFSET
+- [ ] E2E: DISTINCT
+- [ ] E2E: HAVING (post-aggregate filter)
+- [ ] E2E: Subquery (SELECT * FROM (SELECT ...))
+
+#### 9.2: E2E Tests for JOIN
+- [ ] E2E: INNER JOIN (2 tables)
+- [ ] E2E: LEFT JOIN
+- [ ] E2E: 3-table JOIN
+- [ ] Verify CBO join reordering is active
+
+#### 9.3: COW Visibility Fix (DataFusion reads stale MPs)
+- [ ] After UPDATE/DELETE, DataFusion path must read updated active MPs
+- [ ] Root cause: exec_select_datafusion receives stale `mps` snapshot
+- [ ] Fix: re-fetch active MPs inside exec_select_datafusion, or invalidate cache on COW
+
+### P1: Important (production quality)
+
+#### 9.4: ResultCache Table Version Tracking
+- [ ] Track table versions from metadata (not empty HashMap)
+- [ ] Call meta.get_table_version() before cache lookup
+- [ ] Invalidate cache on INSERT/UPDATE/DELETE via version change
+- [ ] Test: insert → select (miss) → select (hit) → insert → select (miss)
+
+#### 9.5: Auth Enforcement in MySQL Handshake
+- [ ] Verify password via AuthManager during MySQL handshake
+- [ ] When auth.enabled=true, reject connections with wrong password
+- [ ] When auth.enabled=false, accept all (dev mode, current behavior)
+- [ ] Test: connect with correct password → success; wrong password → error
+
+#### 9.6: RBAC Enforcement in DDL/DML
+- [ ] Call rbac.check_privilege() before CREATE TABLE / DROP TABLE / INSERT / UPDATE / DELETE
+- [ ] Track current user from MySQL session
+- [ ] Test: non-admin user cannot DROP TABLE
+
+#### 9.7: DataFusion Path MP Pruning
+- [ ] NovaTableProvider::scan() should use filter predicates for MP pruning
+- [ ] Pass _filters to MicroPartitionScanExec for predicate pushdown
+- [ ] Currently: DataFusion path reads all active MPs, no pruning
+
+#### 9.8: DataFusion Path Statistics
+- [ ] NovaTableProvider should expose statistics to DataFusion optimizer
+- [ ] Implement TableProvider::statistics() method
+- [ ] Currently: statistics only collected in legacy path
+
+### P2: Enhancement (nice to have)
+
+#### 9.9: Foyer HybridCache (replace HashMap)
+- [ ] Replace HashMap in NovaCache with foyer::HybridCache (RAM + SSD)
+- [ ] Add LRU eviction policy
+- [ ] Add cache size limits (2GB RAM + 50GB SSD for result cache, 4GB RAM + 100GB SSD for MP cache)
+- [ ] Test: cache hit/miss/eviction
+
+#### 9.10: Parallel Scan in DataFusion Path
+- [ ] NovaTableProvider::scan() creates MicroPartitionScanExec with 1 partition per MP
+- [ ] DataFusion executes partitions in parallel automatically
+- [ ] Verify parallelism is actually happening (not sequential)
+
+#### 9.11: ALTER TABLE Support
+- [ ] Parser: sqlparser native ALTER TABLE
+- [ ] Analyzer: resolve to ResolvedStatement::AlterTable
+- [ ] Executor: add/drop column (creates new MP with updated schema)
+- [ ] Test: ALTER TABLE ADD COLUMN → INSERT → SELECT new column
+
+#### 9.12: Time Travel SQL Syntax
+- [ ] Parser: `SELECT * FROM t AT(TIMESTAMP => '2026-06-30 12:00:00')`
+- [ ] Analyzer: resolve to ResolvedStatement::Select with at_timestamp
+- [ ] Executor: use get_mps_at_timestamp() (already implemented)
+- [ ] Test: insert → wait → select AT TIMESTAMP → verify old data
+
+#### 9.13: E2E Tests for Snowflake Features
+- [ ] E2E: CREATE TABLE x CLONE y → verify data
+- [ ] E2E: CREATE STREAM s ON TABLE t
+- [ ] E2E: GC <retention> → verify old MPs deleted
+- [ ] E2E: BACKUP TO /path → RESTORE FROM /path
+
+#### 9.14: gRPC Proto Definitions (multi-node only)
+- [ ] Define .proto files for coordinator↔worker RPC
+- [ ] RegisterWorker, Heartbeat, ExecuteFragment, StreamResults
+- [ ] Generate tonic stubs
+- [ ] Future: enables distributed execution
+
+### Phase 9 Exit Criteria
+
+- [ ] All P0 features implemented with tests
+- [ ] All P1 features implemented with tests
+- [ ] 300+ tests total
+- [ ] COW visibility verified (UPDATE → SELECT sees updated data)
+- [ ] ResultCache invalidation verified (INSERT → cache miss)
+- [ ] Auth enforcement verified (wrong password rejected)
+- [ ] clippy clean, fmt clean
+- [ ] Zero TODO/FIXME in production code
