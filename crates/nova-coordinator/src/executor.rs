@@ -15,6 +15,8 @@ pub struct Executor {
     reader: MpReader,
     optimizer: NovaOptimizer,
     current_txn: Arc<std::sync::Mutex<Option<TxnId>>>,
+    #[allow(dead_code)]
+    rbac: crate::rbac::RbacManager,
 }
 
 /// Result of executing a SQL statement.
@@ -37,6 +39,7 @@ impl Executor {
             reader,
             optimizer: NovaOptimizer::new(),
             current_txn: Arc::new(std::sync::Mutex::new(None)),
+            rbac: crate::rbac::RbacManager::new(),
         }
     }
 
