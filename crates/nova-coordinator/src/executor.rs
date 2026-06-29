@@ -1,6 +1,7 @@
 // Executor — wire resolved SQL statements to storage layer.
 
 use crate::analyzer::{ResolvedExpr, ResolvedFilter, ResolvedStatement};
+use crate::optimizer::NovaOptimizer;
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use nova_common::*;
@@ -12,6 +13,7 @@ pub struct Executor {
     meta: Arc<dyn MetadataStore>,
     writer: MpWriter,
     reader: MpReader,
+    optimizer: NovaOptimizer,
 }
 
 /// Result of executing a SQL statement.
@@ -32,6 +34,7 @@ impl Executor {
             meta,
             writer,
             reader,
+            optimizer: NovaOptimizer::new(),
         }
     }
 
@@ -56,10 +59,10 @@ impl Executor {
                 schema,
                 table,
                 projection,
+                filter,
                 at_timestamp,
-                ..
             } => {
-                self.exec_select(db, schema, table, projection, at_timestamp)
+                self.exec_select(db, schema, table, projection, filter, at_timestamp)
                     .await
             }
             ResolvedStatement::Update {
@@ -236,6 +239,7 @@ impl Executor {
         schema: String,
         table: String,
         projection: Vec<String>,
+        filter: Option<ResolvedFilter>,
         at_timestamp: Option<u64>,
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(&db, &schema, &table).await?;
@@ -245,7 +249,26 @@ impl Executor {
             Some(ts) => self.meta.get_mps_at_timestamp(table_meta.id, ts).await?,
             None => self.meta.get_active_mps(table_meta.id).await?,
         };
-        if mps.is_empty() {
+
+        // Apply MP pruning via optimizer (skip MPs that can't match WHERE predicate)
+        let arrow_schema = build_arrow_schema(&table_meta);
+        // ponytail: pass filter separately to optimizer for pruning; refactor when DataFusion integration complete
+        let pruned_mps = if filter.is_some() {
+            let stmt_with_filter = ResolvedStatement::Select {
+                db: db.clone(),
+                schema: schema.clone(),
+                table: table.clone(),
+                projection: projection.clone(),
+                filter,
+                at_timestamp,
+            };
+            self.optimizer
+                .optimize_select(&stmt_with_filter, &mps, &arrow_schema)?
+        } else {
+            mps
+        };
+
+        if pruned_mps.is_empty() {
             let cols = if projection.contains(&"*".to_string()) {
                 table_meta.columns.iter().map(|c| c.name.clone()).collect()
             } else {
@@ -269,9 +292,9 @@ impl Executor {
             )
         };
 
-        // Read all MPs
+        // Read all pruned MPs
         let mut all_batches: Vec<RecordBatch> = Vec::new();
-        for mp in &mps {
+        for mp in &pruned_mps {
             let batches = self.reader.read(mp, col_indices.as_deref()).await?;
             all_batches.extend(batches);
         }
@@ -877,6 +900,64 @@ fn arrow_type(t: &NovaType) -> DataType {
 }
 
 /// Extract a string value from an Arrow array at a given row index.
+/// Build Arrow schema from table metadata.
+fn build_arrow_schema(table_meta: &TableMeta) -> std::sync::Arc<arrow::datatypes::Schema> {
+    let fields: Vec<arrow::datatypes::Field> = table_meta
+        .columns
+        .iter()
+        .map(|c| {
+            let dt = match &c.data_type {
+                NovaType::Boolean => arrow::datatypes::DataType::Boolean,
+                NovaType::Int8 => arrow::datatypes::DataType::Int8,
+                NovaType::Int16 => arrow::datatypes::DataType::Int16,
+                NovaType::Int32 => arrow::datatypes::DataType::Int32,
+                NovaType::Int64 => arrow::datatypes::DataType::Int64,
+                NovaType::Float32 => arrow::datatypes::DataType::Float32,
+                NovaType::Float64 => arrow::datatypes::DataType::Float64,
+                NovaType::Utf8 => arrow::datatypes::DataType::Utf8,
+                NovaType::Date32 => arrow::datatypes::DataType::Date32,
+                NovaType::Timestamp => arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    None,
+                ),
+                NovaType::Binary => arrow::datatypes::DataType::Binary,
+                NovaType::Decimal { precision, scale } => {
+                    arrow::datatypes::DataType::Decimal128(*precision, *scale)
+                }
+                NovaType::List(inner) => arrow::datatypes::DataType::List(std::sync::Arc::new(
+                    arrow::datatypes::Field::new("item", nova_type_to_arrow(inner), true),
+                )),
+            };
+            arrow::datatypes::Field::new(&c.name, dt, c.nullable)
+        })
+        .collect();
+    std::sync::Arc::new(arrow::datatypes::Schema::new(fields))
+}
+
+fn nova_type_to_arrow(t: &NovaType) -> arrow::datatypes::DataType {
+    match t {
+        NovaType::Boolean => arrow::datatypes::DataType::Boolean,
+        NovaType::Int8 => arrow::datatypes::DataType::Int8,
+        NovaType::Int16 => arrow::datatypes::DataType::Int16,
+        NovaType::Int32 => arrow::datatypes::DataType::Int32,
+        NovaType::Int64 => arrow::datatypes::DataType::Int64,
+        NovaType::Float32 => arrow::datatypes::DataType::Float32,
+        NovaType::Float64 => arrow::datatypes::DataType::Float64,
+        NovaType::Utf8 => arrow::datatypes::DataType::Utf8,
+        NovaType::Date32 => arrow::datatypes::DataType::Date32,
+        NovaType::Timestamp => {
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        }
+        NovaType::Binary => arrow::datatypes::DataType::Binary,
+        NovaType::Decimal { precision, scale } => {
+            arrow::datatypes::DataType::Decimal128(*precision, *scale)
+        }
+        NovaType::List(inner) => arrow::datatypes::DataType::List(std::sync::Arc::new(
+            arrow::datatypes::Field::new("item", nova_type_to_arrow(inner), true),
+        )),
+    }
+}
+
 fn array_value_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
     use arrow::array::*;
     if arr.is_null(row) {
