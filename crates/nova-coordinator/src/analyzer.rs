@@ -28,6 +28,7 @@ pub enum ResolvedStatement {
         projection: Vec<String>,
         filter: Option<ResolvedFilter>,
         at_timestamp: Option<Timestamp>,
+        raw_sql: Option<String>,
     },
     Update {
         db: String,
@@ -272,6 +273,7 @@ impl Analyzer {
                         projection,
                         filter: None,
                         at_timestamp: None,
+                        raw_sql: None,
                     })
                 } else {
                     Err(NovaError::SqlAnalysisError {

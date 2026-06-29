@@ -10,6 +10,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 
 /// Reads micro-partitions from object storage as Arrow RecordBatch streams.
+#[derive(Clone)]
 pub struct MpReader {
     store: Arc<dyn ObjectStore>,
     batch_size: usize,

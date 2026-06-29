@@ -66,8 +66,9 @@ impl Executor {
                 projection,
                 filter,
                 at_timestamp,
+                raw_sql,
             } => {
-                self.exec_select(db, schema, table, projection, filter, at_timestamp)
+                self.exec_select(db, schema, table, projection, filter, at_timestamp, raw_sql)
                     .await
             }
             ResolvedStatement::Update {
@@ -327,6 +328,7 @@ impl Executor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn exec_select(
         &self,
         db: String,
@@ -335,6 +337,7 @@ impl Executor {
         projection: Vec<String>,
         filter: Option<ResolvedFilter>,
         at_timestamp: Option<u64>,
+        raw_sql: Option<String>,
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(&db, &schema, &table).await?;
 
@@ -344,9 +347,28 @@ impl Executor {
             None => self.meta.get_active_mps(table_meta.id).await?,
         };
 
-        // Apply MP pruning via optimizer (skip MPs that can't match WHERE predicate)
+        // Handle empty table
+        if mps.is_empty() {
+            let cols = if projection.contains(&"*".to_string()) {
+                table_meta.columns.iter().map(|c| c.name.clone()).collect()
+            } else {
+                projection
+            };
+            return Ok(QueryResult::Rows {
+                columns: cols,
+                rows: vec![],
+            });
+        }
+
+        // Route through DataFusion if raw SQL is available (enables AGG, GROUP BY, ORDER BY, LIMIT, JOIN)
+        if let Some(sql_text) = raw_sql {
+            return self
+                .exec_select_datafusion(&table_meta, &mps, &sql_text)
+                .await;
+        }
+
+        // Fallback: direct storage read (legacy path for programmatic SELECT without raw SQL)
         let arrow_schema = build_arrow_schema(&table_meta);
-        // Save filter for row-level filtering (clone before move)
         let row_filter = filter.clone();
         let pruned_mps = if filter.is_some() {
             let stmt_with_filter = ResolvedStatement::Select {
@@ -356,6 +378,7 @@ impl Executor {
                 projection: projection.clone(),
                 filter,
                 at_timestamp,
+                raw_sql: None,
             };
             self.optimizer
                 .optimize_select(&stmt_with_filter, &mps, &arrow_schema)?
@@ -363,16 +386,12 @@ impl Executor {
             mps.clone()
         };
 
-        // Collect table statistics for CBO (logged for observability)
-        let table_stats =
-            crate::statistics::collect_table_stats(&pruned_mps, &table_meta, &arrow_schema);
         let total_mp_count = mps.len();
         tracing::debug!(
             table = %table,
             total_mps = total_mp_count,
             pruned_mps = pruned_mps.len(),
-            estimated_rows = ?table_stats.num_rows,
-            "SELECT stats"
+            "SELECT (legacy path)"
         );
 
         if pruned_mps.is_empty() {
@@ -387,22 +406,10 @@ impl Executor {
             });
         }
 
-        // Determine column indices for projection
-        let col_indices: Option<Vec<usize>> = if projection.contains(&"*".to_string()) {
-            None
-        } else {
-            Some(
-                projection
-                    .iter()
-                    .filter_map(|p| table_meta.columns.iter().position(|c| &c.name == p))
-                    .collect(),
-            )
-        };
-
         // Read all pruned MPs in parallel
         let read_futures: Vec<_> = pruned_mps
             .iter()
-            .map(|mp| self.reader.read(mp, col_indices.as_deref()))
+            .map(|mp| self.reader.read(mp, None))
             .collect();
         let results = futures::future::join_all(read_futures).await;
         let mut all_batches: Vec<RecordBatch> = Vec::new();
@@ -410,7 +417,6 @@ impl Executor {
             all_batches.extend(result?);
         }
 
-        // Convert to string rows for display
         let result_columns = if projection.contains(&"*".to_string()) {
             table_meta.columns.iter().map(|c| c.name.clone()).collect()
         } else {
@@ -420,7 +426,6 @@ impl Executor {
         let mut rows: Vec<Vec<String>> = Vec::new();
         for batch in &all_batches {
             for row_idx in 0..batch.num_rows() {
-                // Apply row-level filter (WHERE clause)
                 if let Some(ref filter) = row_filter {
                     let col_idx = table_meta
                         .columns
@@ -916,6 +921,34 @@ impl Executor {
         })
     }
 
+    /// Execute SELECT via DataFusion SessionContext (enables AGG, GROUP BY, ORDER BY, LIMIT, JOIN).
+    async fn exec_select_datafusion(
+        &self,
+        table_meta: &TableMeta,
+        mps: &[MicroPartitionMeta],
+        sql: &str,
+    ) -> Result<QueryResult> {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let reader = Arc::new(self.reader.clone());
+        let provider =
+            nova_worker::NovaTableProvider::new(table_meta.clone(), mps.to_vec(), reader);
+        ctx.register_table(&table_meta.name, Arc::new(provider))
+            .map_err(|e| NovaError::Internal {
+                message: format!("DataFusion register table failed: {}", e),
+            })?;
+
+        let df = ctx.sql(sql).await.map_err(|e| NovaError::Internal {
+            message: format!("DataFusion SQL execution failed: {}", e),
+        })?;
+
+        let batches = df.collect().await.map_err(|e| NovaError::Internal {
+            message: format!("DataFusion collect failed: {}", e),
+        })?;
+
+        let (columns, rows) = batches_to_query_result(&batches);
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
     async fn find_table(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
         let dbs = self.meta.list_databases().await?;
         let db_meta =
@@ -1070,6 +1103,29 @@ fn arrow_type(t: &NovaType) -> DataType {
 }
 
 /// Extract a string value from an Arrow array at a given row index.
+/// Convert DataFusion RecordBatches to QueryResult columns + rows.
+fn batches_to_query_result(batches: &[RecordBatch]) -> (Vec<String>, Vec<Vec<String>>) {
+    if batches.is_empty() {
+        return (vec![], vec![]);
+    }
+    let columns: Vec<String> = batches[0]
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row_idx in 0..batch.num_rows() {
+            let row: Vec<String> = (0..batch.num_columns())
+                .map(|col_idx| array_value_to_string(batch.column(col_idx), row_idx))
+                .collect();
+            rows.push(row);
+        }
+    }
+    (columns, rows)
+}
+
 /// Check if a row value matches the filter condition.
 fn row_matches_filter(val: &str, op: &str, expected: &ResolvedExpr) -> bool {
     match (op, expected) {
@@ -1316,6 +1372,7 @@ mod tests {
                 projection: vec!["id".to_string(), "name".to_string()],
                 filter: None,
                 at_timestamp: None,
+                raw_sql: None,
             })
             .await
             .unwrap();
@@ -1654,6 +1711,7 @@ mod tests {
                 projection: vec!["id".to_string()],
                 filter: None,
                 at_timestamp: Some(1), // very early timestamp
+                raw_sql: None,
             })
             .await
             .unwrap();

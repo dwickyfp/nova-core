@@ -159,6 +159,7 @@ mod tests {
             projection: vec!["*".to_string()],
             filter: None,
             at_timestamp: None,
+            raw_sql: None,
         };
         let mps = vec![make_mp(1, 0, 100), make_mp(2, 100, 200)];
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -184,6 +185,7 @@ mod tests {
                 value: ResolvedExpr::Int64(150),
             }),
             at_timestamp: None,
+            raw_sql: None,
         };
         // MP1: min=0, max=100 → pruned (can't have id > 150)
         // MP2: min=100, max=200 → kept (can have id > 150)

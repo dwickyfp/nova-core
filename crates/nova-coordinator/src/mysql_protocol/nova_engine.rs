@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use nova_common::Result;
 use std::sync::Arc;
 
-use crate::analyzer::Analyzer;
+use crate::analyzer::{Analyzer, ResolvedStatement};
 use crate::executor::QueryResult;
 use crate::mysql_protocol::query_engine::QueryEngine;
 use crate::parser::SqlParser;
@@ -52,7 +52,12 @@ impl QueryEngine for NovaEngine {
         for stmt in &stmts {
             // 2. Analyze (name resolution, type checking)
             let analyzer = Analyzer::new(current_db.to_string(), "public".to_string());
-            let resolved = analyzer.resolve(stmt)?;
+            let mut resolved = analyzer.resolve(stmt)?;
+
+            // Inject raw SQL for SELECT statements (DataFusion path)
+            if let ResolvedStatement::Select { raw_sql, .. } = &mut resolved {
+                *raw_sql = Some(sql.to_string());
+            }
 
             // 3. Plan (pass-through for single-node)
             let planned = self.planner.plan(resolved)?;
