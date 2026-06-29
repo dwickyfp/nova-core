@@ -930,12 +930,41 @@ impl Executor {
     ) -> Result<QueryResult> {
         let ctx = datafusion::prelude::SessionContext::new();
         let reader = Arc::new(self.reader.clone());
+
+        // Register the primary table
         let provider =
-            nova_worker::NovaTableProvider::new(table_meta.clone(), mps.to_vec(), reader);
+            nova_worker::NovaTableProvider::new(table_meta.clone(), mps.to_vec(), reader.clone());
         ctx.register_table(&table_meta.name, Arc::new(provider))
             .map_err(|e| NovaError::Internal {
                 message: format!("DataFusion register table failed: {}", e),
             })?;
+
+        // Find and register additional tables referenced in JOINs
+        // ponytail: simple scan for "JOIN <table>" patterns. Upgrade to sqlparser AST walk when needed.
+        let additional_tables = find_join_tables(sql, &table_meta.name);
+        for table_name in &additional_tables {
+            // Search all databases/schemas for this table
+            let dbs = self.meta.list_databases().await?;
+            for db in &dbs {
+                let schemas = self.meta.list_schemas(db.id).await?;
+                for schema in &schemas {
+                    if let Ok(tables) = self.meta.list_tables(db.id, schema.id).await
+                        && let Some(meta) = tables.iter().find(|t| t.name == *table_name)
+                    {
+                        let join_mps = self.meta.get_active_mps(meta.id).await?;
+                        if !join_mps.is_empty() {
+                            let join_provider = nova_worker::NovaTableProvider::new(
+                                meta.clone(),
+                                join_mps,
+                                reader.clone(),
+                            );
+                            let _ = ctx.register_table(&meta.name, Arc::new(join_provider));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
 
         let df = ctx.sql(sql).await.map_err(|e| NovaError::Internal {
             message: format!("DataFusion SQL execution failed: {}", e),
@@ -1103,6 +1132,33 @@ fn arrow_type(t: &NovaType) -> DataType {
 }
 
 /// Extract a string value from an Arrow array at a given row index.
+/// Find table names referenced in JOIN clauses (simple regex-like scan).
+fn find_join_tables(sql: &str, exclude: &str) -> Vec<String> {
+    let mut tables = Vec::new();
+    let upper = sql.to_uppercase();
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    let upper_words: Vec<&str> = upper.split_whitespace().collect();
+    for (i, w) in upper_words.iter().enumerate() {
+        if (*w == "JOIN" || *w == "INNER" || *w == "LEFT" || *w == "RIGHT" || *w == "CROSS")
+            && i + 1 < words.len()
+        {
+            // Skip JOIN keyword itself, find next word that's a table name
+            for j in (i + 1)..words.len() {
+                let next_upper = upper_words[j];
+                if next_upper == "JOIN" {
+                    continue;
+                }
+                let table = words[j].trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                if !table.is_empty() && table != exclude && !tables.contains(&table.to_string()) {
+                    tables.push(table.to_string());
+                }
+                break;
+            }
+        }
+    }
+    tables
+}
+
 /// Convert DataFusion RecordBatches to QueryResult columns + rows.
 fn batches_to_query_result(batches: &[RecordBatch]) -> (Vec<String>, Vec<Vec<String>>) {
     if batches.is_empty() {
