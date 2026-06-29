@@ -16,7 +16,9 @@ pub mod codec;
 pub mod commands;
 pub mod connection;
 pub mod errors;
+pub mod nova_engine;
 pub mod packets;
+pub mod query_engine;
 pub mod server;
 pub mod types;
 

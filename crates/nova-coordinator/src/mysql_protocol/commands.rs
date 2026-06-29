@@ -318,7 +318,7 @@ pub fn handle_stmt_execute(session: &mut Session, payload: &[u8]) -> CommandResu
     }
 }
 
-/// Handle COM_STMT_CLOSE
+/// Handle COM_STMT_CLOSE — silent, no response sent.
 pub fn handle_stmt_close(session: &mut Session, payload: &[u8]) -> CommandResult {
     if payload.len() < 4 {
         return CommandResult::Error {
@@ -332,8 +332,8 @@ pub fn handle_stmt_close(session: &mut Session, payload: &[u8]) -> CommandResult
 
     session.remove_prepared_statement(stmt_id);
 
-    // COM_STMT_CLOSE doesn't send a response
-    CommandResult::Close
+    // COM_STMT_CLOSE sends NO response — return Eof which we'll skip
+    CommandResult::Eof
 }
 
 /// Handle COM_SET_OPTION

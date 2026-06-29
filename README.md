@@ -1,48 +1,58 @@
 # nova-core
 
-> A Rust-native, cloud-native analytical query engine — built on Apache Arrow + DataFusion, inspired by Snowflake's architecture.
-> Time Travel · Zero-Copy Clone · Streams (CDC) · MVCC · Vectorized Execution · Hybrid Cache
+Rust-native, Snowflake-inspired analytical query engine built on Apache Arrow + DataFusion.
 
----
+## Quick Start
 
-## What is nova-core?
+```bash
+# 1. Start infrastructure (MinIO + FoundationDB)
+docker compose up -d
 
-nova-core is the **core query engine** for the Nova platform. It is NOT a management UI — it is the engine itself: storage, metadata, query planning, and execution.
+# 2. Build (default: sled backend for dev)
+cargo build --release
 
-### Why does it exist?
+# 3. Run
+./target/release/nova server --config config.toml
 
-Existing open-source OLAP engines (StarRocks, ClickHouse) have fundamental architectural limitations that prevent Snowflake-grade features:
-
-| Feature | StarRocks | ClickHouse | Snowflake | nova-core |
-|---|---|---|---|---|
-| Time Travel | ❌ (mutable storage) | ❌ | ✅ | ✅ (immutable MPs) |
-| Zero-Copy Clone | ❌ | ❌ | ✅ | ✅ (metadata copy) |
-| Streams (CDC) | ❌ (binlog dying) | ❌ | ✅ | ✅ (version diff) |
-| Query Result Cache | ❌ | ❌ | ✅ | ✅ (MVCC auto-invalidate) |
-| Memory Safety | ⚠️ (C++ UB) | ⚠️ (C++ UB) | ⚠️ (C++ UB) | ✅ (Rust) |
-| No GC Pauses | ❌ (Java FE) | ✅ | ❌ (Java) | ✅ (Rust) |
-| Open Source | ✅ | ✅ | ❌ | ✅ |
-| Self-Hosted | ✅ | ✅ | ❌ | ✅ |
-
-### The core insight
-
-Snowflake's features (Time Travel, Clone, Streams) come from **immutable micro-partition storage**, not from the programming language. nova-core adopts this architecture:
-
-```
-Data is stored as IMMUTABLE Parquet files (micro-partitions) in S3/MinIO.
-UPDATE/DELETE = create a NEW micro-partition (old one retained for Time Travel).
-Clone = copy metadata only (same S3 files, zero data copy).
-Stream = diff old vs new micro-partition versions.
-Result cache = keyed by MVCC table version (auto-invalidates on data change).
+# 4. Connect via MySQL protocol
+mysql -h 127.0.0.1 -P 3306 -u root
 ```
 
-### Performance foundation
+## Metadata Backend
 
-nova-core is built on **Apache DataFusion** — the #1 fastest single-node engine for querying Parquet files (ClickBench, November 2024), beating DuckDB and ClickHouse. It is the first Rust-based engine to hold the top spot.
+nova-core supports two metadata backends, controlled by `config.toml`:
 
----
+### Sled (default, dev)
+Embedded KV store. Zero external dependencies. Single binary.
 
-## Architecture (30-second overview)
+```toml
+[metadata]
+backend = "sled"
+sled_path = "./data/nova-meta"
+```
+
+### FoundationDB (production)
+Distributed ACID KV store. Requires Docker.
+
+```toml
+[metadata]
+backend = "fdb"
+fdb_cluster_file = "docker:docker@127.0.0.1:4500"
+```
+
+Build with FDB support:
+```bash
+cargo build --release --features nova-cli/fdb-backend
+```
+
+Start FoundationDB via Docker:
+```bash
+docker compose up -d fdb
+# Initialize FDB database (first time only):
+docker compose run --rm init
+```
+
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -62,134 +72,138 @@ nova-core is built on **Apache DataFusion** — the #1 fastest single-node engin
 
 Full architecture: [`docs/design/architecture.md`](docs/design/architecture.md)
 
----
-
 ## Tech Stack
 
-| Component | Technology | Why |
+| Component | Crate | Notes |
 |---|---|---|
-| Language | **Rust** (edition 2024) | Memory safety, no GC, performance |
-| SQL Parser | `sqlparser-rs` | ANSI SQL, extensible dialect |
-| Query Engine | `DataFusion` | #1 ClickBench, vectorized, push-based |
-| Columnar Format | `Apache Arrow` | Industry standard, zero-copy |
-| Storage Format | `Parquet` | Columnar, compressed, stats in footer |
-| Metadata Store | `FoundationDB` | ACID KV, proven at Snowflake scale |
-| Object Storage | `object_store` crate | S3/GCS/Azure/MinIO abstraction |
-| Hybrid Cache | `foyer` | RAM + SSD, used by RisingWave |
-| Consensus | `openraft` | Coordinator HA, leader election |
-| RPC | `tonic` (gRPC) | Coordinator ↔ Worker communication |
-| HTTP API | `axum` | REST API for Nova UI |
-| MySQL Protocol | `mysql_wire` | MySQL wire compatibility |
-| Python UDF | `PyO3` | In-process Python FFI |
-| Auth | `argon2` | Password hashing |
-
----
+| Language | Rust 2024 | Memory safety, no GC |
+| SQL Parser | sqlparser-rs 0.52 | |
+| Query Engine | DataFusion 45 | #1 ClickBench Nov 2024 |
+| Columnar | Arrow 54 + Parquet 54 | |
+| Metadata (prod) | FoundationDB 7.4 | ACID distributed KV |
+| Metadata (dev) | sled 0.34 | Embedded KV |
+| Object Storage | object_store 0.11 | S3/MinIO |
+| Cache | foyer 0.16 | RAM + SSD hybrid |
+| Consensus | openraft 0.9 | Coordinator HA |
+| RPC | tonic 0.12 | gRPC |
+| MySQL Protocol | Custom (10 modules) | Production-grade |
 
 ## Project Structure
 
 ```
 nova-core/
-├── Cargo.toml                  # Workspace root
-├── README.md                   # This file
-├── AGENTS.md                   # Guide for AI coding agents
-├── CLAUDE.md                   # Claude Code specific guide
-├── ROADMAP.md                  # Development roadmap (all phases)
-├── Justfile                    # Task runner commands
-│
 ├── crates/
-│   ├── nova-common/            # Shared types, errors, protobuf
-│   ├── nova-coordinator/       # SQL parsing, optimization, scheduling
-│   ├── nova-worker/            # Execution engine, cache, storage I/O
-│   ├── nova-storage/           # Micro-partition R/W, metadata ops
-│   └── nova-cli/               # CLI binary (nova-server, nova-worker)
-│
-├── docs/
-│   ├── design/
-│   │   └── architecture.md     # Complete architecture document
-│   ├── guide/
-│   │   ├── getting-started.md  # Setup, build, first query
-│   │   ├── contributing.md     # How to contribute
-│   │   └── coding-standards.md # Rust conventions, patterns
-│   └── research/
-│       └── papers.md           # Research paper references
-│
-├── skills/
-│   └── nova-core-development/  # Agent skill for nova-core dev
-│       └── SKILL.md
-│
-├── references/
-│   ├── tech-choices.md         # Why each technology was chosen
-│   ├── performance-targets.md # Benchmark targets and methodology
-│   └── snowflake-parity.md    # Feature parity tracking
-│
-├── .github/
-│   └── workflows/
-│       └── ci.yml              # GitHub Actions CI
-│
-└── docker/
-    ├── Dockerfile.coordinator
-    ├── Dockerfile.worker
-    └── docker-compose.yml      # Local dev: 1 coordinator + 2 workers + MinIO + FDB
+│   ├── nova-common/         # Shared types, errors
+│   ├── nova-coordinator/    # SQL parsing, optimization, scheduling, MySQL protocol
+│   ├── nova-worker/         # Execution engine, custom DataFusion operators
+│   ├── nova-storage/        # Micro-partition R/W, metadata (sled + FDB)
+│   └── nova-cli/            # CLI binary (nova server)
+├── docker-compose.yml       # FoundationDB + MinIO
+├── config.toml              # Server configuration
+├── docs/design/             # Architecture documentation
+└── ROADMAP.md               # Development phases
 ```
 
----
+## Implementation Status
 
-## Quick Start
+### Phase 1: Foundation ✅
+- [x] Cargo workspace (5 crates, 15K+ LOC)
+- [x] SledMetadataStore (815 lines, fully implemented)
+- [x] FdbMetadataStore (590 lines, feature-gated `fdb-backend`)
+- [x] FoundationDB Docker container + init
+- [x] MpWriter (Arrow → Parquet → S3)
+- [x] MpReader (S3 → Parquet → Arrow)
+- [x] SQL Parser (CREATE DATABASE/TABLE, INSERT, SELECT, UPDATE, DELETE)
+- [x] Analyzer (name resolution, type checking)
+- [x] Executor (DDL, DML, SELECT with WHERE)
+- [x] MySQL wire protocol (10 modules, 40 tests, production-grade)
+- [x] Config switch (sled/fdb via config.toml)
+- [x] 258 tests
+
+### Phase 2: Query Engine ⚠️ (code exists, NOT wired)
+- [x] MP Pruning (360 lines) — NOT wired into executor
+- [x] CBO (591 lines) — NOT wired
+- [x] Statistics (349 lines) — NOT wired
+- [x] MicroPartitionScanExec (341 lines) — NOT wired into DataFusion
+- [ ] Optimizer — STUB (20 lines)
+- [ ] Planner — STUB (19 lines)
+- [ ] Scheduler — STUB (19 lines)
+- [ ] DataFusion SessionContext integration
+- [ ] Wire optimizer → planner → scheduler → executor pipeline
+
+### Phase 3: Snowflake Features ⚠️ (partial)
+- [x] Transaction Manager (MVCC, 248 lines) — NOT wired
+- [x] UPDATE/DELETE (COW in executor)
+- [x] Time Travel (get_mps_at_timestamp)
+- [ ] Clone (metadata exists, no SQL syntax)
+- [ ] Streams (metadata exists, no SQL syntax)
+- [ ] GC (delete expired MPs)
+- [ ] Wire txn manager into executor
+
+### Phase 4: Distributed ⚠️ (code exists, NOT wired)
+- [x] Raft (209 lines) — NOT wired
+- [x] Distributed exec (321 lines) — NOT wired
+- [x] Worker Pool (283 lines) — NOT wired
+- [x] Auto-scaling (284 lines) — NOT wired
+- [ ] gRPC protobuf definitions
+- [ ] Worker binary (nova worker command)
+- [ ] Wire worker pool → scheduler → distributed exec
+
+### Phase 5: CBO Enhancement ⚠️ (code exists, NOT wired)
+- [x] Runtime Filter / Bloom (255 lines) — NOT wired
+- [x] Late Materialization (289 lines) — NOT wired
+- [x] Advanced Stats: Histograms + MCV (342 lines) — NOT wired
+- [ ] Dictionary Encoding
+- [ ] Wire all into optimizer pipeline
+
+### Phase 6: Cache & Polish ⚠️ (code exists, NOT wired)
+- [x] 3-layer Foyer Cache (485 lines) — NOT wired
+- [x] Result Cache (269 lines) — NOT wired
+- [x] RBAC (361 lines) — NOT wired
+- [x] Monitoring / Prometheus (391 lines) — NOT wired
+- [x] HA / Health Check (360 lines) — NOT wired
+- [x] Backup / Restore (355 lines) — NOT wired
+- [ ] Auth — STUB (20 lines)
+- [ ] storage/cache.rs — STUB (24 lines)
+- [ ] Wire all into server startup
+
+### Phase 7: MySQL Wire Protocol ✅
+- [x] Production-grade MySQL protocol (10 modules, 40 tests)
+- [x] Handshake V10, auth (mysql_native_password + caching_sha2_password)
+- [x] COM_QUERY, COM_PING, COM_QUIT, COM_INIT_DB, COM_FIELD_LIST
+- [x] CLIENT_QUERY_ATTRIBUTES support
+- [x] ResultSet, column definitions, EOF/OK packets
+- [x] mysql-connector-python (use_pure=True) compatibility verified
+
+## Build Commands
 
 ```bash
-# Clone
-git clone git@github.com:dwickyfp/nova-core.git
-cd nova-core
-
-# Build
+# Default build (sled backend)
 cargo build --release
 
-# Run local dev cluster (MinIO + FoundationDB + 1 coordinator + 2 workers)
-docker compose -f docker/docker-compose.yml up -d
+# FDB build
+cargo build --release --features nova-cli/fdb-backend
 
-# Connect via MySQL protocol
-mysql -h 127.0.0.1 -P 4406 -u root
+# Tests
+cargo test -p nova-common
+cargo test -p nova-storage
+cargo test -p nova-coordinator
 
-# Create table and query
-CREATE TABLE orders (id INT, amount DECIMAL(10,2), status VARCHAR(20), dt DATE);
-INSERT INTO orders VALUES (1, 500.00, 'pending', '2026-06-23');
-SELECT * FROM orders WHERE status = 'pending';
-
-# Time Travel (query data as of 1 hour ago)
-SELECT * FROM orders AT(TIMESTAMP => '2026-06-23 10:00:00');
-
-# Zero-copy clone
-CREATE TABLE orders_dev CLONE orders;
-
-# Stream (CDC)
-CREATE STREAM orders_stream ON TABLE orders;
-SELECT * FROM orders_stream;
+# Lint
+cargo clippy --workspace -- -D warnings
+cargo fmt --all -- --check
 ```
 
----
+## Docker Infrastructure
 
-## Development Status
-
-**Phase 1: Foundation** — In Progress
-
-See [ROADMAP.md](ROADMAP.md) for detailed milestones.
-
----
+```yaml
+# docker-compose.yml services:
+- fdb:        FoundationDB 7.4.0  (port 4500)
+- minio:      MinIO S3            (ports 9000, 9001)
+- init:       FDB database init   (one-shot)
+- createbucket: MinIO bucket init (one-shot)
+```
 
 ## License
 
-Apache License 2.0
-
----
-
-## Research Foundation
-
-This project is built on decades of database systems research. See [`docs/research/papers.md`](docs/research/papers.md) for the full list of papers that inform the architecture.
-
-Key influences:
-- **MonetDB/X100** (CIDR 2005) — Vectorized execution model
-- **Snowflake** (SIGMOD 2016, NSDI 2020) — Cloud-native architecture, immutable micro-partitions
-- **C-Store / Vertica** (VLDB 2012) — Late materialization, sideways information passing
-- **DuckDB** (CMU 2023) — Push-based execution model
-- **Apache DataFusion** (ClickBench 2024) — Fastest Rust Parquet engine
-- **Foyer / RisingWave** — Hybrid cache for object storage
+Apache-2.0

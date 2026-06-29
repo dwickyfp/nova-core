@@ -2,10 +2,14 @@
 //!
 //! The MetadataStore trait defines the interface for all metadata operations.
 //! Implementations:
-//! - `SledMetadataStore` — embedded KV store for local dev/testing
-//! - `FdbMetadataStore` — FoundationDB for production (TODO: Phase 1)
+//! - `SledMetadataStore` — embedded KV store for local dev/testing (default)
+//! - `FdbMetadataStore` — FoundationDB for production (feature = "fdb-backend")
 
+#[cfg(feature = "sled-backend")]
 pub mod sled_store;
+
+#[cfg(feature = "fdb-backend")]
+pub mod fdb_store;
 
 use async_trait::async_trait;
 use nova_common::{Result, *};

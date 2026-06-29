@@ -118,18 +118,16 @@ impl PacketCodec {
             seq,
         ];
 
-        self.stream
-            .write_all(&header)
-            .await
-            .map_err(|e| NovaError::Internal {
-                message: format!("write packet header failed: {}", e),
-            })?;
+        // Combine header + payload into single write to avoid TCP fragmentation
+        let mut buf = Vec::with_capacity(4 + payload.len());
+        buf.extend_from_slice(&header);
+        buf.extend_from_slice(payload);
 
         self.stream
-            .write_all(payload)
+            .write_all(&buf)
             .await
             .map_err(|e| NovaError::Internal {
-                message: format!("write packet payload failed: {}", e),
+                message: format!("write packet failed: {}", e),
             })?;
 
         self.stream.flush().await.map_err(|e| NovaError::Internal {

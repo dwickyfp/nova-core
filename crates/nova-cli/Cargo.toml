@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+fdb-backend = ["nova-storage/fdb-backend"]
+
 [[bin]]
 name = "nova"
 path = "src/main.rs"
@@ -19,3 +23,5 @@ tracing-subscriber = { workspace = true }
 figment = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
+object_store = { workspace = true }
+serde = { workspace = true }

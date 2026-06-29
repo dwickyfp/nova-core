@@ -8,6 +8,14 @@ pub mod mp_writer;
 
 // Re-exports
 pub use cache::NovaCache;
-pub use metadata::{MetadataStore, sled_store::SledMetadataStore};
 pub use mp_reader::MpReader;
 pub use mp_writer::MpWriter;
+
+// Metadata store backends
+#[cfg(feature = "sled-backend")]
+pub use metadata::sled_store::SledMetadataStore;
+
+#[cfg(feature = "fdb-backend")]
+pub use metadata::fdb_store::FdbMetadataStore;
+
+pub use metadata::MetadataStore;

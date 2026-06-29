@@ -1,0 +1,86 @@
+version: "3.9"
+
+services:
+  # ─── FoundationDB (metadata store for production) ───
+  fdb:
+    image: foundationdb/foundationdb:7.4.0
+    container_name: nova-fdb
+    ports:
+      - "4500:4500"
+    environment:
+      FDB_NETWORKING_MODE: host
+    volumes:
+      - nova-fdb-data:/var/lib/foundationdb
+      - nova-fdb-logs:/var/log/foundationdb
+    healthcheck:
+      test: ["CMD", "fdbcli", "--exec", "status", "--timeout", "5"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    networks:
+      - nova-net
+
+  # ─── MinIO (S3-compatible object storage) ───
+  minio:
+    image: minio/minio:latest
+    container_name: nova-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: nova
+      MINIO_ROOT_PASSWORD: nova12345
+    command: server /data --console-address ":9001"
+    volumes:
+      - nova-minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - nova-net
+
+  # ─── Auto-create MinIO bucket + FDB database ───
+  init:
+    image: foundationdb/foundationdb:7.4.0
+    container_name: nova-init
+    depends_on:
+      fdb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      fdbcli --cluster docker:docker@fdb:4500 --exec 'configure new single memory' --timeout 10;
+      echo 'FDB database configured';
+      "
+    restart: "no"
+    networks:
+      - nova-net
+
+  # ─── Create MinIO bucket ───
+  createbucket:
+    image: minio/mc:latest
+    container_name: nova-createbucket
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set nova http://minio:9000 nova nova12345;
+      mc mb nova/nova --ignore-existing;
+      echo 'Bucket nova created';
+      "
+    restart: "no"
+    networks:
+      - nova-net
+
+volumes:
+  nova-fdb-data:
+  nova-fdb-logs:
+  nova-minio-data:
+
+networks:
+  nova-net:
+    driver: bridge

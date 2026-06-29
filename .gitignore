@@ -23,3 +23,4 @@ Thumbs.db
 
 # Benchmark artifacts
 benchmarks/results/
+data/
