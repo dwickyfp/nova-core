@@ -126,11 +126,13 @@ nova-core/
 - [x] QueryScheduler (local execution via Executor)
 - [x] NovaEngine pipeline: Parser → Analyzer → Planner → Scheduler → Executor
 - [x] MP pruning active: WHERE filter → skip MPs that can't match
+- [x] Statistics collection wired (collect_table_stats called in exec_select)
+- [x] NovaTableProvider (DataFusion TableProvider, 133 lines)
+- [x] MicroPartitionScanExec registered as physical plan
 - [x] build_arrow_schema: NovaType → Arrow DataType mapping
 - [x] 5 new tests (optimizer, planner, scheduler)
-- [ ] DataFusion SessionContext integration (future)
-- [ ] CBO join reordering wired (code exists, not connected)
-- [ ] Statistics collection wired (code exists, not connected)
+- [ ] CBO join reordering (needs JOIN support in parser/analyzer — future phase)
+- [ ] DataFusion SessionContext full integration (table provider ready, registration TBD)
 
 ### Phase 3: Snowflake Features ⚠️ (partial)
 - [x] Transaction Manager (MVCC, 248 lines) — NOT wired

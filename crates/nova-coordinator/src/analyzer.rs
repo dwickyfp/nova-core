@@ -56,6 +56,10 @@ pub enum ResolvedStatement {
         table: String,
         append_only: bool,
     },
+    /// Garbage collect expired micro-partitions.
+    Gc {
+        retention_days: u32,
+    },
 }
 
 #[derive(Debug)]

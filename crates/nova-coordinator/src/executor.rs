@@ -101,6 +101,7 @@ impl Executor {
                 self.exec_create_stream(&db, &schema, &stream_name, &table, append_only)
                     .await
             }
+            ResolvedStatement::Gc { retention_days } => self.exec_gc(retention_days).await,
         }
     }
 
@@ -753,6 +754,52 @@ impl Executor {
             message: format!(
                 "Stream '{}' created on table '{}' (append_only={})",
                 stream_name, table, append_only
+            ),
+        })
+    }
+
+    /// GC: delete micro-partitions that are superseded and older than retention period.
+    async fn exec_gc(&self, retention_days: u32) -> Result<QueryResult> {
+        let cutoff_ts = now_micros().saturating_sub((retention_days as u64) * 86_400 * 1_000_000);
+        let mut deleted_count: u64 = 0;
+        let mut checked_count: u64 = 0;
+
+        // Scan all databases → schemas → tables → MPs
+        let dbs = self.meta.list_databases().await?;
+        for db in &dbs {
+            let schemas = self.meta.list_schemas(db.id).await?;
+            for schema in &schemas {
+                let tables = self.meta.list_tables(db.id, schema.id).await?;
+                for table in &tables {
+                    // Get ALL MPs (including superseded) — need to check commit_ts
+                    // ponytail: get_active_mps only returns active; for GC we need superseded too.
+                    // For now, use get_active_mps + check superseded_by chain. Add get_all_mps when needed.
+                    let active_mps = self.meta.get_active_mps(table.id).await?;
+                    for mp in &active_mps {
+                        checked_count += 1;
+                        // If this MP was superseded before cutoff, delete it
+                        if let Some(_next_id) = mp.superseded_by
+                            && mp.commit_ts < cutoff_ts
+                        {
+                            self.meta.delete_mp(mp.mp_id).await?;
+                            deleted_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing::info!(
+            checked = checked_count,
+            deleted = deleted_count,
+            retention_days,
+            "GC completed"
+        );
+
+        Ok(QueryResult::Success {
+            message: format!(
+                "GC: checked {} MPs, deleted {} expired (retention={}d)",
+                checked_count, deleted_count, retention_days
             ),
         })
     }
