@@ -252,7 +252,6 @@ impl Executor {
 
         // Apply MP pruning via optimizer (skip MPs that can't match WHERE predicate)
         let arrow_schema = build_arrow_schema(&table_meta);
-        // ponytail: pass filter separately to optimizer for pruning; refactor when DataFusion integration complete
         let pruned_mps = if filter.is_some() {
             let stmt_with_filter = ResolvedStatement::Select {
                 db: db.clone(),
@@ -265,8 +264,20 @@ impl Executor {
             self.optimizer
                 .optimize_select(&stmt_with_filter, &mps, &arrow_schema)?
         } else {
-            mps
+            mps.clone()
         };
+
+        // Collect table statistics for CBO (logged for observability)
+        let table_stats =
+            crate::statistics::collect_table_stats(&pruned_mps, &table_meta, &arrow_schema);
+        let total_mp_count = mps.len();
+        tracing::debug!(
+            table = %table,
+            total_mps = total_mp_count,
+            pruned_mps = pruned_mps.len(),
+            estimated_rows = ?table_stats.num_rows,
+            "SELECT stats"
+        );
 
         if pruned_mps.is_empty() {
             let cols = if projection.contains(&"*".to_string()) {

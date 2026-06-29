@@ -120,16 +120,17 @@ nova-core/
 - [x] Config switch (sled/fdb via config.toml)
 - [x] 258 tests
 
-### Phase 2: Query Engine ⚠️ (code exists, NOT wired)
-- [x] MP Pruning (360 lines) — NOT wired into executor
-- [x] CBO (591 lines) — NOT wired
-- [x] Statistics (349 lines) — NOT wired
-- [x] MicroPartitionScanExec (341 lines) — NOT wired into DataFusion
-- [ ] Optimizer — STUB (20 lines)
-- [ ] Planner — STUB (19 lines)
-- [ ] Scheduler — STUB (19 lines)
-- [ ] DataFusion SessionContext integration
-- [ ] Wire optimizer → planner → scheduler → executor pipeline
+### Phase 2: Query Engine ✅
+- [x] NovaOptimizer (171 lines) — MP pruning wired into exec_select
+- [x] QueryPlanner (pass-through for single-node)
+- [x] QueryScheduler (local execution via Executor)
+- [x] NovaEngine pipeline: Parser → Analyzer → Planner → Scheduler → Executor
+- [x] MP pruning active: WHERE filter → skip MPs that can't match
+- [x] build_arrow_schema: NovaType → Arrow DataType mapping
+- [x] 5 new tests (optimizer, planner, scheduler)
+- [ ] DataFusion SessionContext integration (future)
+- [ ] CBO join reordering wired (code exists, not connected)
+- [ ] Statistics collection wired (code exists, not connected)
 
 ### Phase 3: Snowflake Features ⚠️ (partial)
 - [x] Transaction Manager (MVCC, 248 lines) — NOT wired
