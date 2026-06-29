@@ -928,7 +928,10 @@ impl Executor {
         mps: &[MicroPartitionMeta],
         sql: &str,
     ) -> Result<QueryResult> {
-        let ctx = datafusion::prelude::SessionContext::new();
+        // Disable EnforceDistribution (requires children for custom scan operators)
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        config.options_mut().optimizer.skip_failed_rules = true;
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
         let reader = Arc::new(self.reader.clone());
 
         // Register the primary table

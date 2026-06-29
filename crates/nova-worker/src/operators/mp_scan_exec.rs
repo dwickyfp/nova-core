@@ -109,9 +109,8 @@ impl ExecutionPlan for MicroPartitionScanExec {
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::Internal(
-            "MicroPartitionScanExec has no children".to_string(),
-        ))
+        // Leaf node — return self unchanged. Required by EnforceDistribution optimizer rule.
+        Ok(self)
     }
 
     fn execute(
