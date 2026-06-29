@@ -9,6 +9,8 @@ use sqlparser::ast::{BinaryOperator, Expr, Value};
 
 use crate::analyzer::{ResolvedFilter, ResolvedStatement};
 use crate::mp_pruning;
+use crate::optimizer_rules::{LateMaterializationPlan, plan_late_materialization};
+use crate::statistics;
 
 /// Nova optimizer: applies pruning and optimization rules.
 pub struct NovaOptimizer;
@@ -29,7 +31,6 @@ impl NovaOptimizer {
         if let ResolvedStatement::Select { filter, .. } = stmt {
             match filter {
                 Some(f) => {
-                    // Convert ResolvedFilter → sqlparser Expr for mp_pruning
                     let expr = resolved_filter_to_expr(f);
                     Ok(mp_pruning::prune_mps(mps, &expr, schema))
                 }
@@ -38,6 +39,35 @@ impl NovaOptimizer {
         } else {
             Ok(mps.to_vec())
         }
+    }
+
+    /// Plan late materialization for a SELECT with filter + projection.
+    /// Returns a plan that describes which columns to read first (filter) vs later (projection).
+    pub fn plan_late_materialization(
+        &self,
+        stmt: &ResolvedStatement,
+    ) -> Option<LateMaterializationPlan> {
+        if let ResolvedStatement::Select {
+            projection, filter, ..
+        } = stmt
+        {
+            let filter_col = filter.as_ref().map(|f| vec![f.column.clone()])?;
+            let column_sizes: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            plan_late_materialization(&filter_col, projection, 0.1, &column_sizes)
+        } else {
+            None
+        }
+    }
+
+    /// Collect table statistics for CBO.
+    pub fn collect_stats(
+        &self,
+        mps: &[MicroPartitionMeta],
+        table: &nova_common::TableMeta,
+        schema: &arrow::datatypes::SchemaRef,
+    ) -> datafusion::common::stats::Statistics {
+        statistics::collect_table_stats(mps, table, schema)
     }
 }
 
