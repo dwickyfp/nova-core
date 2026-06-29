@@ -151,6 +151,21 @@ async fn main() -> anyhow::Result<()> {
             let _monitoring = QueryMetrics::default();
             tracing::info!("Monitoring initialized (query metrics ready)");
 
+            // Phase 4: Initialize WorkerPool (single-node mode — self-registered)
+            let worker_pool = nova_coordinator::worker_pool::WorkerPool::new();
+            let _self_worker_id = worker_pool
+                .register("127.0.0.1:0".to_string())
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to register self as worker: {}", e))?;
+            tracing::info!("WorkerPool initialized (single-node mode, self-registered)");
+
+            // Phase 4: Initialize AutoScaler (passive — no auto-scaling in single-node)
+            let _auto_scaler = nova_coordinator::auto_scaling::AutoScaler::new(
+                nova_coordinator::auto_scaling::ScalingPolicy::default(),
+                nova_coordinator::auto_scaling::WarehouseSize::Small,
+            );
+            tracing::info!("AutoScaler initialized (passive, single-node)");
+
             let engine = Arc::new(NovaEngine::new(executor));
 
             // Start MySQL server
