@@ -41,32 +41,34 @@ impl QueryEngine for NovaEngine {
             }
         }
 
-        // 1. Parse
+        // 1. Parse all statements
         let stmts = self.parser.parse(sql)?;
-        let stmt = stmts
-            .first()
-            .ok_or_else(|| nova_common::NovaError::SqlParseError {
-                message: "empty SQL".to_string(),
-            })?;
 
-        // 2. Analyze (name resolution, type checking)
-        let analyzer = Analyzer::new(current_db.to_string(), "public".to_string());
-        let resolved = analyzer.resolve(stmt)?;
+        // Execute each statement in order. Return result of the last one.
+        let mut last_result = QueryResult::Success {
+            message: format!("{} statement(s) executed", stmts.len()),
+        };
 
-        // 3. Plan (pass-through for single-node)
-        let planned = self.planner.plan(resolved)?;
+        for stmt in &stmts {
+            // 2. Analyze (name resolution, type checking)
+            let analyzer = Analyzer::new(current_db.to_string(), "public".to_string());
+            let resolved = analyzer.resolve(stmt)?;
 
-        // 4. Schedule + Execute
-        let result = self.scheduler.execute(planned).await?;
+            // 3. Plan (pass-through for single-node)
+            let planned = self.planner.plan(resolved)?;
 
-        // 5. Cache SELECT results
-        if let QueryResult::Rows { columns, rows } = &result {
-            let empty_versions = std::collections::HashMap::new();
-            self.result_cache
-                .put(sql, empty_versions, columns.clone(), rows.clone())
-                .await;
+            // 4. Schedule + Execute
+            last_result = self.scheduler.execute(planned).await?;
+
+            // 5. Cache SELECT results
+            if let QueryResult::Rows { columns, rows } = &last_result {
+                let empty_versions = std::collections::HashMap::new();
+                self.result_cache
+                    .put(sql, empty_versions, columns.clone(), rows.clone())
+                    .await;
+            }
         }
 
-        Ok(result)
+        Ok(last_result)
     }
 }
