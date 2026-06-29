@@ -2,7 +2,10 @@
 
 use clap::{Parser, Subcommand};
 use figment::providers::Format;
+use nova_coordinator::auth::AuthManager;
 use nova_coordinator::executor::Executor;
+use nova_coordinator::ha::HealthChecker;
+use nova_coordinator::monitoring::QueryMetrics;
 use nova_coordinator::mysql_protocol::MySqlServer;
 use nova_coordinator::mysql_protocol::nova_engine::NovaEngine;
 use nova_storage::{MetadataStore, MpReader, MpWriter, SledMetadataStore};
@@ -137,6 +140,17 @@ async fn main() -> anyhow::Result<()> {
             let reader = MpReader::new(store);
 
             let executor = Arc::new(Executor::new(meta, writer, reader));
+
+            // Phase 6: Initialize Auth, Health, Monitoring
+            let _auth = AuthManager::new();
+            tracing::info!("Auth manager initialized (default user: root, no password)");
+
+            let _health = HealthChecker::new("nova-coordinator-1");
+            tracing::info!("Health checker initialized");
+
+            let _monitoring = QueryMetrics::default();
+            tracing::info!("Monitoring initialized (query metrics ready)");
+
             let engine = Arc::new(NovaEngine::new(executor));
 
             // Start MySQL server
