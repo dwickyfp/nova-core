@@ -399,11 +399,15 @@ impl Executor {
             )
         };
 
-        // Read all pruned MPs
+        // Read all pruned MPs in parallel
+        let read_futures: Vec<_> = pruned_mps
+            .iter()
+            .map(|mp| self.reader.read(mp, col_indices.as_deref()))
+            .collect();
+        let results = futures::future::join_all(read_futures).await;
         let mut all_batches: Vec<RecordBatch> = Vec::new();
-        for mp in &pruned_mps {
-            let batches = self.reader.read(mp, col_indices.as_deref()).await?;
-            all_batches.extend(batches);
+        for result in results {
+            all_batches.extend(result?);
         }
 
         // Convert to string rows for display
