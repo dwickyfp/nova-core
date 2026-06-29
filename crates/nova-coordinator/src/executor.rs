@@ -14,6 +14,7 @@ pub struct Executor {
     writer: MpWriter,
     reader: MpReader,
     optimizer: NovaOptimizer,
+    current_txn: Arc<std::sync::Mutex<Option<TxnId>>>,
 }
 
 /// Result of executing a SQL statement.
@@ -35,6 +36,7 @@ impl Executor {
             writer,
             reader,
             optimizer: NovaOptimizer::new(),
+            current_txn: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -104,16 +106,46 @@ impl Executor {
             ResolvedStatement::Gc { retention_days } => self.exec_gc(retention_days).await,
             ResolvedStatement::Begin => {
                 let txn_id = self.meta.begin_transaction().await?;
+                let mut txn_guard = self.current_txn.lock().unwrap();
+                *txn_guard = Some(txn_id);
                 Ok(QueryResult::Success {
                     message: format!("Transaction {} started", txn_id),
                 })
             }
-            ResolvedStatement::Commit => Ok(QueryResult::Success {
-                message: "Transaction committed".to_string(),
-            }),
-            ResolvedStatement::Rollback => Ok(QueryResult::Success {
-                message: "Transaction rolled back".to_string(),
-            }),
+            ResolvedStatement::Commit => {
+                let txn_id = {
+                    let mut guard = self.current_txn.lock().unwrap();
+                    guard.take()
+                };
+                match txn_id {
+                    Some(id) => {
+                        self.meta.commit_transaction(id).await?;
+                        Ok(QueryResult::Success {
+                            message: format!("Transaction {} committed", id),
+                        })
+                    }
+                    None => Ok(QueryResult::Success {
+                        message: "No active transaction".to_string(),
+                    }),
+                }
+            }
+            ResolvedStatement::Rollback => {
+                let txn_id = {
+                    let mut guard = self.current_txn.lock().unwrap();
+                    guard.take()
+                };
+                match txn_id {
+                    Some(id) => {
+                        self.meta.abort_transaction(id).await?;
+                        Ok(QueryResult::Success {
+                            message: format!("Transaction {} rolled back", id),
+                        })
+                    }
+                    None => Ok(QueryResult::Success {
+                        message: "No active transaction".to_string(),
+                    }),
+                }
+            }
         }
     }
 
@@ -265,6 +297,8 @@ impl Executor {
 
         // Apply MP pruning via optimizer (skip MPs that can't match WHERE predicate)
         let arrow_schema = build_arrow_schema(&table_meta);
+        // Save filter for row-level filtering (clone before move)
+        let row_filter = filter.clone();
         let pruned_mps = if filter.is_some() {
             let stmt_with_filter = ResolvedStatement::Select {
                 db: db.clone(),
@@ -333,6 +367,19 @@ impl Executor {
         let mut rows: Vec<Vec<String>> = Vec::new();
         for batch in &all_batches {
             for row_idx in 0..batch.num_rows() {
+                // Apply row-level filter (WHERE clause)
+                if let Some(ref filter) = row_filter {
+                    let col_idx = table_meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name == filter.column);
+                    if let Some(ci) = col_idx {
+                        let val = array_value_to_string(batch.column(ci), row_idx);
+                        if !row_matches_filter(&val, &filter.op, &filter.value) {
+                            continue;
+                        }
+                    }
+                }
                 let mut row = Vec::new();
                 for col_idx in 0..batch.num_columns() {
                     row.push(array_value_to_string(batch.column(col_idx), row_idx));
@@ -970,6 +1017,29 @@ fn arrow_type(t: &NovaType) -> DataType {
 }
 
 /// Extract a string value from an Arrow array at a given row index.
+/// Check if a row value matches the filter condition.
+fn row_matches_filter(val: &str, op: &str, expected: &ResolvedExpr) -> bool {
+    match (op, expected) {
+        ("=", ResolvedExpr::Int64(v)) => val.parse::<i64>().map(|x| x == *v).unwrap_or(false),
+        ("=", ResolvedExpr::Float64(v)) => val.parse::<f64>().map(|x| x == *v).unwrap_or(false),
+        ("=", ResolvedExpr::String(v)) => val == v,
+        ("=", ResolvedExpr::Boolean(v)) => val == v.to_string(),
+        ("!=", ResolvedExpr::Int64(v)) => val.parse::<i64>().map(|x| x != *v).unwrap_or(false),
+        ("!=", ResolvedExpr::String(v)) => val != v,
+        (">", ResolvedExpr::Int64(v)) => val.parse::<i64>().map(|x| x > *v).unwrap_or(false),
+        (">", ResolvedExpr::Float64(v)) => val.parse::<f64>().map(|x| x > *v).unwrap_or(false),
+        ("<", ResolvedExpr::Int64(v)) => val.parse::<i64>().map(|x| x < *v).unwrap_or(false),
+        ("<", ResolvedExpr::Float64(v)) => val.parse::<f64>().map(|x| x < *v).unwrap_or(false),
+        (">=", ResolvedExpr::Int64(v)) => val.parse::<i64>().map(|x| x >= *v).unwrap_or(false),
+        ("<=", ResolvedExpr::Int64(v)) => val.parse::<i64>().map(|x| x <= *v).unwrap_or(false),
+        (">", ResolvedExpr::String(v)) => val > v.as_str(),
+        ("<", ResolvedExpr::String(v)) => val < v.as_str(),
+        (">=", ResolvedExpr::String(v)) => val >= v.as_str(),
+        ("<=", ResolvedExpr::String(v)) => val <= v.as_str(),
+        _ => true, // unknown op → include row
+    }
+}
+
 /// Build Arrow schema from table metadata.
 fn build_arrow_schema(table_meta: &TableMeta) -> std::sync::Arc<arrow::datatypes::Schema> {
     let fields: Vec<arrow::datatypes::Field> = table_meta

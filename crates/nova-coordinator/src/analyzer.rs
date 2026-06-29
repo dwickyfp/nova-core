@@ -75,7 +75,7 @@ pub struct ResolvedColumn {
     pub nullable: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ResolvedExpr {
     Int64(i64),
     Float64(f64),
@@ -84,7 +84,7 @@ pub enum ResolvedExpr {
     Null,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ResolvedFilter {
     pub column: String,
     pub op: String,
