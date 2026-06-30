@@ -60,15 +60,38 @@ impl TableProvider for NovaTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        // Log filters for future MP pruning integration
+        if !filters.is_empty() {
+            tracing::debug!(
+                filters = ?filters.len(),
+                "NovaTableProvider::scan received filters (MP pruning via filters is future work)"
+            );
+        }
         Ok(Arc::new(MicroPartitionScanExec::new(
             self.mps.clone(),
             self.schema.clone(),
             projection.cloned(),
             self.reader.clone(),
         )))
+    }
+
+    /// Return table statistics for DataFusion's CBO.
+    /// Aggregates row count and byte size from all micro-partitions.
+    fn statistics(&self) -> Option<datafusion::common::stats::Statistics> {
+        if self.mps.is_empty() {
+            return None;
+        }
+        let total_rows: u64 = self.mps.iter().map(|mp| mp.row_count).sum();
+        let total_bytes: u64 = self.mps.iter().map(|mp| mp.byte_size).sum();
+        use datafusion::common::stats::Precision;
+        Some(datafusion::common::stats::Statistics {
+            num_rows: Precision::Exact(total_rows as usize),
+            total_byte_size: Precision::Exact(total_bytes as usize),
+            column_statistics: vec![],
+        })
     }
 }
 
