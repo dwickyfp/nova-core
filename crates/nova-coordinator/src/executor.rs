@@ -925,9 +925,13 @@ impl Executor {
     async fn exec_select_datafusion(
         &self,
         table_meta: &TableMeta,
-        mps: &[MicroPartitionMeta],
+        _mps: &[MicroPartitionMeta],
         sql: &str,
     ) -> Result<QueryResult> {
+        // Re-fetch active MPs to ensure we see the latest state (COW visibility fix).
+        // The caller's mps snapshot may be stale after UPDATE/DELETE.
+        let mps = self.meta.get_active_mps(table_meta.id).await?;
+
         // Disable EnforceDistribution (requires children for custom scan operators)
         let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
         config.options_mut().optimizer.skip_failed_rules = true;
