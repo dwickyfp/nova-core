@@ -5,6 +5,7 @@
 // Integrates with DataFusion's push-based execution pipeline.
 
 use arrow::datatypes::SchemaRef;
+#[allow(unused_imports)]
 use arrow::record_batch::RecordBatch;
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -45,17 +46,34 @@ impl MicroPartitionScanExec {
         projection: Option<Vec<usize>>,
         reader: Arc<MpReader>,
     ) -> Self {
-        let n_partitions = mp_list.len().max(1); // at least 1 partition
+        let n_partitions = mp_list.len().max(1);
+        // Compute projected schema if projection is provided
+        let output_schema = match &projection {
+            Some(indices) if !indices.is_empty() => {
+                let projected_fields: Vec<_> = indices
+                    .iter()
+                    .filter_map(|&i| schema.fields().get(i).cloned())
+                    .collect();
+                Arc::new(arrow::datatypes::Schema::new(projected_fields))
+            }
+            _ => schema.clone(),
+        };
+        // For COUNT(*), DataFusion passes Some([]) — use full schema for scan,
+        // but don't apply projection in MpReader (pass None to read all columns)
+        let read_projection = match &projection {
+            Some(indices) if !indices.is_empty() => projection.clone(),
+            _ => None,
+        };
         let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
+            EquivalenceProperties::new(output_schema.clone()),
             Partitioning::UnknownPartitioning(n_partitions),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
         Self {
             mp_list,
-            schema,
-            projection,
+            schema: output_schema,
+            projection: read_projection,
             reader,
             properties,
         }
@@ -136,26 +154,9 @@ impl ExecutionPlan for MicroPartitionScanExec {
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            let projected_batches: Vec<RecordBatch> = if let Some(ref cols) = projection {
-                batches
-                    .into_iter()
-                    .map(|batch| {
-                        let projected_cols: Vec<_> =
-                            cols.iter().map(|&i| batch.column(i).clone()).collect();
-                        let projected_schema = Arc::new(arrow::datatypes::Schema::new(
-                            cols.iter()
-                                .map(|&i| batch.schema().field(i).clone())
-                                .collect::<Vec<_>>(),
-                        ));
-                        RecordBatch::try_new(projected_schema, projected_cols)
-                            .map_err(|e| DataFusionError::External(Box::new(e)))
-                    })
-                    .collect::<DFResult<Vec<_>>>()?
-            } else {
-                batches
-            };
-
-            Ok::<_, DataFusionError>(projected_batches)
+            // MpReader already applies projection, so batches are already projected.
+            // No need to re-project here.
+            Ok::<_, DataFusionError>(batches)
         };
 
         // std::thread::spawn with fresh Runtime avoids "nested runtime" error
