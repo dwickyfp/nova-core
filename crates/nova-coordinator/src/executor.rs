@@ -165,7 +165,7 @@ impl Executor {
                 table,
                 action,
             } => {
-                let table_meta = self.find_table(&db, &schema, &table).await?;
+                let _table_meta = self.find_table(&db, &schema, &table).await?;
                 match action {
                     crate::analyzer::AlterAction::AddColumn { name, data_type } => {
                         tracing::info!(
