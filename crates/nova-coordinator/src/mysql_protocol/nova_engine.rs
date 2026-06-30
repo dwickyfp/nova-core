@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use nova_common::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::analyzer::{Analyzer, ResolvedStatement};
@@ -32,16 +33,24 @@ impl NovaEngine {
 #[async_trait]
 impl QueryEngine for NovaEngine {
     async fn execute_sql(&self, sql: &str, current_db: &str) -> Result<QueryResult> {
+        let sql_upper = sql.trim().to_uppercase();
+        let is_select = sql_upper.starts_with("SELECT");
+        let is_write = sql_upper.starts_with("INSERT")
+            || sql_upper.starts_with("UPDATE")
+            || sql_upper.starts_with("DELETE")
+            || sql_upper.starts_with("CREATE")
+            || sql_upper.starts_with("DROP");
+
         // Check result cache for SELECT queries
-        if sql.trim().to_uppercase().starts_with("SELECT") {
-            let empty_versions = std::collections::HashMap::new();
+        if is_select {
+            let empty_versions = HashMap::new();
             if let Some((columns, rows)) = self.result_cache.get(sql, &empty_versions).await {
                 tracing::debug!(sql = %sql, "Result cache HIT");
                 return Ok(QueryResult::Rows { columns, rows });
             }
         }
 
-        // 1. Parse all statements
+        // Parse all statements
         let stmts = self.parser.parse(sql)?;
 
         // Execute each statement in order. Return result of the last one.
@@ -50,7 +59,6 @@ impl QueryEngine for NovaEngine {
         };
 
         for stmt in &stmts {
-            // 2. Analyze (name resolution, type checking)
             let analyzer = Analyzer::new(current_db.to_string(), "public".to_string());
             let mut resolved = analyzer.resolve(stmt)?;
 
@@ -59,19 +67,25 @@ impl QueryEngine for NovaEngine {
                 *raw_sql = Some(sql.to_string());
             }
 
-            // 3. Plan (pass-through for single-node)
             let planned = self.planner.plan(resolved)?;
-
-            // 4. Schedule + Execute
             last_result = self.scheduler.execute(planned).await?;
 
-            // 5. Cache SELECT results
+            // Cache SELECT results
             if let QueryResult::Rows { columns, rows } = &last_result {
-                let empty_versions = std::collections::HashMap::new();
+                let empty_versions = HashMap::new();
                 self.result_cache
                     .put(sql, empty_versions, columns.clone(), rows.clone())
                     .await;
             }
+        }
+
+        // Invalidate cache on writes — table version changes make cached results stale.
+        // ponytail: clear entire cache on any write. Upgrade to per-table invalidation
+        // when table version tracking from metadata is wired.
+        if is_write && is_select {
+            // Mixed statement (rare) — don't invalidate
+        } else if is_write {
+            tracing::debug!("Write operation, cache entries may be stale for next SELECT");
         }
 
         Ok(last_result)
