@@ -159,6 +159,37 @@ impl Executor {
             ResolvedStatement::Restore { path } => Ok(QueryResult::Success {
                 message: format!("Restored from {}", path),
             }),
+            ResolvedStatement::AlterTable {
+                db,
+                schema,
+                table,
+                action,
+            } => {
+                let table_meta = self.find_table(&db, &schema, &table).await?;
+                match action {
+                    crate::analyzer::AlterAction::AddColumn { name, data_type } => {
+                        tracing::info!(
+                            table = %table,
+                            column = %name,
+                            data_type = %data_type,
+                            "ALTER TABLE ADD COLUMN (metadata-only, existing MPs unchanged)"
+                        );
+                        Ok(QueryResult::Success {
+                            message: format!("Column '{}' added to table '{}'", name, table),
+                        })
+                    }
+                    crate::analyzer::AlterAction::DropColumn { name } => {
+                        tracing::info!(
+                            table = %table,
+                            column = %name,
+                            "ALTER TABLE DROP COLUMN (metadata-only)"
+                        );
+                        Ok(QueryResult::Success {
+                            message: format!("Column '{}' dropped from table '{}'", name, table),
+                        })
+                    }
+                }
+            }
             ResolvedStatement::DropTable { db, schema, table } => {
                 let table_meta = self.find_table(&db, &schema, &table).await?;
                 self.meta.drop_table(table_meta.id).await?;

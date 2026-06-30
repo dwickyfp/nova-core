@@ -35,6 +35,10 @@ impl SqlParser {
         if upper.starts_with("RESTORE") {
             return self.parse_restore(sql);
         }
+        // Time Travel: SELECT ... FROM t AT(TIMESTAMP => <unix_micros>)
+        if upper.contains(" AT(TIMESTAMP") || upper.contains(" AT(TIMESTAMP ") {
+            return self.parse_time_travel(sql);
+        }
         Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| NovaError::SqlParseError {
             message: e.to_string(),
         })
@@ -128,6 +132,41 @@ impl SqlParser {
             )));
         }
         Ok(stmts)
+    }
+
+    /// Parse: SELECT ... FROM t AT(TIMESTAMP => <unix_micros>)
+    /// Strips AT(TIMESTAMP => ...) and encodes timestamp via DROP TABLE __tt_<ts>__<sql>
+    fn parse_time_travel(&self, sql: &str) -> Result<Vec<Statement>> {
+        // Extract timestamp value from AT(TIMESTAMP => <value>)
+        let at_pos =
+            sql.to_uppercase()
+                .find("AT(TIMESTAMP")
+                .ok_or_else(|| NovaError::SqlParseError {
+                    message: "missing AT(TIMESTAMP".to_string(),
+                })?;
+        let after_at = &sql[at_pos..];
+        let ts_start = after_at
+            .find("=>")
+            .ok_or_else(|| NovaError::SqlParseError {
+                message: "missing => in AT(TIMESTAMP => ...)".to_string(),
+            })?;
+        let after_arrow = &after_at[ts_start + 2..];
+        let ts_end = after_arrow.find(')').unwrap_or(after_arrow.len());
+        let ts_str = after_arrow[..ts_end]
+            .trim()
+            .trim_matches(|c: char| c == '\'' || c == '"');
+        let ts: u64 = ts_str.parse().unwrap_or(0);
+
+        // Strip AT(TIMESTAMP => ...) from SQL to get plain SELECT
+        let clean_sql = sql[..at_pos].trim_end().trim_end_matches(',').to_string();
+        // Encode as DROP TABLE __tt_<ts>__<clean_sql>
+        // ponytail: encode timestamp + SQL in table name for analyzer detection.
+        // Upgrade to custom AST when sqlparser supports AT() natively.
+        let encoded = format!("__tt_{}__{}", ts, clean_sql.replace(' ', "_"));
+        let fake_sql = format!("DROP TABLE {}", encoded);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
     }
 
     /// Parse: GC <retention_days> or VACUUM <retention_days>

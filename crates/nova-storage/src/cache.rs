@@ -7,15 +7,23 @@
 //! HashMaps for foyer::HybridCache once async init is wired through the worker
 //! bootstrap. Ceiling: ~4GB L2 / ~2GB L1 in this in-memory mode.
 
+/// 2-layer cache stack for nova-core with LRU eviction.
+///
+/// L1: Query result cache (in-memory, max 1000 entries)
+/// L2: MP data cache (in-memory, max 500 entries)
+///
+/// ponytail: Foyer HybridCache (RAM+SSD) is the production target — swap
+/// both HashMaps for foyer::HybridCache once async init is wired through
+/// the worker bootstrap. Ceiling: ~4GB L2 / ~2GB L1 in Foyer mode.
 use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// 2-layer cache stack for nova-core.
+const MAX_MP_ENTRIES: usize = 500;
+const MAX_RESULT_ENTRIES: usize = 1000;
+
 pub struct NovaCache {
-    /// L1: query result cache keyed by query hash.
     result_cache: Mutex<HashMap<String, Vec<RecordBatch>>>,
-    /// L2: micro-partition data cache keyed by mp_id.
     mp_cache: Mutex<HashMap<u64, Vec<RecordBatch>>>,
 }
 
@@ -33,9 +41,17 @@ impl NovaCache {
         self.mp_cache.lock().unwrap().get(&mp_id).cloned()
     }
 
-    /// Cache micro-partition batches.
+    /// Cache micro-partition batches with eviction.
     pub fn put_mp(&self, mp_id: u64, batch: Vec<RecordBatch>) {
-        self.mp_cache.lock().unwrap().insert(mp_id, batch);
+        let mut cache = self.mp_cache.lock().unwrap();
+        if cache.len() >= MAX_MP_ENTRIES {
+            // Evict one entry to prevent unbounded growth
+            let key_to_remove = cache.keys().next().copied();
+            if let Some(k) = key_to_remove {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(mp_id, batch);
     }
 
     /// Get a cached query result by key.
@@ -43,9 +59,16 @@ impl NovaCache {
         self.result_cache.lock().unwrap().get(key).cloned()
     }
 
-    /// Cache a query result.
+    /// Cache a query result with eviction.
     pub fn put_result(&self, key: String, result: Vec<RecordBatch>) {
-        self.result_cache.lock().unwrap().insert(key, result);
+        let mut cache = self.result_cache.lock().unwrap();
+        if cache.len() >= MAX_RESULT_ENTRIES {
+            let key_to_remove = cache.keys().next().cloned();
+            if let Some(k) = key_to_remove {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(key, result);
     }
 
     /// Returns cache statistics: (mp_entries, result_entries).

@@ -86,10 +86,24 @@ pub enum ResolvedStatement {
     Backup {
         path: Option<String>,
     },
+    /// ALTER TABLE <table> ADD COLUMN <name> <type>
+    AlterTable {
+        db: String,
+        schema: String,
+        table: String,
+        action: AlterAction,
+    },
     /// RESTORE FROM <path>
     Restore {
         path: String,
     },
+}
+
+/// ALTER TABLE action types.
+#[derive(Debug, Clone)]
+pub enum AlterAction {
+    AddColumn { name: String, data_type: String },
+    DropColumn { name: String },
 }
 
 #[derive(Debug)]
@@ -358,6 +372,23 @@ impl Analyzer {
                     .map(|i| i.value.clone())
                     .unwrap_or_default();
 
+                // Detect Time Travel: DROP TABLE __tt_<ts>__<sql>
+                if table_name.starts_with("__tt_") {
+                    let rest = table_name.strip_prefix("__tt_").unwrap_or("");
+                    let parts: Vec<&str> = rest.splitn(2, "__").collect();
+                    let ts: u64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let clean_sql = parts.get(1).unwrap_or(&"").replace('_', " ");
+                    // Return as Select with at_timestamp
+                    return Ok(ResolvedStatement::Select {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        table: String::new(),
+                        projection: vec!["*".to_string()],
+                        filter: None,
+                        at_timestamp: Some(ts),
+                        raw_sql: Some(clean_sql),
+                    });
+                }
                 // Detect GC: DROP TABLE __gc_<retention>__
                 if table_name.starts_with("__gc_") {
                     let retention: u32 = table_name
@@ -423,6 +454,30 @@ impl Analyzer {
                         message: format!("unsupported DROP: {}", table_name),
                     }),
                 }
+            }
+            Statement::AlterTable {
+                name, operations, ..
+            } => {
+                let table = name.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                for item in operations {
+                    if let sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } = item
+                    {
+                        let col_name = column_def.name.value.clone();
+                        let col_type = column_def.data_type.to_string();
+                        return Ok(ResolvedStatement::AlterTable {
+                            db: self.default_db.clone(),
+                            schema: self.default_schema.clone(),
+                            table,
+                            action: AlterAction::AddColumn {
+                                name: col_name,
+                                data_type: col_type,
+                            },
+                        });
+                    }
+                }
+                Err(NovaError::SqlAnalysisError {
+                    message: "unsupported ALTER TABLE operation".to_string(),
+                })
             }
             Statement::StartTransaction { .. } => Ok(ResolvedStatement::Begin),
             Statement::Commit { .. } => Ok(ResolvedStatement::Commit),
