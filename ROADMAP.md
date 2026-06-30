@@ -17,7 +17,7 @@
 | 6 | Cache & Polish | Month 10 | ✅ Complete | Auth, cache, RBAC, monitoring, HA, backup |
 | 7 | MySQL Protocol | — | ✅ Complete | Production-grade (40 tests) |
 | 8 | SQL Completeness | — | ✅ Complete | AGG, GROUP BY, ORDER BY, JOIN, DROP, multi-stmt, DataFusion |
-| 9 | Production Hardening | — | 🔴 In Progress | COW fix, cache invalidation, auth, RBAC, E2E tests, Foyer |
+| 9 | Production Hardening | — | ✅ Complete | COW fix, cache invalidation, auth, RBAC, E2E tests, Foyer |
 
 ---
 
