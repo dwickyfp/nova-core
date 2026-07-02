@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use nova_common::{NovaError, Result};
 
-use crate::mysql_protocol::auth::AuthPlugin;
+use crate::mysql_protocol::auth::{AuthPlugin, verify_mysql_native_password};
 use crate::mysql_protocol::capabilities::ClientCapabilities;
 use crate::mysql_protocol::codec::PacketCodec;
 use crate::mysql_protocol::commands::{
@@ -28,6 +28,7 @@ use crate::mysql_protocol::types::ColumnType;
 pub struct MySqlServer {
     listener: TcpListener,
     engine: Arc<dyn QueryEngine>,
+    auth: Option<Arc<crate::auth::AuthManager>>,
     sessions: Arc<Mutex<Vec<u32>>>,
     next_connection_id: Arc<Mutex<u32>>,
 }
@@ -52,8 +53,13 @@ impl Default for MySqlServerConfig {
 }
 
 impl MySqlServer {
-    /// Bind to address and create server
-    pub async fn bind(addr: &str, engine: Arc<dyn QueryEngine>) -> Result<Self> {
+    /// Bind to address and create server.
+    /// If auth is provided, MySQL handshake password verification is enforced.
+    pub async fn bind(
+        addr: &str,
+        engine: Arc<dyn QueryEngine>,
+        auth: Option<Arc<crate::auth::AuthManager>>,
+    ) -> Result<Self> {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| NovaError::Internal {
@@ -63,6 +69,7 @@ impl MySqlServer {
         Ok(Self {
             listener,
             engine,
+            auth,
             sessions: Arc::new(Mutex::new(Vec::new())),
             next_connection_id: Arc::new(Mutex::new(1)),
         })
@@ -80,10 +87,11 @@ impl MySqlServer {
 
                     let sessions = Arc::clone(&self.sessions);
                     let engine = Arc::clone(&self.engine);
+                    let auth = self.auth.clone();
 
                     tokio::spawn(async move {
                         if let Err(e) =
-                            handle_connection(stream, connection_id, sessions, engine).await
+                            handle_connection(stream, connection_id, sessions, engine, auth).await
                         {
                             tracing::error!(
                                 connection_id = connection_id,
@@ -108,6 +116,7 @@ async fn handle_connection(
     connection_id: u32,
     sessions: Arc<Mutex<Vec<u32>>>,
     engine: Arc<dyn QueryEngine>,
+    auth: Option<Arc<crate::auth::AuthManager>>,
 ) -> Result<()> {
     let mut codec = PacketCodec::new(stream);
 
@@ -140,7 +149,7 @@ async fn handle_connection(
     let mut session = Session::new(
         handshake_response.username.clone(),
         AuthPlugin::MysqlNativePassword,
-        scramble,
+        scramble.clone(),
     );
     session.client_capabilities = handshake_response.capabilities;
 
@@ -159,9 +168,73 @@ async fn handle_connection(
         sessions_guard.push(connection_id);
     }
 
-    // Send OK packet (auth success)
-    let ok_packet = build_ok_packet(0, 0, session.server_status, "");
-    codec.write_packet(&ok_packet.payload).await?;
+    // Authentication: verify password if auth manager is configured.
+    // When auth is None (dev mode), accept all connections.
+    if let Some(ref auth_manager) = auth {
+        let username = &handshake_response.username;
+        let auth_response = &handshake_response.auth_response;
+
+        // Look up user in AuthManager
+        let user_info = auth_manager.get_user_info(username);
+
+        match user_info {
+            None => {
+                // Unknown user
+                let err = build_error_packet(
+                    MySqlError::ER_ACCESS_DENIED_ERROR,
+                    &format!(
+                        "Access denied for user '{}'@'{}' (using password: YES)",
+                        username, "unknown"
+                    ),
+                );
+                codec.write_packet(&err.payload).await?;
+                tracing::warn!(
+                    connection_id = connection_id,
+                    username = %username,
+                    "Access denied: unknown user"
+                );
+                return Ok(());
+            }
+            Some(info) => {
+                if info.mysql_native_hash.is_empty() {
+                    // No password required for this user (e.g. root in dev mode)
+                    let ok_packet = build_ok_packet(0, 0, session.server_status, "");
+                    codec.write_packet(&ok_packet.payload).await?;
+                } else {
+                    // Verify mysql_native_password response against stored hash
+                    let verified = verify_mysql_native_password(
+                        &scramble,
+                        &info.mysql_native_hash,
+                        auth_response,
+                    );
+
+                    if !verified {
+                        let err = build_error_packet(
+                            MySqlError::ER_ACCESS_DENIED_ERROR,
+                            &format!(
+                                "Access denied for user '{}'@'{}' (using password: YES)",
+                                username, "unknown"
+                            ),
+                        );
+                        codec.write_packet(&err.payload).await?;
+                        tracing::warn!(
+                            connection_id = connection_id,
+                            username = %username,
+                            "Access denied: invalid password"
+                        );
+                        return Ok(());
+                    }
+
+                    let ok_packet = build_ok_packet(0, 0, session.server_status, "");
+                    codec.write_packet(&ok_packet.payload).await?;
+                }
+            }
+        }
+    } else {
+        // Dev mode: no auth required
+        let ok_packet = build_ok_packet(0, 0, session.server_status, "");
+        codec.write_packet(&ok_packet.payload).await?;
+    }
 
     tracing::info!(
         connection_id = connection_id,
@@ -231,6 +304,15 @@ async fn handle_connection(
                 } else if sql_lower.starts_with("show databases")
                     || sql_lower.starts_with("show schemas")
                 {
+                    let db_names = engine.list_databases().await.unwrap_or_default();
+                    let mut rows: Vec<Vec<Option<String>>> =
+                        db_names.into_iter().map(|n| vec![Some(n)]).collect();
+                    // Always include system databases
+                    for sys_db in ["information_schema", "mysql", "performance_schema", "sys"] {
+                        if !rows.iter().any(|r| r[0].as_deref() == Some(sys_db)) {
+                            rows.push(vec![Some(sys_db.to_string())]);
+                        }
+                    }
                     CommandResult::ResultSet {
                         columns: vec![ColumnDef {
                             name: "Database".to_string(),
@@ -238,13 +320,7 @@ async fn handle_connection(
                             flags: 0,
                             decimals: 0,
                         }],
-                        rows: vec![
-                            vec![Some("information_schema".to_string())],
-                            vec![Some("mysql".to_string())],
-                            vec![Some("performance_schema".to_string())],
-                            vec![Some("sys".to_string())],
-                            vec![Some("nova".to_string())],
-                        ],
+                        rows,
                     }
                 } else if sql_lower.starts_with("select @@version")
                     || sql_lower.starts_with("select version()")
@@ -278,7 +354,14 @@ async fn handle_connection(
                         rows: vec![],
                     }
                 } else if sql_lower.starts_with("show tables") {
+                    let current_db = if session.current_db.is_empty() {
+                        "nova"
+                    } else {
+                        &session.current_db
+                    };
+                    let table_names = engine.list_tables(current_db).await.unwrap_or_default();
                     let col_name = format!("Tables_in_{}", session.current_db);
+                    let rows = table_names.into_iter().map(|n| vec![Some(n)]).collect();
                     CommandResult::ResultSet {
                         columns: vec![ColumnDef {
                             name: col_name,
@@ -286,7 +369,7 @@ async fn handle_connection(
                             flags: 0,
                             decimals: 0,
                         }],
-                        rows: vec![],
+                        rows,
                     }
                 } else if sql_lower.starts_with("select 1") && !sql_lower.contains("from") {
                     CommandResult::ResultSet {

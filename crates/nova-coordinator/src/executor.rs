@@ -15,8 +15,9 @@ pub struct Executor {
     reader: MpReader,
     optimizer: NovaOptimizer,
     current_txn: Arc<std::sync::Mutex<Option<TxnId>>>,
-    #[allow(dead_code)]
     rbac: crate::rbac::RbacManager,
+    /// Current user (user_id, is_admin). None = dev mode (no RBAC).
+    current_user: Arc<tokio::sync::RwLock<Option<(u64, bool)>>>,
 }
 
 /// Result of executing a SQL statement.
@@ -40,6 +41,64 @@ impl Executor {
             optimizer: NovaOptimizer::new(),
             current_txn: Arc::new(std::sync::Mutex::new(None)),
             rbac: crate::rbac::RbacManager::new(),
+            current_user: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Set the current user for RBAC enforcement.
+    /// Call after successful authentication. `(user_id, is_admin)`.
+    pub async fn set_current_user(&self, user_id: u64, is_admin: bool) {
+        *self.current_user.write().await = Some((user_id, is_admin));
+    }
+
+    /// List all database names.
+    pub async fn list_database_names(&self) -> Result<Vec<String>> {
+        let dbs = self.meta.list_databases().await?;
+        Ok(dbs.iter().map(|d| d.name.clone()).collect())
+    }
+
+    /// List all table names in a database.
+    pub async fn list_table_names(&self, db: &str) -> Result<Vec<String>> {
+        let dbs = self.meta.list_databases().await?;
+        let db_meta =
+            dbs.iter()
+                .find(|d| d.name == db)
+                .ok_or_else(|| NovaError::DatabaseNotFound {
+                    db_name: db.to_string(),
+                })?;
+        let schemas = self.meta.list_schemas(db_meta.id).await?;
+        let mut tables = Vec::new();
+        for schema in &schemas {
+            let schema_tables = self.meta.list_tables(db_meta.id, schema.id).await?;
+            tables.extend(schema_tables.iter().map(|t| t.name.clone()));
+        }
+        Ok(tables)
+    }
+
+    /// Check if current user has the required privilege on a table.
+    /// Returns Ok(()) if allowed, Err if denied.
+    /// Skips check in dev mode (no user set) or for admin users.
+    async fn check_privilege(
+        &self,
+        table_name: &str,
+        privilege: crate::rbac::Privilege,
+    ) -> Result<()> {
+        let user = self.current_user.read().await;
+        match *user {
+            None => Ok(()),               // dev mode: no RBAC
+            Some((_uid, true)) => Ok(()), // admin: full access
+            Some((uid, false)) => {
+                if self.rbac.check_privilege(uid, table_name, privilege).await {
+                    Ok(())
+                } else {
+                    Err(NovaError::Internal {
+                        message: format!(
+                            "access denied: user {} lacks {:?} on {}",
+                            uid, privilege, table_name
+                        ),
+                    })
+                }
+            }
         }
     }
 
@@ -52,13 +111,21 @@ impl Executor {
                 schema,
                 table,
                 columns,
-            } => self.exec_create_table(db, schema, table, columns).await,
+            } => {
+                self.check_privilege(&table, crate::rbac::Privilege::Create)
+                    .await?;
+                self.exec_create_table(db, schema, table, columns).await
+            }
             ResolvedStatement::Insert {
                 db,
                 schema,
                 table,
                 values,
-            } => self.exec_insert(db, schema, table, values).await,
+            } => {
+                self.check_privilege(&table, crate::rbac::Privilege::Insert)
+                    .await?;
+                self.exec_insert(db, schema, table, values).await
+            }
             ResolvedStatement::Select {
                 db,
                 schema,
@@ -78,6 +145,8 @@ impl Executor {
                 assignments,
                 filter,
             } => {
+                self.check_privilege(&table, crate::rbac::Privilege::Update)
+                    .await?;
                 self.exec_update(&db, &schema, &table, assignments, filter)
                     .await
             }
@@ -86,7 +155,11 @@ impl Executor {
                 schema,
                 table,
                 filter,
-            } => self.exec_delete(&db, &schema, &table, filter).await,
+            } => {
+                self.check_privilege(&table, crate::rbac::Privilege::Delete)
+                    .await?;
+                self.exec_delete(&db, &schema, &table, filter).await
+            }
             ResolvedStatement::CreateClone {
                 db,
                 schema,
@@ -191,6 +264,8 @@ impl Executor {
                 }
             }
             ResolvedStatement::DropTable { db, schema, table } => {
+                self.check_privilege(&table, crate::rbac::Privilege::Drop)
+                    .await?;
                 let table_meta = self.find_table(&db, &schema, &table).await?;
                 self.meta.drop_table(table_meta.id).await?;
                 Ok(QueryResult::Success {

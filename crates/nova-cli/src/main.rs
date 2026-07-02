@@ -169,13 +169,13 @@ async fn main() -> anyhow::Result<()> {
             let executor = Arc::new(Executor::new(meta, writer, reader));
 
             // Phase 6: Initialize Auth, Health, Monitoring
-            let _auth = if cfg.auth.enabled {
-                AuthManager::with_default_user(
+            let auth = if cfg.auth.enabled {
+                Some(Arc::new(AuthManager::with_default_user(
                     &cfg.auth.default_username,
                     &cfg.auth.default_password_hash,
-                )
+                )))
             } else {
-                AuthManager::new()
+                None
             };
             tracing::info!(
                 enabled = cfg.auth.enabled,
@@ -226,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
                     .expect("HTTP server error");
             });
             let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-            let server = MySqlServer::bind(&addr, engine).await?;
+            let server = MySqlServer::bind(&addr, engine, auth).await?;
 
             tracing::info!(addr = %addr, "MySQL server listening");
 
@@ -241,12 +241,49 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!(
                 coordinator = %coordinator_addr,
-                "Starting Nova worker (single-node mode — coordinator handles execution)"
+                "Starting Nova worker — gRPC server + coordinator registration"
             );
-            // ponytail: Worker binary connects to coordinator via gRPC.
-            // For single-node mode, worker is pass-through. Add gRPC client when distributed mode is needed.
-            tracing::info!("Worker running in standby mode. Press Ctrl+C to stop.");
-            tokio::signal::ctrl_c().await?;
+
+            // Setup metadata store (sled for dev)
+            let sled_path = "./data/nova-worker-meta";
+            std::fs::create_dir_all(sled_path)?;
+            let meta: Arc<dyn nova_storage::MetadataStore> =
+                Arc::new(nova_storage::SledMetadataStore::open(sled_path)?);
+
+            // Setup object store (local for dev)
+            let data_dir = "./data/nova-worker-data";
+            std::fs::create_dir_all(data_dir)?;
+            let store: Arc<dyn object_store::ObjectStore> = Arc::new(
+                object_store::local::LocalFileSystem::new_with_prefix(data_dir)?,
+            );
+
+            let reader = nova_storage::MpReader::new(store);
+            let executor = nova_worker::Executor::new(reader);
+
+            // Create worker state
+            let state = Arc::new(nova_worker::WorkerState {
+                worker_id: std::sync::atomic::AtomicU64::new(0),
+                registered: std::sync::atomic::AtomicBool::new(false),
+                executor,
+                meta,
+                stats: tokio::sync::RwLock::new(nova_worker::WorkerStats::default()),
+            });
+
+            // Start gRPC server
+            let grpc_addr = coordinator_addr
+                .parse()
+                .map_err(|e| anyhow::anyhow!("invalid gRPC address: {e}"))?;
+            let grpc_server = nova_worker::WorkerGrpcServer::new(state);
+
+            tracing::info!(addr = %coordinator_addr, "Worker gRPC server listening");
+            tonic::transport::Server::builder()
+                .add_service(
+                    nova_worker::grpc_server::worker_service_server::WorkerServiceServer::new(
+                        grpc_server,
+                    ),
+                )
+                .serve(grpc_addr)
+                .await?;
             tracing::info!("Worker shutting down.");
         }
     }

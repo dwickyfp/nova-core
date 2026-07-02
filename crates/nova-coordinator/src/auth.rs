@@ -22,6 +22,9 @@ pub struct UserInfo {
     pub username: String,
     pub password_hash: String,
     pub is_admin: bool,
+    /// SHA1(SHA1(password)) for MySQL native_password wire protocol.
+    /// Empty when no password is set.
+    pub mysql_native_hash: Vec<u8>,
 }
 
 impl AuthManager {
@@ -33,8 +36,9 @@ impl AuthManager {
             UserInfo {
                 user_id: 1,
                 username: "root".to_string(),
-                password_hash: String::new(), // empty = no password required
+                password_hash: String::new(),
                 is_admin: true,
+                mysql_native_hash: Vec::new(),
             },
         );
         Self {
@@ -57,6 +61,8 @@ impl AuthManager {
             )
             .map(|h| h.to_string())
             .unwrap_or_default();
+            // Compute MySQL native_password hash: SHA1(SHA1(password))
+            let mysql_hash = crate::mysql_protocol::auth::hash_password_mysql_native(password);
             auth.users.insert(
                 username.to_string(),
                 UserInfo {
@@ -64,6 +70,7 @@ impl AuthManager {
                     username: username.to_string(),
                     password_hash: hash,
                     is_admin: true,
+                    mysql_native_hash: mysql_hash,
                 },
             );
         }
@@ -99,6 +106,11 @@ impl AuthManager {
         Ok(user.user_id)
     }
 
+    /// Get user info by username (for MySQL protocol auth).
+    pub fn get_user_info(&self, username: &str) -> Option<&UserInfo> {
+        self.users.get(username)
+    }
+
     /// Check if user has admin privileges.
     pub fn is_admin(&self, username: &str) -> bool {
         self.users
@@ -131,6 +143,11 @@ impl AuthManager {
                 message: format!("password hash failed: {}", e),
             })?
         };
+        let mysql_hash = if password.is_empty() {
+            Vec::new()
+        } else {
+            crate::mysql_protocol::auth::hash_password_mysql_native(password)
+        };
         self.users.insert(
             username.to_string(),
             UserInfo {
@@ -138,6 +155,7 @@ impl AuthManager {
                 username: username.to_string(),
                 password_hash: hash,
                 is_admin,
+                mysql_native_hash: mysql_hash,
             },
         );
         Ok(user_id)

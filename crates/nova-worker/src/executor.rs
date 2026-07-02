@@ -23,6 +23,11 @@ impl Executor {
         }
     }
 
+    /// Clone the inner MpReader Arc.
+    pub fn reader_clone(&self) -> Arc<MpReader> {
+        self.reader.clone()
+    }
+
     /// Execute a SQL query against a registered table.
     /// Returns Arrow RecordBatches.
     pub async fn execute(

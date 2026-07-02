@@ -24,6 +24,11 @@ impl QueryScheduler {
     pub async fn execute(&self, stmt: ResolvedStatement) -> Result<QueryResult> {
         self.executor.execute(stmt).await
     }
+
+    /// Get a reference to the executor (for metadata queries).
+    pub fn executor(&self) -> &std::sync::Arc<Executor> {
+        &self.executor
+    }
 }
 
 #[cfg(test)]

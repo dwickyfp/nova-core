@@ -24,16 +24,21 @@ futures = "0.3"
 nova-worker = { path = "../nova-worker" }
 figment = { workspace = true }
 axum = "0.8"
-tonic = "0.12"
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
 sqlparser = "0.52"
 argon2 = "0.5"
 foyer = { workspace = true }
 object_store.workspace = true
-openraft = "0.9.24"
+openraft = { version = "0.9.24", features = ["storage-v2", "serde"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
 criterion = { version = "0.5", features = ["async_tokio"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [[bench]]
 name = "query_benchmarks"

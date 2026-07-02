@@ -7,7 +7,7 @@
 // - If worker misses 3 heartbeats → marked dead → work re-scheduled
 //
 // Phase 4.2: In-memory worker registry (no gRPC yet — uses direct function calls)
-// Phase 4.3+: Full gRPC with tonic
+// Phase 10: Full gRPC with tonic wired via WorkerClientPool
 
 use nova_common::{NovaError, Result};
 use std::collections::HashMap;

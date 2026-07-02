@@ -3,8 +3,8 @@
 #
 # Usage:
 #   docker compose -f docker/docker-compose.yml up -d
-#   docker compose -f docker/docker-compose.yml down
-#   docker compose -f docker/docker-compose.yml logs -f
+#   docker compose -f docker/docker-compose.yml logs -f nova-coordinator
+#   docker compose -f docker/docker-compose.yml down -v
 
 name: nova-core
 
@@ -12,22 +12,43 @@ services:
 
   # ── FoundationDB (metadata store) ──────────────────────────
   fdb:
-    image: foundationdb/foundationdb:7.3.43
+    image: foundationdb/foundationdb:7.4.0
     container_name: nova-fdb
     ports:
       - "4500:4500"
-      - "4501:4501"
     environment:
-      FDB_NETWORKING_MODE: host
-      FDB_COORDINATOR: fdb:4500
+      FDB_CLUSTER_FILE_CONTENTS: "docker:docker@nova-fdb:4500"
+      FDB_NETWORKING_MODE: container
     volumes:
-      - fdb_data:/var/fdb
+      - fdb_data:/var/lib/foundationdb
+      - fdb_logs:/var/log/foundationdb
     healthcheck:
-      test: ["CMD", "fdbcli", "--exec", "status"]
+      test: ["CMD", "fdbcli", "-C", "/var/fdb/fdb.cluster", "--exec", "status", "--timeout", "5"]
       interval: 10s
-      timeout: 5s
-      retries: 10
+      timeout: 10s
+      retries: 12
       start_period: 30s
+    networks:
+      - nova
+
+  # ── FDB Init (run once — configure new single memory) ──────
+  fdb-init:
+    image: foundationdb/foundationdb:7.4.0
+    container_name: nova-fdb-init
+    depends_on:
+      fdb:
+        condition: service_healthy
+    environment:
+      FDB_CLUSTER_FILE_CONTENTS: "docker:docker@nova-fdb:4500"
+    entrypoint:
+      - /usr/bin/fdbcli
+      - -C
+      - /var/fdb/fdb.cluster
+      - --exec
+      - "configure new single memory"
+      - --timeout
+      - "30"
+    restart: "no"
     networks:
       - nova
 
@@ -38,21 +59,22 @@ services:
     command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
-      - "9001:9001"
+      - "9001:9001"    # MinIO Console UI
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: nova
+      MINIO_ROOT_PASSWORD: nova12345
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
     networks:
       - nova
 
-  # ── MinIO Init (auto-create buckets) ──────────────────────
+  # ── MinIO Init (auto-create nova bucket) ──────────────────
   minio-init:
     image: minio/mc:latest
     container_name: nova-minio-init
@@ -61,10 +83,11 @@ services:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set nova http://minio:9000 minioadmin minioadmin;
+      mc alias set nova http://minio:9000 nova nova12345;
       mc mb --ignore-existing nova/nova;
-      echo 'MinIO init complete!';
+      echo 'MinIO init complete — bucket nova ready';
       "
+    restart: "no"
     networks:
       - nova
 
@@ -73,6 +96,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: nova-core:latest
     container_name: nova-coordinator
     command: ["nova", "server", "--config", "/etc/nova/config.toml"]
     depends_on:
@@ -80,13 +104,19 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      fdb-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
     ports:
-      - "4406:4406"   # MySQL protocol
-      - "8080:8080"   # REST API
+      - "3306:3306"    # MySQL protocol
+      - "9090:9090"    # Monitoring / metrics
     volumes:
-      - ./config.toml:/etc/nova/config.toml:ro
+      - ./config-fdb.toml:/etc/nova/config.toml:ro
     environment:
       NOVA_LOG_LEVEL: info
+      RUST_LOG: info
+    restart: unless-stopped
     networks:
       - nova
 
@@ -95,17 +125,19 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: nova-core:latest
     container_name: nova-worker-1
-    command: ["nova", "worker", "--config", "/etc/nova/config.toml"]
+    command: ["nova", "worker", "--config", "/etc/nova/config.toml", "--coordinator-addr", "127.0.0.1:50051"]
     depends_on:
       coordinator:
         condition: service_started
     volumes:
-      - ./config.toml:/etc/nova/config.toml:ro
+      - ./config-fdb.toml:/etc/nova/config.toml:ro
       - worker1_cache:/data/cache
     environment:
       NOVA_LOG_LEVEL: info
       NOVA_WORKER_GRPC_PORT: "50051"
+    restart: unless-stopped
     networks:
       - nova
 
@@ -114,25 +146,29 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    image: nova-core:latest
     container_name: nova-worker-2
-    command: ["nova", "worker", "--config", "/etc/nova/config.toml"]
+    command: ["nova", "worker", "--config", "/etc/nova/config.toml", "--coordinator-addr", "127.0.0.1:50052"]
     depends_on:
       coordinator:
         condition: service_started
     volumes:
-      - ./config.toml:/etc/nova/config.toml:ro
+      - ./config-fdb.toml:/etc/nova/config.toml:ro
       - worker2_cache:/data/cache
     environment:
       NOVA_LOG_LEVEL: info
       NOVA_WORKER_GRPC_PORT: "50052"
+    restart: unless-stopped
     networks:
       - nova
 
 networks:
   nova:
+    driver: bridge
 
 volumes:
   fdb_data:
+  fdb_logs:
   minio_data:
   worker1_cache:
   worker2_cache:

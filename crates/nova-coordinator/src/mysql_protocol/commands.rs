@@ -174,10 +174,7 @@ pub fn handle_init_db(session: &mut Session, payload: &[u8]) -> CommandResult {
     let db_name = String::from_utf8_lossy(payload)
         .trim_end_matches('\0')
         .to_string();
-
-    // TODO: Check if database exists
     session.set_database(&db_name);
-
     CommandResult::Ok {
         affected_rows: 0,
         last_insert_id: 0,
@@ -186,26 +183,22 @@ pub fn handle_init_db(session: &mut Session, payload: &[u8]) -> CommandResult {
 }
 
 /// Handle COM_QUERY
+/// ponytail: server.rs handles COM_QUERY inline (with query engine access).
+/// This function is kept for protocol completeness but delegates to error.
 pub fn handle_query(session: &mut Session, payload: &[u8]) -> CommandResult {
     let query = String::from_utf8_lossy(payload).to_string();
     let query_lower = query.to_lowercase();
-
-    // Reset result state
     session.reset_result_state();
 
-    // Handle special queries
     if query_lower.starts_with("show databases") || query_lower.starts_with("show schemas") {
         return handle_show_databases(session);
     }
-
     if query_lower.starts_with("show tables") {
         return handle_show_tables(session);
     }
-
     if query_lower.starts_with("select @@version") {
         return handle_select_version(session);
     }
-
     if query_lower.starts_with("use ") {
         let db = query[4..].trim().trim_end_matches(';').to_string();
         session.set_database(&db);
@@ -215,12 +208,9 @@ pub fn handle_query(session: &mut Session, payload: &[u8]) -> CommandResult {
             message: String::new(),
         };
     }
-
-    // TODO: Execute actual query through query engine
-    // For now, return error
     CommandResult::Error {
         code: MySqlError::ER_NOT_SUPPORTED_YET,
-        message: "Query execution not yet implemented".to_string(),
+        message: "Use server.rs COM_QUERY path for query execution".to_string(),
     }
 }
 
@@ -244,21 +234,20 @@ fn handle_show_databases(_: &mut Session) -> CommandResult {
 }
 
 /// Handle SHOW TABLES
+/// ponytail: returns empty — server.rs handles SHOW TABLES with metadata access.
 fn handle_show_tables(session: &mut Session) -> CommandResult {
     let db = &session.current_db;
     let col_name = format!("Tables_in_{}", db);
-
     let columns = vec![ColumnDef {
         name: col_name,
         col_type: ColumnType::VarString,
         flags: 0,
         decimals: 0,
     }];
-
-    // TODO: Query actual tables from metadata
-    let rows = vec![];
-
-    CommandResult::ResultSet { columns, rows }
+    CommandResult::ResultSet {
+        columns,
+        rows: vec![],
+    }
 }
 
 /// Handle SELECT @@version
@@ -276,15 +265,11 @@ fn handle_select_version(_session: &mut Session) -> CommandResult {
 }
 
 /// Handle COM_STMT_PREPARE
+/// ponytail: basic stub — prepared statements not fully implemented.
 pub fn handle_stmt_prepare(session: &mut Session, payload: &[u8]) -> CommandResult {
     let sql = String::from_utf8_lossy(payload).to_string();
-
-    // Count parameters (simple heuristic: count ? marks)
     let num_params = sql.matches('?').count() as u16;
-
     let stmt_id = session.add_prepared_statement(sql, num_params);
-
-    // TODO: Return proper prepared statement response
     CommandResult::Ok {
         affected_rows: 0,
         last_insert_id: 0,
@@ -293,6 +278,7 @@ pub fn handle_stmt_prepare(session: &mut Session, payload: &[u8]) -> CommandResu
 }
 
 /// Handle COM_STMT_EXECUTE
+/// ponytail: basic stub — prepared statement execution not fully implemented.
 pub fn handle_stmt_execute(session: &mut Session, payload: &[u8]) -> CommandResult {
     if payload.len() < 4 {
         return CommandResult::Error {
@@ -311,7 +297,7 @@ pub fn handle_stmt_execute(session: &mut Session, payload: &[u8]) -> CommandResu
         };
     }
 
-    // TODO: Execute prepared statement with parameters
+    // ponytail: prepared statement execution not fully implemented.
     CommandResult::Error {
         code: MySqlError::ER_NOT_SUPPORTED_YET,
         message: "Prepared statement execution not yet implemented".to_string(),
@@ -350,7 +336,7 @@ pub fn handle_set_option(_session: &mut Session, payload: &[u8]) -> CommandResul
 
     // MYSQL_OPTION_MULTI_STATEMENTS_ON = 0
     // MYSQL_OPTION_MULTI_STATEMENTS_OFF = 1
-    let _ = option; // TODO: Handle multi-statement option
+    let _ = option; // MYSQL_OPTION_MULTI_STATEMENT — acknowledged, no action needed.
 
     CommandResult::Ok {
         affected_rows: 0,

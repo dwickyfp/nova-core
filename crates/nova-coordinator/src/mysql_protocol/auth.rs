@@ -125,27 +125,14 @@ impl AuthContext {
         client_response: &[u8],
         stored_password_hash: &[u8],
     ) -> Result<bool> {
-        if client_response.is_empty() {
-            // Empty password
-            if stored_password_hash.is_empty() {
-                self.state = AuthState::Success;
-                return Ok(true);
-            } else {
-                self.state = AuthState::Failed;
-                return Ok(false);
-            }
-        }
-
-        // Calculate expected response
-        let expected = mysql_native_password_auth(&self.scramble, stored_password_hash);
-
-        if client_response == expected {
-            self.state = AuthState::Success;
-            Ok(true)
+        let ok =
+            verify_mysql_native_password(&self.scramble, stored_password_hash, client_response);
+        self.state = if ok {
+            AuthState::Success
         } else {
-            self.state = AuthState::Failed;
-            Ok(false)
-        }
+            AuthState::Failed
+        };
+        Ok(ok)
     }
 
     /// Verify caching_sha2_password (SHA256-based).
@@ -158,88 +145,85 @@ impl AuthContext {
         client_response: &[u8],
         stored_password_hash: &[u8],
     ) -> Result<bool> {
-        if client_response.is_empty() {
-            // Empty password
-            if stored_password_hash.is_empty() {
-                self.state = AuthState::Success;
-                return Ok(true);
-            } else {
-                self.state = AuthState::Failed;
-                return Ok(false);
-            }
-        }
-
-        // For now, implement fast auth only
-        // In production, you'd check cache first and fall back to full auth if needed
-        let expected = caching_sha2_password_auth(&self.scramble, stored_password_hash);
-
-        if client_response == expected {
-            self.state = AuthState::FastAuthSuccess;
-            Ok(true)
+        let ok =
+            verify_caching_sha2_password(&self.scramble, stored_password_hash, client_response);
+        self.state = if ok {
+            AuthState::FastAuthSuccess
         } else {
-            // In production, you'd request full auth here
-            self.state = AuthState::FullAuthRequired;
-            Ok(false)
-        }
+            AuthState::FullAuthRequired
+        };
+        Ok(ok)
     }
 }
 
-/// Calculate mysql_native_password authentication response.
+/// Verify a client's mysql_native_password response against stored hash.
 ///
-/// Given:
-/// - scramble: 20-byte random challenge from server
-/// - password_hash: SHA1(SHA1(password)) stored in mysql.user table
+/// Client sends: XOR(SHA1(password), SHA1(scramble + SHA1(SHA1(password))))
+/// We have: SHA1(SHA1(password)) = password_hash (stored)
+/// We receive: client_response = XOR(SHA1(password), SHA1(scramble + password_hash))
 ///
-/// Returns: XOR(SHA1(password), SHA1(scramble + password_hash))
-pub fn mysql_native_password_auth(scramble: &[u8], password_hash: &[u8]) -> Vec<u8> {
-    if password_hash.is_empty() {
-        return Vec::new();
+/// To verify: SHA1(scramble + password_hash) XOR client_response = SHA1(password)
+/// Then SHA1(SHA1(password)) should equal password_hash.
+pub fn verify_mysql_native_password(
+    scramble: &[u8],
+    stored_hash: &[u8],
+    client_response: &[u8],
+) -> bool {
+    if stored_hash.is_empty() && client_response.is_empty() {
+        return true; // no password required
     }
-
-    // SHA1(scramble + password_hash)
+    if stored_hash.is_empty() || client_response.is_empty() {
+        return false;
+    }
+    // SHA1(scramble + stored_hash)
     let mut hasher = Sha1::new();
     hasher.update(scramble);
-    hasher.update(password_hash);
-    let _scramble_hash = hasher.finalize();
+    hasher.update(stored_hash);
+    let scramble_hash = hasher.finalize();
 
-    // We need SHA1(password) which is the pre-image of password_hash
-    // But we don't have it! In real MySQL, the client computes this.
-    // For server-side verification, we need to store SHA1(password) or
-    // use a different approach.
-    //
-    // Actually, the client sends: XOR(SHA1(password), SHA1(scramble + SHA1(SHA1(password))))
-    // And we have SHA1(SHA1(password)) stored.
-    //
-    // To verify, we need to either:
-    // 1. Store SHA1(password) in addition to SHA1(SHA1(password))
-    // 2. Or use a different verification method
-    //
-    // For now, return empty (this is a placeholder - real implementation
-    // would need to store the intermediate hash or use a different approach)
-    Vec::new()
+    // XOR client_response with scramble_hash to recover SHA1(password)
+    let stage1: Vec<u8> = client_response
+        .iter()
+        .zip(scramble_hash.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+
+    // SHA1(stage1) should equal stored_hash
+    let mut hasher2 = Sha1::new();
+    hasher2.update(&stage1);
+    let computed = hasher2.finalize();
+    computed.as_slice() == stored_hash
 }
 
-/// Calculate caching_sha2_password authentication response.
+/// Verify a client's caching_sha2_password response against stored hash.
 ///
-/// Given:
-/// - scramble: 20-byte random challenge from server
-/// - password_hash: SHA256(SHA256(password)) stored in mysql.user table
-///
-/// Returns: XOR(SHA256(password), SHA256(scramble + SHA256(SHA256(password))))
-pub fn caching_sha2_password_auth(scramble: &[u8], password_hash: &[u8]) -> Vec<u8> {
-    if password_hash.is_empty() {
-        return Vec::new();
+/// Same algorithm as mysql_native_password but with SHA256.
+pub fn verify_caching_sha2_password(
+    scramble: &[u8],
+    stored_hash: &[u8],
+    client_response: &[u8],
+) -> bool {
+    if stored_hash.is_empty() && client_response.is_empty() {
+        return true;
     }
-
-    // SHA256(scramble + password_hash)
+    if stored_hash.is_empty() || client_response.is_empty() {
+        return false;
+    }
     let mut hasher = Sha256::new();
     hasher.update(scramble);
-    hasher.update(password_hash);
-    let _scramble_hash = hasher.finalize();
+    hasher.update(stored_hash);
+    let scramble_hash = hasher.finalize();
 
-    // Similar to mysql_native_password, we need SHA256(password) which we don't have
-    // This is a placeholder
-    Vec::new()
+    let stage1: Vec<u8> = client_response
+        .iter()
+        .zip(scramble_hash.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+
+    let mut hasher2 = Sha256::new();
+    hasher2.update(&stage1);
+    let computed = hasher2.finalize();
+    computed.as_slice() == stored_hash
 }
 
 /// Hash password for storage (mysql_native_password).
@@ -475,5 +459,55 @@ mod tests {
         let result = ctx.verify(&[], &[]).unwrap();
         assert!(result);
         assert_eq!(ctx.state, AuthState::Success);
+    }
+
+    #[test]
+    fn test_verify_mysql_native_password_roundtrip() {
+        let scramble = AuthContext::generate_scramble();
+        let stored_hash = hash_password_mysql_native("secretpass");
+        let client_response = ClientAuth::mysql_native_password("secretpass", &scramble);
+
+        assert!(verify_mysql_native_password(
+            &scramble,
+            &stored_hash,
+            &client_response
+        ));
+    }
+
+    #[test]
+    fn test_verify_mysql_native_password_wrong_password() {
+        let scramble = AuthContext::generate_scramble();
+        let stored_hash = hash_password_mysql_native("secretpass");
+        let client_response = ClientAuth::mysql_native_password("wrongpass", &scramble);
+
+        assert!(!verify_mysql_native_password(
+            &scramble,
+            &stored_hash,
+            &client_response
+        ));
+    }
+
+    #[test]
+    fn test_verify_caching_sha2_password_roundtrip() {
+        let scramble = AuthContext::generate_scramble();
+        let stored_hash = hash_password_caching_sha2("secretpass");
+        let client_response = ClientAuth::caching_sha2_password("secretpass", &scramble);
+
+        assert!(verify_caching_sha2_password(
+            &scramble,
+            &stored_hash,
+            &client_response
+        ));
+    }
+
+    #[test]
+    fn test_verify_mysql_native_password_both_empty() {
+        assert!(verify_mysql_native_password(&[], &[], &[]));
+    }
+
+    #[test]
+    fn test_verify_mysql_native_password_empty_hash_nonempty_response() {
+        let scramble = AuthContext::generate_scramble();
+        assert!(!verify_mysql_native_password(&scramble, &[], &[1, 2, 3]));
     }
 }

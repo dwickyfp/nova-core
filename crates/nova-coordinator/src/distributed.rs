@@ -83,6 +83,38 @@ impl FragmentDispatcher {
         fragments
     }
 
+    /// Dispatch fragments to workers via gRPC and collect results.
+    /// Returns merged Arrow RecordBatches from all workers.
+    ///
+    /// ponytail: currently sequential dispatch — add parallel join_all when
+    /// multi-worker throughput matters.
+    pub async fn dispatch_via_grpc(
+        &mut self,
+        sql: &str,
+        mps: &[nova_common::MicroPartitionMeta],
+        worker_pool: &mut crate::grpc_client::WorkerClientPool,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+        if worker_pool.is_empty() {
+            return Err("no workers available".to_string());
+        }
+
+        let fragments = self.distribute_scan(mps);
+        if fragments.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut all_batches = Vec::new();
+        for (i, fragment) in fragments.iter().enumerate() {
+            let worker_idx = i % worker_pool.len();
+            let batches = worker_pool
+                .execute_on(worker_idx, fragment.fragment_id, sql, vec![])
+                .await
+                .map_err(|e| format!("worker {} error: {}", worker_idx, e))?;
+            all_batches.extend(batches);
+        }
+        Ok(all_batches)
+    }
+
     /// Select join strategy based on table statistics.
     ///
     /// Rules:

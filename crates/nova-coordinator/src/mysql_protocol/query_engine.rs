@@ -7,4 +7,10 @@ use nova_common::Result;
 pub trait QueryEngine: Send + Sync {
     /// Parse + analyze + execute raw SQL.
     async fn execute_sql(&self, sql: &str, current_db: &str) -> Result<QueryResult>;
+
+    /// List all database names (for SHOW DATABASES).
+    async fn list_databases(&self) -> Result<Vec<String>>;
+
+    /// List all table names in the given database (for SHOW TABLES).
+    async fn list_tables(&self, db: &str) -> Result<Vec<String>>;
 }

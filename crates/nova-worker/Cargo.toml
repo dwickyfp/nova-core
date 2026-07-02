@@ -16,14 +16,20 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 foyer = { workspace = true }
-tonic = "0.12"
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
 futures = "0.3.32"
 tokio-stream = "0.1.18"
 async-trait = "0.1"
+async-stream = "0.3"
 
 [dev-dependencies]
-criterion = "0.8.2"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 tempfile = "3.27.0"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [[bench]]
 name = "clickbench"

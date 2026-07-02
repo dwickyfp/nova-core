@@ -90,4 +90,12 @@ impl QueryEngine for NovaEngine {
 
         Ok(last_result)
     }
+
+    async fn list_databases(&self) -> Result<Vec<String>> {
+        self.scheduler.executor().list_database_names().await
+    }
+
+    async fn list_tables(&self, db: &str) -> Result<Vec<String>> {
+        self.scheduler.executor().list_table_names(db).await
+    }
 }

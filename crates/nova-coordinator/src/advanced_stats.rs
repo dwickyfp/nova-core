@@ -161,7 +161,7 @@ impl MostCommonValues {
         }
 
         let mut sorted: Vec<(u64, u64)> = counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         let (values, counts): (Vec<f64>, Vec<u64>) = sorted
             .into_iter()
