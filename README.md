@@ -361,17 +361,51 @@ INSERT INTO orders VALUES (2000, 1, 999.99, 'new');
 -- ponytail: stream consumption API (CONSUME FROM stream) is future work
 ```
 
-### Garbage Collection
+### Garbage Collection & Auto Compaction
 
-Remove superseded micro-partitions older than a retention window.
+Nova uses **immutable copy-on-write micro-partitions (MPs)**. Every UPDATE/DELETE creates new MPs and marks old ones as superseded — they are kept for Time Travel but accumulate over time. GC removes superseded MPs older than the retention window.
+
+**Manual GC:**
 
 ```sql
--- Keep last 7 days of history, purge older MPs
+-- Keep last 7 days of history, purge older superseded MPs
 GC 7;
 
 -- Aggressive: keep only 1 day
 GC 1;
 ```
+
+**How compaction works internally:**
+
+1. `UPDATE users SET score = 99 WHERE id = 1` → creates a new MP with updated row, marks old MP as `superseded_by = new_mp_id`
+2. Old MP stays active for Time Travel queries (`AT(TIMESTAMP => ...)`)
+3. `GC 7` scans all tables, finds MPs where `commit_ts < NOW() - 7 days` AND `superseded_by IS NOT NULL`, removes them from object storage and metadata
+
+**Auto-compaction via scheduled GC:**
+
+Nova does not run GC automatically — trigger it from a cron job or after heavy write workloads:
+
+```bash
+# Example: daily GC via mysql client
+echo "GC 7;" | mysql -h 127.0.0.1 -P 3306 -u root
+
+# Or via cron (run daily at 2AM)
+0 2 * * * echo "GC 7;" | mysql -h 127.0.0.1 -P 3306 -u root
+```
+
+**Space amplification rule of thumb:**
+
+| Write pattern | Recommended retention |
+|---|---|
+| High-frequency updates (streaming) | `GC 1` or `GC 3` daily |
+| Batch ETL (daily loads) | `GC 7` weekly |
+| Append-only (inserts only) | GC not needed — no superseded MPs |
+| Regulatory compliance | `GC 90` or `GC 365` |
+
+**What GC does NOT remove:**
+- Active MPs (current data)
+- MPs still within the retention window (needed for Time Travel)
+- Clone source MPs that are referenced by cloned tables
 
 ### Backup & Restore
 
