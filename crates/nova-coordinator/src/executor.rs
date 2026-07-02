@@ -983,48 +983,52 @@ impl Executor {
 
     /// GC: delete micro-partitions that are superseded and older than retention period.
     async fn exec_gc(&self, retention_days: u32) -> Result<QueryResult> {
-        let cutoff_ts = now_micros().saturating_sub((retention_days as u64) * 86_400 * 1_000_000);
-        let mut deleted_count: u64 = 0;
-        let mut checked_count: u64 = 0;
+        let deleted = self.gc_internal(retention_days).await?;
+        Ok(QueryResult::Success {
+            message: format!(
+                "GC: deleted {} expired MPs (retention={}d)",
+                deleted, retention_days
+            ),
+        })
+    }
 
-        // Scan all databases → schemas → tables → MPs
+    /// Internal GC callable from background compaction service.
+    pub async fn gc_internal(&self, retention_days: u32) -> Result<u64> {
+        let cutoff_ts = now_micros().saturating_sub((retention_days as u64) * 86_400 * 1_000_000);
+        let mut deleted: u64 = 0;
         let dbs = self.meta.list_databases().await?;
         for db in &dbs {
             let schemas = self.meta.list_schemas(db.id).await?;
             for schema in &schemas {
                 let tables = self.meta.list_tables(db.id, schema.id).await?;
                 for table in &tables {
-                    // Get ALL MPs (including superseded) — need to check commit_ts
-                    // ponytail: get_active_mps only returns active; for GC we need superseded too.
-                    // For now, use get_active_mps + check superseded_by chain. Add get_all_mps when needed.
-                    let active_mps = self.meta.get_active_mps(table.id).await?;
-                    for mp in &active_mps {
-                        checked_count += 1;
-                        // If this MP was superseded before cutoff, delete it
-                        if let Some(_next_id) = mp.superseded_by
-                            && mp.commit_ts < cutoff_ts
-                        {
+                    let mps = self.meta.get_active_mps(table.id).await?;
+                    for mp in &mps {
+                        if mp.superseded_by.is_some() && mp.commit_ts < cutoff_ts {
                             self.meta.delete_mp(mp.mp_id).await?;
-                            deleted_count += 1;
+                            deleted += 1;
                         }
                     }
                 }
             }
         }
+        tracing::info!(deleted, retention_days, "GC sweep completed");
+        Ok(deleted)
+    }
 
-        tracing::info!(
-            checked = checked_count,
-            deleted = deleted_count,
-            retention_days,
-            "GC completed"
-        );
+    /// Expose metadata store (for compaction service).
+    pub fn meta(&self) -> &Arc<dyn nova_storage::MetadataStore> {
+        &self.meta
+    }
 
-        Ok(QueryResult::Success {
-            message: format!(
-                "GC: checked {} MPs, deleted {} expired (retention={}d)",
-                checked_count, deleted_count, retention_days
-            ),
-        })
+    /// Expose MP reader (for compaction service).
+    pub fn mp_reader(&self) -> Arc<nova_storage::MpReader> {
+        Arc::new(self.reader.clone())
+    }
+
+    /// Expose MP writer (for compaction service).
+    pub fn mp_writer(&self) -> &nova_storage::MpWriter {
+        &self.writer
     }
 
     /// Execute SELECT via DataFusion SessionContext (enables AGG, GROUP BY, ORDER BY, LIMIT, JOIN).

@@ -47,6 +47,8 @@ struct Config {
     metadata: MetadataConfig,
     #[serde(default)]
     auth: AuthConfig,
+    #[serde(default)]
+    compaction: nova_coordinator::compaction::CompactionConfig,
 }
 
 #[derive(serde::Deserialize)]
@@ -203,7 +205,10 @@ async fn main() -> anyhow::Result<()> {
             );
             tracing::info!("AutoScaler initialized (passive, single-node)");
 
-            let engine = Arc::new(NovaEngine::new(executor));
+            let engine = Arc::new(NovaEngine::new(executor.clone()));
+
+            // Phase 12: Start background compaction (auto-GC + MP merge)
+            nova_coordinator::compaction::start(executor, cfg.compaction.clone());
 
             // Phase 6: Start HTTP server for /health and /metrics
             let http_addr = format!("{}:{}", cfg.server.host, 9090);

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod auto_scaling;
 pub mod cache;
 pub mod cbo;
+pub mod compaction;
 pub mod distributed;
 pub mod executor;
 pub mod grpc_client;

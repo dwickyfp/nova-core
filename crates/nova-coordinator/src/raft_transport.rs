@@ -22,8 +22,8 @@ use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftStateMachine;
 use openraft::{
     BasicNode, Config, Entry, EntryPayload, LogId, LogState, RaftLogReader, RaftNetworkFactory,
-    RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership,
-    TokioRuntime, Vote,
+    RaftSnapshotBuilder, Snapshot, SnapshotMeta, StorageError, StoredMembership, TokioRuntime,
+    Vote,
 };
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
