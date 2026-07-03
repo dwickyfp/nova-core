@@ -127,7 +127,7 @@ services:
       dockerfile: docker/Dockerfile
     image: nova-core:latest
     container_name: nova-worker-1
-    command: ["nova", "worker", "--config", "/etc/nova/config.toml", "--coordinator-addr", "127.0.0.1:50051"]
+    command: ["nova", "worker", "--config", "/etc/nova/config.toml", "--grpc-addr", "0.0.0.0:50051", "--coordinator-addr", "nova-coordinator:50060"]
     depends_on:
       coordinator:
         condition: service_started
@@ -136,7 +136,6 @@ services:
       - worker1_cache:/data/cache
     environment:
       NOVA_LOG_LEVEL: info
-      NOVA_WORKER_GRPC_PORT: "50051"
     restart: unless-stopped
     networks:
       - nova
@@ -148,7 +147,7 @@ services:
       dockerfile: docker/Dockerfile
     image: nova-core:latest
     container_name: nova-worker-2
-    command: ["nova", "worker", "--config", "/etc/nova/config.toml", "--coordinator-addr", "127.0.0.1:50052"]
+    command: ["nova", "worker", "--config", "/etc/nova/config.toml", "--grpc-addr", "0.0.0.0:50052", "--coordinator-addr", "nova-coordinator:50060"]
     depends_on:
       coordinator:
         condition: service_started
@@ -157,7 +156,6 @@ services:
       - worker2_cache:/data/cache
     environment:
       NOVA_LOG_LEVEL: info
-      NOVA_WORKER_GRPC_PORT: "50052"
     restart: unless-stopped
     networks:
       - nova

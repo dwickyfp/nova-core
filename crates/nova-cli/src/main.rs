@@ -28,12 +28,23 @@ enum Commands {
     Server {
         #[arg(short, long, default_value = "config.toml")]
         config: String,
+        /// This node's Raft ID (1, 2, or 3). Defaults to 1 (single-node).
+        #[arg(long, default_value = "1")]
+        node_id: u64,
+        /// Comma-separated peer list: "2=host:port,3=host:port".
+        /// Empty = single-node mode (no Raft cluster).
+        #[arg(long, default_value = "")]
+        raft_peers: String,
     },
     /// Start a worker node (connects to coordinator via gRPC).
     Worker {
         #[arg(short, long, default_value = "config.toml")]
         config: String,
-        #[arg(long, default_value = "127.0.0.1:50051")]
+        /// Address this worker listens on for gRPC (e.g. 0.0.0.0:50051).
+        #[arg(long, default_value = "0.0.0.0:50051")]
+        grpc_addr: String,
+        /// Coordinator gRPC address to register with (e.g. coordinator:50060).
+        #[arg(long, default_value = "127.0.0.1:50060")]
         coordinator_addr: String,
     },
     /// Show version info.
@@ -113,7 +124,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Server { config } => {
+        Commands::Server {
+            config,
+            node_id,
+            raft_peers,
+        } => {
             tracing::info!(config = %config, "Starting Nova coordinator");
 
             let cfg: Config = figment::Figment::new()
@@ -198,12 +213,61 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to register self as worker: {}", e))?;
             tracing::info!("WorkerPool initialized (single-node mode, self-registered)");
 
-            // Phase 4: Initialize AutoScaler (passive — no auto-scaling in single-node)
-            let _auto_scaler = nova_coordinator::auto_scaling::AutoScaler::new(
-                nova_coordinator::auto_scaling::ScalingPolicy::default(),
-                nova_coordinator::auto_scaling::WarehouseSize::Small,
-            );
-            tracing::info!("AutoScaler initialized (passive, single-node)");
+            // Phase 15: Start Raft node (single-node by default, cluster if --raft-peers set)
+            {
+                let sled_path = cfg
+                    .metadata
+                    .sled_path
+                    .as_deref()
+                    .unwrap_or("./data/nova-meta");
+                let sled_store = Arc::new(SledMetadataStore::open(sled_path)?);
+                let peers: std::collections::HashMap<u64, String> = if raft_peers.is_empty() {
+                    Default::default()
+                } else {
+                    raft_peers
+                        .split(',')
+                        .filter_map(|s| {
+                            let (id, addr) = s.split_once('=')?;
+                            Some((id.parse::<u64>().ok()?, addr.to_string()))
+                        })
+                        .collect()
+                };
+                let raft_node = nova_coordinator::raft_transport::NovaRaftNode::start(
+                    node_id, peers, sled_store,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("raft start failed: {e:?}"))?;
+                if raft_node.leader_id().is_none() {
+                    raft_node.initialize_single().await.ok();
+                }
+                tracing::info!(node_id, "Raft node started");
+                // keep raft alive for coordinator lifetime
+                std::mem::forget(raft_node);
+            }
+
+            // Phase 15: Start AutoScaler background loop
+            {
+                let worker_pool_arc = Arc::new(worker_pool);
+                let worker_pool_for_scaler = worker_pool_arc.clone();
+                tokio::spawn(async move {
+                    let scaler = nova_coordinator::auto_scaling::AutoScaler::new(
+                        nova_coordinator::auto_scaling::ScalingPolicy::default(),
+                        nova_coordinator::auto_scaling::WarehouseSize::Small,
+                    );
+                    loop {
+                        let workers: Vec<_> = worker_pool_for_scaler.active_workers().await;
+                        let decision = scaler.evaluate(&workers);
+                        if !matches!(
+                            decision,
+                            nova_coordinator::auto_scaling::ScalingDecision::NoAction
+                        ) {
+                            tracing::info!(?decision, "AutoScaler decision");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                });
+                tracing::info!("AutoScaler background loop started (30s interval)");
+            }
 
             let engine = Arc::new(NovaEngine::new(executor.clone()));
 
@@ -242,6 +306,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Worker {
             config: _,
+            grpc_addr,
             coordinator_addr,
         } => {
             tracing::info!(
@@ -274,20 +339,20 @@ async fn main() -> anyhow::Result<()> {
                 stats: tokio::sync::RwLock::new(nova_worker::WorkerStats::default()),
             });
 
-            // Start gRPC server
-            let grpc_addr = coordinator_addr
+            // Start gRPC server on grpc_addr
+            let grpc_socket = grpc_addr
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid gRPC address: {e}"))?;
             let grpc_server = nova_worker::WorkerGrpcServer::new(state);
 
-            tracing::info!(addr = %coordinator_addr, "Worker gRPC server listening");
+            tracing::info!(addr = %grpc_addr, "Worker gRPC server listening");
             tonic::transport::Server::builder()
                 .add_service(
                     nova_worker::grpc_server::worker_service_server::WorkerServiceServer::new(
                         grpc_server,
                     ),
                 )
-                .serve(grpc_addr)
+                .serve(grpc_socket)
                 .await?;
             tracing::info!("Worker shutting down.");
         }
