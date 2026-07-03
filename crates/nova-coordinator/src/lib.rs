@@ -7,6 +7,7 @@ pub mod auto_scaling;
 pub mod cache;
 pub mod cbo;
 pub mod compaction;
+pub mod coordinator_grpc;
 pub mod distributed;
 pub mod dynamic_table_scheduler;
 pub mod executor;

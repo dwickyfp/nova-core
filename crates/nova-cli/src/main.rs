@@ -206,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("Monitoring initialized (query metrics ready)");
 
             // Phase 4: Initialize WorkerPool (single-node mode — self-registered)
-            let worker_pool = nova_coordinator::worker_pool::WorkerPool::new();
+            let worker_pool = Arc::new(nova_coordinator::worker_pool::WorkerPool::new());
             let _self_worker_id = worker_pool
                 .register("127.0.0.1:0".to_string())
                 .await
@@ -259,10 +259,30 @@ async fn main() -> anyhow::Result<()> {
                 std::mem::forget(raft_node);
             }
 
+            // Worker registry gRPC service (worker -> coordinator)
+            {
+                let coordinator_grpc_addr: std::net::SocketAddr = "0.0.0.0:50060".parse().unwrap();
+                let coordinator_svc =
+                    nova_coordinator::coordinator_grpc::CoordinatorGrpcServer::new(
+                        worker_pool.clone(),
+                    );
+                tokio::spawn(async move {
+                    tracing::info!(addr = %coordinator_grpc_addr, "Coordinator gRPC registry listening");
+                    tonic::transport::Server::builder()
+                        .add_service(
+                            nova_coordinator::coordinator_grpc::CoordinatorServiceServer::new(
+                                coordinator_svc,
+                            ),
+                        )
+                        .serve(coordinator_grpc_addr)
+                        .await
+                        .expect("Coordinator gRPC registry error");
+                });
+            }
+
             // Phase 15: Start AutoScaler background loop
             {
-                let worker_pool_arc = Arc::new(worker_pool);
-                let worker_pool_for_scaler = worker_pool_arc.clone();
+                let worker_pool_for_scaler = worker_pool.clone();
                 tokio::spawn(async move {
                     let scaler = nova_coordinator::auto_scaling::AutoScaler::new(
                         nova_coordinator::auto_scaling::ScalingPolicy::default(),
@@ -352,6 +372,78 @@ async fn main() -> anyhow::Result<()> {
                 meta,
                 stats: tokio::sync::RwLock::new(nova_worker::WorkerStats::default()),
             });
+
+            // Register with coordinator and start heartbeat loop.
+            {
+                let state_for_hb = state.clone();
+                let coordinator = coordinator_addr.clone();
+                let advertise_addr = std::env::var("NOVA_WORKER_ADDRESS").unwrap_or_else(|_| {
+                    grpc_addr
+                        .split_once(':')
+                        .map(|(host, _)| if host == "0.0.0.0" { "127.0.0.1" } else { host })
+                        .unwrap_or("127.0.0.1")
+                        .to_string()
+                });
+                let grpc_port = grpc_addr
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u32>().ok())
+                    .unwrap_or(50051);
+                tokio::spawn(async move {
+                    loop {
+                        match nova_coordinator::coordinator_grpc::CoordinatorServiceClient::connect(
+                            format!("http://{coordinator}"),
+                        )
+                        .await
+                        {
+                            Ok(mut client) => match client
+                                .register_worker(
+                                    nova_coordinator::coordinator_grpc::RegisterRequest {
+                                        address: advertise_addr.clone(),
+                                        grpc_port,
+                                        memory_limit_bytes: 0,
+                                        cpu_count: std::thread::available_parallelism()
+                                            .map(|n| n.get() as u32)
+                                            .unwrap_or(1),
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(resp) => {
+                                    let worker_id = resp.into_inner().worker_id;
+                                    state_for_hb
+                                        .worker_id
+                                        .store(worker_id, std::sync::atomic::Ordering::SeqCst);
+                                    state_for_hb
+                                        .registered
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    tracing::info!(worker_id, "Registered with coordinator");
+                                    loop {
+                                        let stats = state_for_hb.stats.read().await.clone();
+                                        if client
+                                            .heartbeat(nova_coordinator::coordinator_grpc::HeartbeatRequest {
+                                                worker_id,
+                                                cpu_usage: stats.cpu_usage,
+                                                memory_usage: stats.memory_usage,
+                                                active_queries: stats.active_queries,
+                                                cache_hit_count: stats.cache_hit_count,
+                                                cache_miss_count: stats.cache_miss_count,
+                                            })
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, "Worker registration failed"),
+                            },
+                            Err(e) => tracing::warn!(error = %e, "Coordinator connect failed"),
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                });
+            }
 
             // Start gRPC server on grpc_addr
             let grpc_socket = grpc_addr

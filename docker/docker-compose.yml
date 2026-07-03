@@ -136,6 +136,7 @@ services:
       - worker1_cache:/data/cache
     environment:
       NOVA_LOG_LEVEL: info
+      NOVA_WORKER_ADDRESS: nova-worker-1
     restart: unless-stopped
     networks:
       - nova
@@ -156,6 +157,7 @@ services:
       - worker2_cache:/data/cache
     environment:
       NOVA_LOG_LEVEL: info
+      NOVA_WORKER_ADDRESS: nova-worker-2
     restart: unless-stopped
     networks:
       - nova

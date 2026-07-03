@@ -2,7 +2,14 @@ syntax = "proto3";
 
 package nova.rpc;
 
-// Coordinator ↔ Worker RPC service
+// Worker → Coordinator registry RPC service
+service CoordinatorService {
+  rpc RegisterWorker(RegisterRequest) returns (RegisterResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc DeregisterWorker(DeregisterRequest) returns (DeregisterResponse);
+}
+
+// Coordinator → Worker execution RPC service
 service WorkerService {
   rpc RegisterWorker(RegisterRequest) returns (RegisterResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
