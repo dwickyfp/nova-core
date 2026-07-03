@@ -232,8 +232,9 @@ async fn main() -> anyhow::Result<()> {
                         })
                         .collect()
                 };
-                let raft_node = nova_coordinator::raft_transport::NovaRaftNode::start(
-                    node_id, peers, sled_store,
+                let raft_path = std::path::Path::new(sled_path).join("raft");
+                let raft_node = nova_coordinator::raft_transport::NovaRaftNode::start_durable(
+                    node_id, peers, sled_store, raft_path,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("raft start failed: {e:?}"))?;
