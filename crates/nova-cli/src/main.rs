@@ -240,8 +240,22 @@ async fn main() -> anyhow::Result<()> {
                 if raft_node.leader_id().is_none() {
                     raft_node.initialize_single().await.ok();
                 }
+                // Start Raft gRPC server on port cfg.server.port + 10000
+                let raft_grpc_addr: std::net::SocketAddr =
+                    format!("{}:{}", cfg.server.host, cfg.server.port as u32 + 10000)
+                        .parse()
+                        .unwrap_or_else(|_| "0.0.0.0:13306".parse().unwrap());
+                let raft_svc = raft_node.grpc_server();
+                tokio::spawn(async move {
+                    use nova_coordinator::raft_transport::raft_service_server::RaftServiceServer;
+                    tracing::info!(addr = %raft_grpc_addr, "Raft gRPC server listening");
+                    tonic::transport::Server::builder()
+                        .add_service(RaftServiceServer::new(raft_svc))
+                        .serve(raft_grpc_addr)
+                        .await
+                        .expect("Raft gRPC server error");
+                });
                 tracing::info!(node_id, "Raft node started");
-                // keep raft alive for coordinator lifetime
                 std::mem::forget(raft_node);
             }
 

@@ -19,7 +19,11 @@
 | 8 | SQL Completeness | — | ✅ Complete | AGG, GROUP BY, ORDER BY, JOIN, DROP, multi-stmt, DataFusion |
 | 9 | Production Hardening | — | ✅ Complete | COW fix, cache invalidation, auth, RBAC, E2E tests, Foyer |
 | 10 | Multi-Node Distributed | — | ✅ Complete | tonic gRPC stubs, WorkerGrpcServer, WorkerClientPool, FragmentDispatcher::dispatch_via_grpc |
-| 11 | HA Coordinator | — | 🔄 In Progress | openraft 3-node leader election, RaftRpcServer, RaftNetwork transport |
+| 11 | HA Coordinator | — | ✅ Complete | openraft 3-node leader election, RaftRpcServer, RaftNetwork transport |
+| 12 | Auto-Compaction | — | ✅ Complete | background GC + MP merge |
+| 13 | Dynamic Tables | — | ✅ Complete | CREATE/ALTER/DROP/SHOW DYNAMIC TABLE + scheduler |
+| 14 | Production Deployment | — | ✅ Complete | Docker Rust 1.91, fixed worker gRPC args |
+| 15 | Distributed Cluster Wire-up | — | ✅ Complete | Raft gRPC server mounted, AutoScaler loop wired |
 
 ---
 

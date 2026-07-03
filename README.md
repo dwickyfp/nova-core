@@ -494,6 +494,8 @@ The `docker/config-fdb.toml` inside the container points to service names (`nova
 | 11 | HA Coordinator — openraft 3-node leader election | ✅ Complete |
 | 12 | Auto-Compaction — background GC + MP merge (bin-packing) | ✅ Complete |
 | 13 | Dynamic Tables — CREATE/ALTER/DROP/SHOW + scheduler | ✅ Complete |
+| 14 | Production Deployment — Docker Rust 1.91 + worker gRPC args | ✅ Complete |
+| 15 | Distributed Cluster Wire-up — Raft gRPC server + AutoScaler loop | ✅ Complete |
 
 **300+ tests passing** · **~20K LOC Rust** · **clippy clean** · **zero TODO/FIXME**
 
