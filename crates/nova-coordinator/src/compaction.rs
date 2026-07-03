@@ -9,8 +9,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nova_common::now_micros;
-use nova_storage::{MetadataStore, MpReader, MpWriter};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -181,9 +179,6 @@ async fn merge_mp_group(
     candidates: &[&nova_common::MicroPartitionMeta],
     target_rows: u64,
 ) -> nova_common::Result<u64> {
-    use arrow::compute::concat_batches;
-    use nova_common::MicroPartitionMeta;
-
     let meta = executor.meta();
     let reader = executor.mp_reader();
     let writer = executor.mp_writer();

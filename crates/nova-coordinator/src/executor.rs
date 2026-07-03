@@ -302,6 +302,41 @@ impl Executor {
                     message: format!("Schema '{}.{}' dropped", db, schema),
                 })
             }
+            ResolvedStatement::CreateDynamicTable {
+                db,
+                schema,
+                name,
+                query_definition,
+                target_lag_seconds,
+                refresh_mode,
+                initialize_on_create,
+            } => {
+                self.exec_create_dynamic_table(
+                    &db,
+                    &schema,
+                    &name,
+                    query_definition,
+                    target_lag_seconds,
+                    refresh_mode,
+                    initialize_on_create,
+                )
+                .await
+            }
+            ResolvedStatement::RefreshDynamicTable { db, schema, name } => {
+                self.exec_refresh_dynamic_table(&db, &schema, &name).await
+            }
+            ResolvedStatement::SuspendDynamicTable { db, schema, name } => {
+                self.exec_set_dt_scheduler(&db, &schema, &name, false).await
+            }
+            ResolvedStatement::ResumeDynamicTable { db, schema, name } => {
+                self.exec_set_dt_scheduler(&db, &schema, &name, true).await
+            }
+            ResolvedStatement::DropDynamicTable { db, schema, name } => {
+                self.exec_drop_dynamic_table(&db, &schema, &name).await
+            }
+            ResolvedStatement::ShowDynamicTables { db, pattern } => {
+                self.exec_show_dynamic_tables(&db, pattern.as_deref()).await
+            }
         }
     }
 
@@ -1021,6 +1056,451 @@ impl Executor {
         &self.meta
     }
 
+    // ══════════════════════════════════════════════════════════════
+    //  DYNAMIC TABLE — CREATE / REFRESH / DROP / SHOW / SCHEDULER
+    // ══════════════════════════════════════════════════════════════
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_create_dynamic_table(
+        &self,
+        db: &str,
+        schema: &str,
+        name: &str,
+        query_definition: String,
+        target_lag_seconds: u64,
+        refresh_mode: nova_common::DtRefreshMode,
+        initialize_on_create: bool,
+    ) -> Result<QueryResult> {
+        use nova_common::{DtRefreshStatus, DynamicTableMeta, generate_id, now_micros};
+        // 1. Resolve db + schema to get IDs
+        let db_meta = self
+            .meta
+            .list_databases()
+            .await?
+            .into_iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| NovaError::DatabaseNotFound {
+                db_name: db.to_string(),
+            })?;
+        let schema_meta = self
+            .meta
+            .list_schemas(db_meta.id)
+            .await?
+            .into_iter()
+            .find(|s| s.name == schema)
+            .ok_or_else(|| NovaError::Internal {
+                message: format!("schema '{}' not found", schema),
+            })?;
+
+        // 2. Create placeholder output table (columns will be populated on first refresh)
+        let output_table_id = generate_id();
+        let output_table = nova_common::TableMeta {
+            id: output_table_id,
+            db_id: db_meta.id,
+            schema_id: schema_meta.id,
+            name: format!("__dt_output_{}", name),
+            columns: vec![],
+            created_at: now_micros(),
+            owner: 1,
+            comment: Some(format!("Dynamic table output for {}", name)),
+            version: 0,
+            properties: std::collections::HashMap::new(),
+        };
+        self.meta.create_table(output_table).await?;
+
+        // 3. Store DynamicTableMeta
+        let dt_id = generate_id();
+        let dt = DynamicTableMeta {
+            id: dt_id,
+            db_id: db_meta.id,
+            schema_id: schema_meta.id,
+            name: name.to_string(),
+            query_definition: query_definition.clone(),
+            target_lag_seconds: target_lag_seconds.max(60),
+            refresh_mode,
+            initialize_on_create,
+            output_table_id,
+            last_refresh_ts: None,
+            refresh_status: DtRefreshStatus::Pending,
+            comment: None,
+            created_at: now_micros(),
+            scheduler_enabled: true,
+        };
+        self.meta.create_dynamic_table(dt).await?;
+
+        // 4. Immediate initial refresh if requested
+        if initialize_on_create {
+            let _ = self
+                .exec_refresh_dynamic_table_by_id(
+                    dt_id,
+                    &query_definition,
+                    output_table_id,
+                    refresh_mode,
+                )
+                .await;
+        }
+
+        Ok(QueryResult::Success {
+            message: format!(
+                "Dynamic table '{}' created (lag={}s, mode={})",
+                name, target_lag_seconds, refresh_mode
+            ),
+        })
+    }
+
+    /// Refresh a dynamic table by name (called from ALTER DT REFRESH + scheduler).
+    pub async fn exec_refresh_dynamic_table(
+        &self,
+        db: &str,
+        _schema: &str,
+        name: &str,
+    ) -> Result<QueryResult> {
+        use nova_common::DtRefreshStatus;
+        // Find DT by name in this db
+        let db_meta = self
+            .meta
+            .list_databases()
+            .await?
+            .into_iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| NovaError::DatabaseNotFound {
+                db_name: db.to_string(),
+            })?;
+        let mut dt = self
+            .meta
+            .list_dynamic_tables(db_meta.id)
+            .await?
+            .into_iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| NovaError::Internal {
+                message: format!("dynamic table '{}' not found", name),
+            })?;
+
+        dt.refresh_status = DtRefreshStatus::Running;
+        self.meta.update_dynamic_table(dt.clone()).await?;
+
+        let result = self
+            .exec_refresh_dynamic_table_by_id(
+                dt.id,
+                &dt.query_definition,
+                dt.output_table_id,
+                dt.refresh_mode,
+            )
+            .await;
+
+        dt.refresh_status = match &result {
+            Ok(_) => DtRefreshStatus::Success,
+            Err(e) => DtRefreshStatus::Failed {
+                error: e.to_string(),
+            },
+        };
+        dt.last_refresh_ts = Some(nova_common::now_micros());
+        self.meta.update_dynamic_table(dt).await?;
+
+        result.map(|rows| QueryResult::Success {
+            message: format!("Dynamic table '{}' refreshed ({} rows)", name, rows),
+        })
+    }
+
+    async fn exec_refresh_dynamic_table_by_id(
+        &self,
+        _dt_id: nova_common::TableId,
+        query_definition: &str,
+        output_table_id: nova_common::TableId,
+        refresh_mode: nova_common::DtRefreshMode,
+    ) -> Result<u64> {
+        // Detect if we should do incremental refresh:
+        // Auto → incremental only for pure filter/project (no AGG/GROUP/DISTINCT/WINDOW)
+        let use_incremental = match refresh_mode {
+            nova_common::DtRefreshMode::Incremental => true,
+            nova_common::DtRefreshMode::Full => false,
+            nova_common::DtRefreshMode::Auto => {
+                let q_upper = query_definition.to_uppercase();
+                !q_upper.contains("GROUP BY")
+                    && !q_upper.contains("COUNT(")
+                    && !q_upper.contains("SUM(")
+                    && !q_upper.contains("AVG(")
+                    && !q_upper.contains("MIN(")
+                    && !q_upper.contains("MAX(")
+                    && !q_upper.contains("DISTINCT")
+                    && !q_upper.contains("HAVING")
+                    && !q_upper.contains("OVER (")
+            }
+        };
+
+        if use_incremental {
+            // Incremental: get last_refresh_ts, only scan MPs newer than that watermark
+            let last_ts = self
+                .meta
+                .list_databases()
+                .await
+                .ok()
+                .and(None::<u64>) // ponytail: lookup dt.last_refresh_ts from id
+                .unwrap_or(0);
+            self.do_incremental_refresh(query_definition, output_table_id, last_ts)
+                .await
+        } else {
+            self.do_full_refresh(query_definition, output_table_id)
+                .await
+        }
+    }
+
+    /// Full refresh: re-execute query, replace all output MPs.
+    async fn do_full_refresh(
+        &self,
+        query_definition: &str,
+        output_table_id: nova_common::TableId,
+    ) -> Result<u64> {
+        // Register all tables in all databases, execute query via DataFusion
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        config.options_mut().optimizer.skip_failed_rules = true;
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        let reader = std::sync::Arc::new(self.reader.clone());
+
+        // Register all tables we can find
+        for db in self.meta.list_databases().await.unwrap_or_default() {
+            for schema in self.meta.list_schemas(db.id).await.unwrap_or_default() {
+                for table in self
+                    .meta
+                    .list_tables(db.id, schema.id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if let Ok(mps) = self.meta.get_active_mps(table.id).await
+                        && !mps.is_empty()
+                    {
+                        let provider =
+                            nova_worker::NovaTableProvider::new(table.clone(), mps, reader.clone());
+                        let _ = ctx.register_table(&table.name, std::sync::Arc::new(provider));
+                    }
+                }
+            }
+        }
+
+        let df = ctx
+            .sql(query_definition)
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: e.to_string(),
+            })?;
+        let batches = df.collect().await.map_err(|e| NovaError::Internal {
+            message: e.to_string(),
+        })?;
+        let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+
+        // Write new MPs to output table
+        for batch in &batches {
+            let mp_meta = self
+                .writer
+                .write(output_table_id, 0, 0, std::slice::from_ref(batch), 1)
+                .await?;
+            self.meta.insert_mp(mp_meta).await?;
+        }
+
+        // Supersede old MPs in output table (FULL refresh = replace all)
+        let old_mps = self.meta.get_active_mps(output_table_id).await?;
+        let new_mps = self.meta.get_active_mps(output_table_id).await?;
+        for old in &old_mps {
+            if let Some(new) = new_mps.iter().find(|n| n.mp_id != old.mp_id) {
+                let _ = self.meta.mark_superseded(old.mp_id, new.mp_id).await;
+            }
+        }
+
+        Ok(total_rows)
+    }
+
+    /// Incremental refresh: only scan MPs with commit_ts > last_refresh_ts, append results.
+    async fn do_incremental_refresh(
+        &self,
+        query_definition: &str,
+        output_table_id: nova_common::TableId,
+        last_ts: u64,
+    ) -> Result<u64> {
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        config.options_mut().optimizer.skip_failed_rules = true;
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        let reader = std::sync::Arc::new(self.reader.clone());
+
+        let mut any_new = false;
+        for db in self.meta.list_databases().await.unwrap_or_default() {
+            for schema in self.meta.list_schemas(db.id).await.unwrap_or_default() {
+                for table in self
+                    .meta
+                    .list_tables(db.id, schema.id)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if let Ok(all_mps) = self.meta.get_active_mps(table.id).await {
+                        // Only MPs newer than last refresh watermark
+                        let new_mps: Vec<_> = all_mps
+                            .into_iter()
+                            .filter(|mp| mp.commit_ts > last_ts)
+                            .collect();
+                        if !new_mps.is_empty() {
+                            any_new = true;
+                            let provider = nova_worker::NovaTableProvider::new(
+                                table.clone(),
+                                new_mps,
+                                reader.clone(),
+                            );
+                            let _ = ctx.register_table(&table.name, std::sync::Arc::new(provider));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !any_new {
+            return Ok(0); // No new data — skip refresh
+        }
+
+        let df = ctx
+            .sql(query_definition)
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: e.to_string(),
+            })?;
+        let batches = df.collect().await.map_err(|e| NovaError::Internal {
+            message: e.to_string(),
+        })?;
+        let total_rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+
+        // Append-only: write new MPs, don't supersede old ones
+        for batch in &batches {
+            let mp_meta = self
+                .writer
+                .write(output_table_id, 0, 0, std::slice::from_ref(batch), 1)
+                .await?;
+            self.meta.insert_mp(mp_meta).await?;
+        }
+
+        Ok(total_rows)
+    }
+
+    async fn exec_set_dt_scheduler(
+        &self,
+        db: &str,
+        _schema: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<QueryResult> {
+        let db_meta = self
+            .meta
+            .list_databases()
+            .await?
+            .into_iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| NovaError::DatabaseNotFound {
+                db_name: db.to_string(),
+            })?;
+        let mut dt = self
+            .meta
+            .list_dynamic_tables(db_meta.id)
+            .await?
+            .into_iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| NovaError::Internal {
+                message: format!("dynamic table '{}' not found", name),
+            })?;
+        dt.scheduler_enabled = enabled;
+        self.meta.update_dynamic_table(dt).await?;
+        let action = if enabled { "RESUMED" } else { "SUSPENDED" };
+        Ok(QueryResult::Success {
+            message: format!("Dynamic table '{}' scheduler {}", name, action),
+        })
+    }
+
+    async fn exec_drop_dynamic_table(
+        &self,
+        db: &str,
+        _schema: &str,
+        name: &str,
+    ) -> Result<QueryResult> {
+        let db_meta = self
+            .meta
+            .list_databases()
+            .await?
+            .into_iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| NovaError::DatabaseNotFound {
+                db_name: db.to_string(),
+            })?;
+        let dt = self
+            .meta
+            .list_dynamic_tables(db_meta.id)
+            .await?
+            .into_iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| NovaError::Internal {
+                message: format!("dynamic table '{}' not found", name),
+            })?;
+        // Drop output MPs
+        for mp in self
+            .meta
+            .get_active_mps(dt.output_table_id)
+            .await
+            .unwrap_or_default()
+        {
+            let _ = self.meta.delete_mp(mp.mp_id).await;
+        }
+        // Drop output table
+        let _ = self.meta.drop_table(dt.output_table_id).await;
+        // Drop DT metadata
+        self.meta.drop_dynamic_table(dt.id).await?;
+        Ok(QueryResult::Success {
+            message: format!("Dynamic table '{}' dropped", name),
+        })
+    }
+
+    async fn exec_show_dynamic_tables(
+        &self,
+        db: &str,
+        pattern: Option<&str>,
+    ) -> Result<QueryResult> {
+        let db_meta = self
+            .meta
+            .list_databases()
+            .await?
+            .into_iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| NovaError::DatabaseNotFound {
+                db_name: db.to_string(),
+            })?;
+        let dts = self.meta.list_dynamic_tables(db_meta.id).await?;
+        let rows: Vec<Vec<String>> = dts
+            .iter()
+            .filter(|d| pattern.map(|p| d.name.contains(p)).unwrap_or(true))
+            .map(|d| {
+                vec![
+                    d.name.clone(),
+                    format!("{}", d.refresh_mode),
+                    d.target_lag_seconds.to_string(),
+                    d.last_refresh_ts
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "never".to_string()),
+                    format!("{}", d.refresh_status),
+                    if d.scheduler_enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                    .to_string(),
+                ]
+            })
+            .collect();
+        Ok(QueryResult::Rows {
+            columns: vec![
+                "name".into(),
+                "refresh_mode".into(),
+                "target_lag_s".into(),
+                "last_refresh_ts".into(),
+                "status".into(),
+                "scheduler".into(),
+            ],
+            rows,
+        })
+    }
+
     /// Expose MP reader (for compaction service).
     pub fn mp_reader(&self) -> Arc<nova_storage::MpReader> {
         Arc::new(self.reader.clone())
@@ -1195,7 +1675,7 @@ impl Executor {
             source: Box::new(e),
         })
     }
-}
+} // impl Executor
 
 /// Parse SQL type string to NovaType.
 fn parse_sql_type(s: &str) -> NovaType {

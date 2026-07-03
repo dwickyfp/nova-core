@@ -8,6 +8,7 @@ pub mod cache;
 pub mod cbo;
 pub mod compaction;
 pub mod distributed;
+pub mod dynamic_table_scheduler;
 pub mod executor;
 pub mod grpc_client;
 pub mod ha;

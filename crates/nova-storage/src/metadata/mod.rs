@@ -151,4 +151,23 @@ pub trait MetadataStore: Send + Sync {
 
     /// Get clone metadata for a cloned table.
     async fn get_clone(&self, clone_table_id: TableId) -> Result<Option<CloneMeta>>;
+
+    // ══════════════════════════════════════════════════════════════
+    //  DYNAMIC TABLE OPERATIONS
+    // ══════════════════════════════════════════════════════════════
+
+    /// Create a new dynamic table entry.
+    async fn create_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()>;
+
+    /// Get a dynamic table by ID.
+    async fn get_dynamic_table(&self, dt_id: TableId) -> Result<Option<DynamicTableMeta>>;
+
+    /// List all dynamic tables in a database.
+    async fn list_dynamic_tables(&self, db_id: DatabaseId) -> Result<Vec<DynamicTableMeta>>;
+
+    /// Update dynamic table metadata (e.g. after refresh).
+    async fn update_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()>;
+
+    /// Drop a dynamic table by ID.
+    async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()>;
 }

@@ -14,10 +14,10 @@ impl SqlParser {
     }
 
     /// Parse SQL text into one or more statements.
-    /// Also handles Nova custom syntax (CLONE, STREAM, GC) via pre-parse.
+    /// Also handles Nova custom syntax (CLONE, STREAM, GC, DYNAMIC TABLE) via pre-parse.
     pub fn parse(&self, sql: &str) -> Result<Vec<Statement>> {
         let sql = sql.trim();
-        // Nova custom syntax: CLONE, STREAM, GC
+        // Nova custom syntax: CLONE, STREAM, GC, DYNAMIC TABLE
         // These are not standard SQL, so we pre-parse them.
         let upper = sql.to_uppercase();
         if upper.contains(" CLONE ") {
@@ -25,6 +25,20 @@ impl SqlParser {
         }
         if upper.starts_with("CREATE STREAM ") {
             return self.parse_stream(sql);
+        }
+        if upper.starts_with("CREATE DYNAMIC TABLE")
+            || upper.starts_with("CREATE OR REPLACE DYNAMIC TABLE")
+        {
+            return self.parse_dynamic_table(sql);
+        }
+        if upper.starts_with("ALTER DYNAMIC TABLE") {
+            return self.parse_alter_dynamic_table(sql);
+        }
+        if upper.starts_with("DROP DYNAMIC TABLE") {
+            return self.parse_drop_dynamic_table(sql);
+        }
+        if upper.starts_with("SHOW DYNAMIC TABLES") {
+            return self.parse_show_dynamic_tables(sql);
         }
         if upper.starts_with("GC") || upper.starts_with("VACUUM") {
             return self.parse_gc(sql);
@@ -132,6 +146,151 @@ impl SqlParser {
             )));
         }
         Ok(stmts)
+    }
+
+    /// Parse: CREATE [OR REPLACE] DYNAMIC TABLE <name>
+    ///   TARGET_LAG = '<n> seconds|minutes|hours|days'
+    ///   [REFRESH_MODE = FULL|INCREMENTAL|AUTO]
+    ///   [INITIALIZE = ON_CREATE|ON_SCHEDULE]
+    ///   [COMMENT = '<str>']
+    ///   AS <query>
+    ///
+    /// Encoded as: CREATE TABLE __dt_<name>__<lag_secs>__<mode>__<init> (<query encoded>)
+    fn parse_dynamic_table(&self, sql: &str) -> Result<Vec<Statement>> {
+        let upper = sql.to_uppercase();
+        // Find AS keyword — query starts after it
+        let as_pos = upper.find(" AS ").ok_or_else(|| NovaError::SqlParseError {
+            message: "DYNAMIC TABLE syntax: missing AS <query>".to_string(),
+        })?;
+        let query_def = sql[as_pos + 4..].trim().to_string();
+        let header = &upper[..as_pos];
+
+        // Extract name — token after DYNAMIC TABLE or REPLACE DYNAMIC TABLE
+        let parts: Vec<&str> = sql[..as_pos].split_whitespace().collect();
+        let dt_pos = parts
+            .iter()
+            .position(|p| p.eq_ignore_ascii_case("TABLE"))
+            .unwrap_or(0);
+        let name = parts
+            .get(dt_pos + 1)
+            .unwrap_or(&"unknown")
+            .trim_end_matches(';')
+            .to_string();
+
+        // Parse TARGET_LAG = '<n> unit'
+        let lag_secs = Self::parse_target_lag(header).unwrap_or(300);
+
+        // Parse REFRESH_MODE
+        let refresh_mode = if header.contains("REFRESH_MODE = INCREMENTAL")
+            || header.contains("REFRESH_MODE=INCREMENTAL")
+        {
+            "INCREMENTAL"
+        } else if header.contains("REFRESH_MODE = FULL") || header.contains("REFRESH_MODE=FULL") {
+            "FULL"
+        } else {
+            "AUTO"
+        };
+
+        // Parse INITIALIZE
+        let init = if header.contains("INITIALIZE = ON_SCHEDULE")
+            || header.contains("INITIALIZE=ON_SCHEDULE")
+        {
+            "ON_SCHEDULE"
+        } else {
+            "ON_CREATE"
+        };
+
+        // Encode as fake CREATE TABLE with metadata in name + comment
+        // ponytail: switch to custom AST node when sqlparser adds extensibility
+        let encoded_query = query_def
+            .chars()
+            .map(|c| match c {
+                ' ' => '_',
+                '\'' | '"' => ' ',
+                other => other,
+            })
+            .filter(|&c| c != ' ')
+            .collect::<String>();
+        let fake_sql = format!(
+            "CREATE TABLE __dt_{}__{}__{}__{} (__dt_query__ VARCHAR COMMENT '{}')",
+            name, lag_secs, refresh_mode, init, encoded_query
+        );
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: format!("dynamic table encode failed: {}", e),
+        })
+    }
+
+    /// Parse TARGET_LAG = '<n> seconds|minutes|hours|days' → seconds
+    fn parse_target_lag(header: &str) -> Option<u64> {
+        let lag_pos = header.find("TARGET_LAG")?;
+        let after = &header[lag_pos..];
+        let quote_start = after.find('\'')?;
+        let after_quote = &after[quote_start + 1..];
+        let quote_end = after_quote.find('\'')?;
+        let lag_str = after_quote[..quote_end].trim().to_uppercase();
+        let parts: Vec<&str> = lag_str.splitn(2, ' ').collect();
+        let n: u64 = parts.first()?.parse().ok()?;
+        let multiplier = match parts.get(1).unwrap_or(&"") {
+            s if s.starts_with("SECOND") => 1,
+            s if s.starts_with("MINUTE") => 60,
+            s if s.starts_with("HOUR") => 3600,
+            s if s.starts_with("DAY") => 86400,
+            _ => 60,
+        };
+        Some(n * multiplier)
+    }
+
+    /// Parse: ALTER DYNAMIC TABLE <name> REFRESH|SUSPEND|RESUME
+    fn parse_alter_dynamic_table(&self, sql: &str) -> Result<Vec<Statement>> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        // ALTER DYNAMIC TABLE <name> <action>
+        if parts.len() < 5 {
+            return Err(NovaError::SqlParseError {
+                message:
+                    "ALTER DYNAMIC TABLE syntax: ALTER DYNAMIC TABLE <name> REFRESH|SUSPEND|RESUME"
+                        .to_string(),
+            });
+        }
+        let name = parts[3].trim_end_matches(';');
+        let action = parts[4].trim_end_matches(';').to_uppercase();
+        let fake_sql = format!("DROP TABLE __alter_dt__{}_{}", name, action);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: DROP DYNAMIC TABLE <name>
+    fn parse_drop_dynamic_table(&self, sql: &str) -> Result<Vec<Statement>> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if parts.len() < 4 {
+            return Err(NovaError::SqlParseError {
+                message: "DROP DYNAMIC TABLE syntax: DROP DYNAMIC TABLE <name>".to_string(),
+            });
+        }
+        let name = parts[3].trim_end_matches(';');
+        let fake_sql = format!("DROP TABLE __drop_dt__{}", name);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: SHOW DYNAMIC TABLES [LIKE '<pattern>']
+    fn parse_show_dynamic_tables(&self, sql: &str) -> Result<Vec<Statement>> {
+        let upper = sql.to_uppercase();
+        let pattern = if let Some(like_pos) = upper.find(" LIKE ") {
+            let after = &sql[like_pos + 6..]
+                .trim()
+                .trim_matches(';')
+                .trim()
+                .to_string();
+            after.trim_matches('\'').to_string()
+        } else {
+            String::new()
+        };
+        let fake_sql = format!("DROP TABLE __show_dt__{}", pattern);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
     }
 
     /// Parse: SELECT ... FROM t AT(TIMESTAMP => <unix_micros>)
@@ -279,5 +438,56 @@ mod tests {
         let parser = SqlParser::new();
         let result = parser.parse("NOT VALID SQL !!!");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_dynamic_table_full() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse(
+                "CREATE DYNAMIC TABLE dt_orders \
+                 TARGET_LAG = '5 minutes' \
+                 REFRESH_MODE = FULL \
+                 AS SELECT id, amount FROM orders",
+            )
+            .unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_dynamic_table_incremental() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse(
+                "CREATE DYNAMIC TABLE dt_active \
+                 TARGET_LAG = '1 minute' \
+                 REFRESH_MODE = INCREMENTAL \
+                 AS SELECT * FROM orders WHERE status = 'active'",
+            )
+            .unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_alter_dynamic_table_refresh() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse("ALTER DYNAMIC TABLE dt_orders REFRESH")
+            .unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_drop_dynamic_table() {
+        let parser = SqlParser::new();
+        let stmts = parser.parse("DROP DYNAMIC TABLE dt_orders").unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_show_dynamic_tables() {
+        let parser = SqlParser::new();
+        let stmts = parser.parse("SHOW DYNAMIC TABLES").unwrap();
+        assert_eq!(stmts.len(), 1);
     }
 }

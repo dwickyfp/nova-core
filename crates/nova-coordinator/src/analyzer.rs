@@ -97,6 +97,45 @@ pub enum ResolvedStatement {
     Restore {
         path: String,
     },
+    /// CREATE DYNAMIC TABLE
+    CreateDynamicTable {
+        db: String,
+        schema: String,
+        name: String,
+        query_definition: String,
+        target_lag_seconds: u64,
+        refresh_mode: nova_common::DtRefreshMode,
+        initialize_on_create: bool,
+    },
+    /// ALTER DYNAMIC TABLE <name> REFRESH
+    RefreshDynamicTable {
+        db: String,
+        schema: String,
+        name: String,
+    },
+    /// ALTER DYNAMIC TABLE <name> SUSPEND
+    SuspendDynamicTable {
+        db: String,
+        schema: String,
+        name: String,
+    },
+    /// ALTER DYNAMIC TABLE <name> RESUME
+    ResumeDynamicTable {
+        db: String,
+        schema: String,
+        name: String,
+    },
+    /// DROP DYNAMIC TABLE <name>
+    DropDynamicTable {
+        db: String,
+        schema: String,
+        name: String,
+    },
+    /// SHOW DYNAMIC TABLES
+    ShowDynamicTables {
+        db: String,
+        pattern: Option<String>,
+    },
 }
 
 /// ALTER TABLE action types.
@@ -154,6 +193,59 @@ impl Analyzer {
                 Ok(ResolvedStatement::CreateDatabase { name })
             }
             Statement::CreateTable(ct) => {
+                // Detect Dynamic Table: table name starts with __dt_
+                if ct.name.0.iter().any(|i| i.value.starts_with("__dt_")) {
+                    // Format: __dt_<name>__<lag_secs>__<mode>__<init>
+                    let table_ident = ct
+                        .name
+                        .0
+                        .iter()
+                        .find(|i| i.value.starts_with("__dt_"))
+                        .map(|i| i.value.clone())
+                        .unwrap_or_default();
+                    let parts: Vec<&str> = table_ident.splitn(5, "__").collect();
+                    // table_ident = __dt_<name>__<lag>__<mode>__<init>
+                    // splitn(5, "__") = ["", "dt_<name>", "<lag>", "<mode>", "<init>"]
+                    let name = parts
+                        .get(1)
+                        .unwrap_or(&"")
+                        .strip_prefix("dt_")
+                        .unwrap_or("")
+                        .to_string();
+                    let lag_secs: u64 = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(300);
+                    let mode_str = parts.get(3).unwrap_or(&"AUTO");
+                    let refresh_mode = match *mode_str {
+                        "INCREMENTAL" => nova_common::DtRefreshMode::Incremental,
+                        "FULL" => nova_common::DtRefreshMode::Full,
+                        _ => nova_common::DtRefreshMode::Auto,
+                    };
+                    // Extract query from column comment if present
+                    let query_definition = ct
+                        .columns
+                        .first()
+                        .and_then(|c| {
+                            c.options.iter().find_map(|o| {
+                                if let sqlparser::ast::ColumnOption::Comment(s) = &o.option {
+                                    Some(s.replace('_', " "))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or_default();
+                    // Parse init from table_ident — 4th part (0-indexed)
+                    let init_str = table_ident.splitn(5, "__").nth(4).unwrap_or("ON_CREATE");
+                    let initialize_on_create = init_str != "ON_SCHEDULE";
+                    return Ok(ResolvedStatement::CreateDynamicTable {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        name,
+                        query_definition,
+                        target_lag_seconds: lag_secs,
+                        refresh_mode,
+                        initialize_on_create,
+                    });
+                }
                 // Detect Clone: table name contains __CLONE__
                 if let Some(clone_idx) = ct
                     .name
@@ -415,6 +507,61 @@ impl Analyzer {
                         .unwrap_or("")
                         .to_string();
                     return Ok(ResolvedStatement::Restore { path });
+                }
+
+                // Detect Dynamic Table ALTER: DROP TABLE __alter_dt__<name>_<action>
+                if table_name.starts_with("__alter_dt__") {
+                    let rest = table_name.strip_prefix("__alter_dt__").unwrap_or("");
+                    // Format: <name>_<ACTION>
+                    let last_sep = rest.rfind('_').unwrap_or(rest.len());
+                    let dt_name = &rest[..last_sep];
+                    let action = if last_sep < rest.len() {
+                        &rest[last_sep + 1..]
+                    } else {
+                        "REFRESH"
+                    };
+                    return match action.to_uppercase().as_str() {
+                        "SUSPEND" => Ok(ResolvedStatement::SuspendDynamicTable {
+                            db: self.default_db.clone(),
+                            schema: self.default_schema.clone(),
+                            name: dt_name.to_string(),
+                        }),
+                        "RESUME" => Ok(ResolvedStatement::ResumeDynamicTable {
+                            db: self.default_db.clone(),
+                            schema: self.default_schema.clone(),
+                            name: dt_name.to_string(),
+                        }),
+                        _ => Ok(ResolvedStatement::RefreshDynamicTable {
+                            db: self.default_db.clone(),
+                            schema: self.default_schema.clone(),
+                            name: dt_name.to_string(),
+                        }),
+                    };
+                }
+                // Detect DROP DYNAMIC TABLE: DROP TABLE __drop_dt__<name>
+                if table_name.starts_with("__drop_dt__") {
+                    let name = table_name
+                        .strip_prefix("__drop_dt__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::DropDynamicTable {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        name,
+                    });
+                }
+                // Detect SHOW DYNAMIC TABLES: DROP TABLE __show_dt__<pattern>
+                if table_name.starts_with("__show_dt__") {
+                    let pattern_str = table_name.strip_prefix("__show_dt__").unwrap_or("");
+                    let pattern = if pattern_str.is_empty() {
+                        None
+                    } else {
+                        Some(pattern_str.to_string())
+                    };
+                    return Ok(ResolvedStatement::ShowDynamicTables {
+                        db: self.default_db.clone(),
+                        pattern,
+                    });
                 }
 
                 // Real DROP TABLE / DROP DATABASE / DROP SCHEMA

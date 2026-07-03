@@ -308,6 +308,79 @@ pub struct AuthConfig {
     pub default_password_hash: String,
 }
 
+// ── Dynamic Table ──
+
+/// Refresh mode for dynamic tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DtRefreshMode {
+    /// Re-execute full query from scratch. Always correct.
+    Full,
+    /// Only process MPs with commit_ts > last_refresh_ts.
+    /// Valid only for filter/project-only queries (no AGG, no DISTINCT).
+    Incremental,
+    /// nova-core picks: Incremental if query is simple filter/project, else Full.
+    Auto,
+}
+
+impl std::fmt::Display for DtRefreshMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DtRefreshMode::Full => write!(f, "FULL"),
+            DtRefreshMode::Incremental => write!(f, "INCREMENTAL"),
+            DtRefreshMode::Auto => write!(f, "AUTO"),
+        }
+    }
+}
+
+/// Refresh status of a dynamic table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DtRefreshStatus {
+    /// Never refreshed (created with INITIALIZE = ON_SCHEDULE).
+    Pending,
+    /// Currently being refreshed.
+    Running,
+    /// Last refresh succeeded.
+    Success,
+    /// Last refresh failed.
+    Failed { error: String },
+}
+
+impl std::fmt::Display for DtRefreshStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DtRefreshStatus::Pending => write!(f, "pending"),
+            DtRefreshStatus::Running => write!(f, "running"),
+            DtRefreshStatus::Success => write!(f, "success"),
+            DtRefreshStatus::Failed { error } => write!(f, "failed: {}", error),
+        }
+    }
+}
+
+/// Dynamic table metadata — materialized view that auto-refreshes based on TARGET_LAG.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicTableMeta {
+    pub id: TableId,
+    pub db_id: DatabaseId,
+    pub schema_id: SchemaId,
+    pub name: String,
+    /// The SQL SELECT query that defines the dynamic table.
+    pub query_definition: String,
+    /// Target freshness in seconds. Data should be no more than this many seconds stale.
+    pub target_lag_seconds: u64,
+    pub refresh_mode: DtRefreshMode,
+    /// If true, materialize immediately on CREATE. If false, defer to first scheduler tick.
+    pub initialize_on_create: bool,
+    /// The underlying regular TableId that stores the materialized rows.
+    pub output_table_id: TableId,
+    /// Timestamp (microseconds) of the last successful refresh.
+    pub last_refresh_ts: Option<Timestamp>,
+    pub refresh_status: DtRefreshStatus,
+    pub comment: Option<String>,
+    pub created_at: Timestamp,
+    /// Whether the background scheduler should auto-refresh this DT.
+    pub scheduler_enabled: bool,
+}
+
 // ── Helpers ──
 
 /// Generate a new unique ID (based on UUID v4 + timestamp).

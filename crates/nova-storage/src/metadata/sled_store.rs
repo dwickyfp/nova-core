@@ -477,6 +477,46 @@ impl MetadataStore for SledMetadataStore {
         let key = format!("/clone/{}", clone_table_id);
         self.get_value(&key)
     }
+
+    // DYNAMIC TABLE
+
+    async fn create_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()> {
+        let key = format!("/dynamic_table/{}", dt.id);
+        self.insert_value(&key, &dt)
+    }
+
+    async fn get_dynamic_table(&self, dt_id: TableId) -> Result<Option<DynamicTableMeta>> {
+        let key = format!("/dynamic_table/{}", dt_id);
+        self.get_value(&key)
+    }
+
+    async fn list_dynamic_tables(&self, db_id: DatabaseId) -> Result<Vec<DynamicTableMeta>> {
+        let prefix = "/dynamic_table/";
+        let mut results = Vec::new();
+        for item in self.db.scan_prefix(prefix) {
+            let (_, v) = item.map_err(|e| NovaError::Internal {
+                message: format!("sled scan failed: {}", e),
+            })?;
+            let dt: DynamicTableMeta = Self::deserialize(&v)?;
+            if dt.db_id == db_id {
+                results.push(dt);
+            }
+        }
+        Ok(results)
+    }
+
+    async fn update_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()> {
+        let key = format!("/dynamic_table/{}", dt.id);
+        self.insert_value(&key, &dt)
+    }
+
+    async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()> {
+        let key = format!("/dynamic_table/{}", dt_id);
+        self.db.remove(&key).map_err(|e| NovaError::Internal {
+            message: format!("sled remove failed: {}", e),
+        })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

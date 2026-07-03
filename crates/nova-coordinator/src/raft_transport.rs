@@ -100,9 +100,9 @@ impl RaftLogStorage<NovaTypeConfig> for InMemoryLogStore {
 
     async fn get_log_state(&mut self) -> Result<LogState<NovaTypeConfig>, StorageError<u64>> {
         let inner = self.inner.lock().await;
-        let last = inner.log.values().last().map(|e| e.log_id.clone());
+        let last = inner.log.values().last().map(|e| e.log_id);
         Ok(LogState {
-            last_purged_log_id: inner.purged.clone(),
+            last_purged_log_id: inner.purged,
             last_log_id: last,
         })
     }
@@ -116,16 +116,16 @@ impl RaftLogStorage<NovaTypeConfig> for InMemoryLogStore {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        Ok(self.inner.lock().await.committed.clone())
+        Ok(self.inner.lock().await.committed)
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        self.inner.lock().await.vote = Some(vote.clone());
+        self.inner.lock().await.vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        Ok(self.inner.lock().await.vote.clone())
+        Ok(self.inner.lock().await.vote)
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -192,7 +192,7 @@ pub struct NovaSnapshotBuilder {
 impl RaftSnapshotBuilder<NovaTypeConfig> for NovaSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<NovaTypeConfig>, StorageError<u64>> {
         let meta = SnapshotMeta {
-            last_log_id: self.last_applied.clone(),
+            last_log_id: self.last_applied,
             last_membership: self.last_membership.clone(),
             snapshot_id: format!(
                 "snap-{}",
@@ -215,7 +215,7 @@ impl RaftStateMachine<NovaTypeConfig> for InMemoryStateMachine {
     async fn applied_state(
         &mut self,
     ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, BasicNode>), StorageError<u64>> {
-        Ok((self.last_applied.clone(), self.last_membership.clone()))
+        Ok((self.last_applied, self.last_membership.clone()))
     }
 
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<RaftResponse>, StorageError<u64>>
@@ -226,7 +226,7 @@ impl RaftStateMachine<NovaTypeConfig> for InMemoryStateMachine {
         let sm = crate::raft::CoordinatorStateMachine::new(self.store.clone());
         let mut results = Vec::new();
         for entry in entries {
-            self.last_applied = Some(entry.log_id.clone());
+            self.last_applied = Some(entry.log_id);
             match &entry.payload {
                 EntryPayload::Blank => results.push(RaftResponse::default()),
                 EntryPayload::Normal(req) => {
@@ -234,8 +234,7 @@ impl RaftStateMachine<NovaTypeConfig> for InMemoryStateMachine {
                     results.push(resp);
                 }
                 EntryPayload::Membership(m) => {
-                    self.last_membership =
-                        StoredMembership::new(Some(entry.log_id.clone()), m.clone());
+                    self.last_membership = StoredMembership::new(Some(entry.log_id), m.clone());
                     results.push(RaftResponse::default());
                 }
             }
@@ -245,7 +244,7 @@ impl RaftStateMachine<NovaTypeConfig> for InMemoryStateMachine {
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         NovaSnapshotBuilder {
-            last_applied: self.last_applied.clone(),
+            last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
         }
     }
@@ -261,7 +260,7 @@ impl RaftStateMachine<NovaTypeConfig> for InMemoryStateMachine {
         meta: &SnapshotMeta<u64, BasicNode>,
         _snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        self.last_applied = meta.last_log_id.clone();
+        self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         Ok(())
     }
@@ -317,10 +316,7 @@ impl RaftNetwork<NovaTypeConfig> for NovaRaftNetworkConnection {
             .into_inner();
         if !resp.error.is_empty() {
             return Err(openraft::error::RPCError::Unreachable(
-                openraft::error::Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    resp.error,
-                )),
+                openraft::error::Unreachable::new(&std::io::Error::other(resp.error)),
             ));
         }
         serde_json::from_slice(&resp.payload).map_err(|e| {
@@ -354,10 +350,7 @@ impl RaftNetwork<NovaTypeConfig> for NovaRaftNetworkConnection {
             .into_inner();
         if !resp.error.is_empty() {
             return Err(openraft::error::RPCError::Unreachable(
-                openraft::error::Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    resp.error,
-                )),
+                openraft::error::Unreachable::new(&std::io::Error::other(resp.error)),
             ));
         }
         serde_json::from_slice(&resp.payload).map_err(|e| {
@@ -395,10 +388,7 @@ impl RaftNetwork<NovaTypeConfig> for NovaRaftNetworkConnection {
             .into_inner();
         if !resp.error.is_empty() {
             return Err(openraft::error::RPCError::Unreachable(
-                openraft::error::Unreachable::new(&std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    resp.error,
-                )),
+                openraft::error::Unreachable::new(&std::io::Error::other(resp.error)),
             ));
         }
         serde_json::from_slice(&resp.payload).map_err(|e| {
