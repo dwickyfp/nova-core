@@ -11,7 +11,7 @@ use crate::rbac::RbacManager;
 /// Authentication manager — verifies user credentials.
 pub struct AuthManager {
     rbac: RbacManager,
-    /// In-memory user → password_hash map (production: store in FDB/sled).
+    /// In-memory user → password_hash map (production: store in FDB).
     users: HashMap<String, UserInfo>,
 }
 

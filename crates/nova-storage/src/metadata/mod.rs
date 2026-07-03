@@ -1,12 +1,8 @@
 //! MetadataStore — abstract trait + implementations for metadata storage.
 //!
 //! The MetadataStore trait defines the interface for all metadata operations.
-//! Implementations:
-//! - `SledMetadataStore` — embedded KV store for local dev/testing (default)
-//! - `FdbMetadataStore` — FoundationDB for production (feature = "fdb-backend")
-
-#[cfg(feature = "sled-backend")]
-pub mod sled_store;
+//! Implementation:
+//! - `FdbMetadataStore` — FoundationDB for dev and production
 
 #[cfg(feature = "fdb-backend")]
 pub mod fdb_store;

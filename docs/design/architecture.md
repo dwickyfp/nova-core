@@ -1692,7 +1692,7 @@ fn on_worker_failure(worker_id: WorkerId, in_flight_queries: Vec<QueryId>) {
 │  Parquet R/W:    parquet crate (Arrow-native)              │
 │  Object Store:   object_store (S3/GCS/Azure/Local)         │
 │  Metadata:       FoundationDB (foundationdb-rs)            │
-│  Dev Metadata:   sled (embedded, for local testing)        │
+│  Dev Metadata:   FoundationDB (local container or production cluster)        │
 │                                                              │
 │  ── Cache Layer ──                                          │
 │  Hybrid Cache:   foyer (RAM + SSD hybrid cache)            │
@@ -1787,7 +1787,7 @@ nova-engine (workspace)
 
 ```
 ├── Project setup: cargo workspace, CI, Docker
-├── Metadata store (FDB/sled) schema + CRUD
+├── Metadata store (FDB) schema + CRUD
 ├── Micro-partition writer (Arrow → Parquet → S3)
 ├── Micro-partition reader (S3 → Parquet → Arrow)
 ├── Basic SQL: CREATE TABLE, INSERT, SELECT (no optimizer)

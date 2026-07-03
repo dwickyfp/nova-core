@@ -6,13 +6,13 @@
 mod tests {
     use nova_coordinator::raft::RaftRequest;
     use nova_coordinator::raft_transport::NovaRaftNode;
-    use nova_storage::SledMetadataStore;
+    use nova_storage::FdbMetadataStore;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn make_store() -> Arc<SledMetadataStore> {
-        Arc::new(SledMetadataStore::open_temporary().unwrap())
+    fn make_store() -> Arc<FdbMetadataStore> {
+        Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap())
     }
 
     #[tokio::test]

@@ -1897,7 +1897,7 @@ mod tests {
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
         let meta: Arc<dyn MetadataStore> =
-            Arc::new(nova_storage::SledMetadataStore::open_temporary().unwrap());
+            Arc::new(nova_storage::FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         let writer = MpWriter::new(store.clone(), "test".to_string());
         let reader = MpReader::new(store);
         let executor = Executor::new(meta, writer, reader);

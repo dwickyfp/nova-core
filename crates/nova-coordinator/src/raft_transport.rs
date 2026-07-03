@@ -9,8 +9,7 @@
 //! - `RaftServiceServerImpl` — tonic gRPC server for RaftService (coordinator-to-coordinator)
 //! - `NovaRaftNode` — high-level wrapper: start(), write(), is_leader()
 //!
-//! ponytail: InMemoryLogStore/StateMachine are for dev/test — replace with
-//! sled-backed stores for production durability.
+//! ponytail: InMemoryStateMachine uses minimal snapshots; persist snapshots when recovery tests need it.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -164,25 +163,28 @@ impl RaftLogStorage<NovaTypeConfig> for InMemoryLogStore {
 }
 
 // ---------------------------------------------------------------------------
-// SledLogStore (durable Raft log/vote/commit state)
+// FdbLogStore (durable Raft log/vote/commit state)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct SledLogStore {
-    db: sled::Db,
+pub struct FdbLogStore {
+    db: Arc<foundationdb::Database>,
+    _network: Arc<foundationdb::api::NetworkAutoStop>,
 }
 
-impl SledLogStore {
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, sled::Error> {
+impl FdbLogStore {
+    pub fn open(cluster_file: &str) -> Result<Self, StorageError<u64>> {
+        let network = unsafe { foundationdb::boot() };
+        let db = foundationdb::Database::new(Some(cluster_file)).map_err(Self::write_err)?;
         Ok(Self {
-            db: sled::open(path)?,
+            db: Arc::new(db),
+            _network: Arc::new(network),
         })
     }
 
-    fn log_key(index: u64) -> [u8; 16] {
-        let mut key = [0; 16];
-        key[..8].copy_from_slice(b"raftlog:");
-        key[8..].copy_from_slice(&index.to_be_bytes());
+    fn log_key(index: u64) -> Vec<u8> {
+        let mut key = b"nova/raft/log/".to_vec();
+        key.extend_from_slice(&index.to_be_bytes());
         key
     }
 
@@ -209,9 +211,52 @@ impl SledLogStore {
     fn ser<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError<u64>> {
         serde_json::to_vec(value).map_err(Self::write_err)
     }
+
+    async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, StorageError<u64>> {
+        self.db
+            .run(|trx, _| {
+                let key = key.clone();
+                async move {
+                    trx.get(&key, false)
+                        .await
+                        .map(|v| v.map(|s| s.to_vec()))
+                        .map_err(foundationdb::FdbBindingError::from)
+                }
+            })
+            .await
+            .map_err(Self::read_err)
+    }
+
+    async fn set(&self, key: Vec<u8>, val: Vec<u8>) -> Result<(), StorageError<u64>> {
+        self.db
+            .run(|trx, _| {
+                let key = key.clone();
+                let val = val.clone();
+                async move {
+                    trx.set(&key, &val);
+                    Ok::<_, foundationdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .map_err(Self::write_err)
+    }
+
+    async fn clear_range(&self, start: Vec<u8>, end: Vec<u8>) -> Result<(), StorageError<u64>> {
+        self.db
+            .run(|trx, _| {
+                let start = start.clone();
+                let end = end.clone();
+                async move {
+                    trx.clear_range(&start, &end);
+                    Ok::<_, foundationdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .map_err(Self::write_err)
+    }
 }
 
-impl RaftLogReader<NovaTypeConfig> for SledLogStore {
+impl RaftLogReader<NovaTypeConfig> for FdbLogStore {
     async fn try_get_log_entries<
         RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + Send,
     >(
@@ -228,31 +273,37 @@ impl RaftLogReader<NovaTypeConfig> for SledLogStore {
             std::ops::Bound::Excluded(v) => *v,
             std::ops::Bound::Unbounded => u64::MAX,
         };
-        let mut out = Vec::new();
-        for item in self.db.range(Self::log_key(start)..Self::log_key(end)) {
-            let (_, val) = item.map_err(|e| Self::read_err(e))?;
-            out.push(Self::de(&val)?);
-        }
-        Ok(out)
+        let begin = Self::log_key(start);
+        let finish = Self::log_key(end);
+        let vals = self
+            .db
+            .run(|trx, _| {
+                let begin = begin.clone();
+                let finish = finish.clone();
+                async move {
+                    let opt =
+                        foundationdb::RangeOption::from((begin.as_slice(), finish.as_slice()));
+                    trx.get_range(&opt, 1_000, false)
+                        .await
+                        .map(|v| v.iter().map(|kv| kv.value().to_vec()).collect::<Vec<_>>())
+                        .map_err(foundationdb::FdbBindingError::from)
+                }
+            })
+            .await
+            .map_err(Self::read_err)?;
+        vals.iter().map(|v| Self::de(v)).collect()
     }
 }
 
-impl RaftLogStorage<NovaTypeConfig> for SledLogStore {
-    type LogReader = SledLogStore;
+impl RaftLogStorage<NovaTypeConfig> for FdbLogStore {
+    type LogReader = FdbLogStore;
 
     async fn get_log_state(&mut self) -> Result<LogState<NovaTypeConfig>, StorageError<u64>> {
-        let last = self
-            .db
-            .scan_prefix(b"raftlog:")
-            .next_back()
-            .transpose()
-            .map_err(|e| Self::read_err(e))?
-            .map(|(_, v)| Self::de::<Entry<NovaTypeConfig>>(&v).map(|e| e.log_id))
-            .transpose()?;
+        let entries = self.try_get_log_entries(..).await?;
+        let last = entries.last().map(|e| e.log_id);
         let purged = self
-            .db
-            .get(b"purged")
-            .map_err(|e| Self::read_err(e))?
+            .get(b"nova/raft/purged".to_vec())
+            .await?
             .map(|v| Self::de(&v))
             .transpose()?;
         Ok(LogState {
@@ -265,39 +316,24 @@ impl RaftLogStorage<NovaTypeConfig> for SledLogStore {
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
-        self.db
-            .insert(b"committed", Self::ser(&committed)?)
-            .map_err(|e| Self::write_err(e))?;
-        self.db
-            .flush_async()
+        self.set(b"nova/raft/committed".to_vec(), Self::ser(&committed)?)
             .await
-            .map_err(|e| Self::write_err(e))?;
-        Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        self.db
-            .get(b"committed")
-            .map_err(|e| Self::read_err(e))?
+        self.get(b"nova/raft/committed".to_vec())
+            .await?
             .map(|v| Self::de(&v))
             .transpose()
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        self.db
-            .insert(b"vote", Self::ser(vote)?)
-            .map_err(|e| Self::write_err(e))?;
-        self.db
-            .flush_async()
-            .await
-            .map_err(|e| Self::write_err(e))?;
-        Ok(())
+        self.set(b"nova/raft/vote".to_vec(), Self::ser(vote)?).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        self.db
-            .get(b"vote")
-            .map_err(|e| Self::read_err(e))?
+        self.get(b"nova/raft/vote".to_vec())
+            .await?
             .map(|v| Self::de(&v))
             .transpose()
     }
@@ -316,45 +352,27 @@ impl RaftLogStorage<NovaTypeConfig> for SledLogStore {
         I::IntoIter: Send,
     {
         for e in entries {
-            self.db
-                .insert(Self::log_key(e.log_id.index), Self::ser(&e)?)
-                .map_err(|e| Self::write_err(e))?;
+            self.set(Self::log_key(e.log_id.index), Self::ser(&e)?)
+                .await?;
         }
-        self.db
-            .flush_async()
-            .await
-            .map_err(|e| Self::write_err(e))?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let keys: Vec<_> = self
-            .db
-            .range(Self::log_key(log_id.index)..)
-            .keys()
-            .collect::<Result<_, _>>()
-            .map_err(|e| Self::write_err(e))?;
-        for k in keys {
-            self.db.remove(k).map_err(|e| Self::write_err(e))?;
-        }
-        Ok(())
+        let start = Self::log_key(log_id.index);
+        let end = Self::log_key(u64::MAX);
+        self.clear_range(start, end).await
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let keys: Vec<_> = self
-            .db
-            .range(Self::log_key(0)..=Self::log_key(log_id.index))
-            .keys()
-            .collect::<Result<_, _>>()
-            .map_err(|e| Self::write_err(e))?;
-        for k in keys {
-            self.db.remove(k).map_err(|e| Self::write_err(e))?;
-        }
-        self.db
-            .insert(b"purged", Self::ser(&log_id)?)
-            .map_err(|e| Self::write_err(e))?;
-        Ok(())
+        self.clear_range(
+            Self::log_key(0),
+            Self::log_key(log_id.index.saturating_add(1)),
+        )
+        .await?;
+        self.set(b"nova/raft/purged".to_vec(), Self::ser(&log_id)?)
+            .await
     }
 }
 
@@ -363,13 +381,13 @@ impl RaftLogStorage<NovaTypeConfig> for SledLogStore {
 // ---------------------------------------------------------------------------
 
 pub struct InMemoryStateMachine {
-    store: Arc<nova_storage::SledMetadataStore>,
+    store: Arc<nova_storage::FdbMetadataStore>,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
 }
 
 impl InMemoryStateMachine {
-    pub fn new(store: Arc<nova_storage::SledMetadataStore>) -> Self {
+    pub fn new(store: Arc<nova_storage::FdbMetadataStore>) -> Self {
         Self {
             store,
             last_applied: None,
@@ -718,32 +736,27 @@ impl NovaRaftNode {
     pub async fn start(
         node_id: u64,
         peers: std::collections::HashMap<u64, String>,
-        store: Arc<nova_storage::SledMetadataStore>,
+        store: Arc<nova_storage::FdbMetadataStore>,
     ) -> Result<Self, openraft::error::Fatal<u64>> {
         Self::start_with_log_store(node_id, peers, store, InMemoryLogStore::default()).await
     }
 
-    /// Start a node with sled-backed Raft log/vote/commit state.
+    /// Start a node with FoundationDB-backed Raft log/vote/commit state.
     pub async fn start_durable(
         node_id: u64,
         peers: std::collections::HashMap<u64, String>,
-        store: Arc<nova_storage::SledMetadataStore>,
-        raft_path: impl AsRef<std::path::Path>,
+        store: Arc<nova_storage::FdbMetadataStore>,
+        cluster_file: &str,
     ) -> Result<Self, openraft::error::Fatal<u64>> {
-        let log_store = SledLogStore::open(raft_path).map_err(|e| {
-            openraft::error::Fatal::StorageError(StorageError::from_io_error(
-                ErrorSubject::Store,
-                ErrorVerb::Write,
-                std::io::Error::other(e),
-            ))
-        })?;
+        let log_store =
+            FdbLogStore::open(cluster_file).map_err(openraft::error::Fatal::StorageError)?;
         Self::start_with_log_store(node_id, peers, store, log_store).await
     }
 
     async fn start_with_log_store<L>(
         node_id: u64,
         peers: std::collections::HashMap<u64, String>,
-        store: Arc<nova_storage::SledMetadataStore>,
+        store: Arc<nova_storage::FdbMetadataStore>,
         log_store: L,
     ) -> Result<Self, openraft::error::Fatal<u64>>
     where
@@ -813,26 +826,5 @@ impl NovaRaftNode {
     /// Expose inner Raft handle (e.g. for metrics/shutdown).
     pub fn raft(&self) -> &openraft::Raft<NovaTypeConfig> {
         &self.raft
-    }
-}
-
-#[cfg(test)]
-mod raft_transport_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_sled_log_store_persists_vote_and_committed() {
-        let dir = tempfile::tempdir().unwrap();
-        let vote = Vote::new_committed(3, 1);
-        let log_id = LogId::new(openraft::CommittedLeaderId::new(3, 1), 7);
-
-        let mut store = SledLogStore::open(dir.path()).unwrap();
-        store.save_vote(&vote).await.unwrap();
-        store.save_committed(Some(log_id)).await.unwrap();
-        drop(store);
-
-        let mut reopened = SledLogStore::open(dir.path()).unwrap();
-        assert_eq!(reopened.read_vote().await.unwrap(), Some(vote));
-        assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id));
     }
 }

@@ -8,7 +8,7 @@ mod tests {
     use nova_coordinator::analyzer::Analyzer;
     use nova_coordinator::executor::Executor;
     use nova_coordinator::parser::SqlParser;
-    use nova_storage::{MetadataStore, MpReader, MpWriter, SledMetadataStore};
+    use nova_storage::{FdbMetadataStore, MetadataStore, MpReader, MpWriter};
     use object_store::local::LocalFileSystem;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -16,7 +16,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let meta = Arc::new(SledMetadataStore::open(dir.path().join("meta")).unwrap())
+        let meta = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap())
             as Arc<dyn MetadataStore>;
         let store =
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&data_dir).unwrap())

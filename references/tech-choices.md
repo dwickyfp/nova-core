@@ -94,8 +94,8 @@
 
 | Aspect | Detail |
 |---|---|
-| **Chosen** | FoundationDB (production) + sled (local dev) |
-| **Alternatives** | PostgreSQL, etcd, TiKV, sled (production), RocksDB |
+| **Chosen** | FoundationDB for dev and production |
+| **Alternatives** | PostgreSQL, etcd, TiKV, FoundationDB (production), RocksDB |
 | **Decision date** | June 2026 |
 
 ### Why FoundationDB?
@@ -125,7 +125,7 @@
 - Less proven for metadata workloads (TiKV is designed for TiDB data, not metadata)
 - Rust-native, but FDB has Snowflake's endorsement
 
-### Why not sled for production?
+### Why not FoundationDB for production?
 
 - Still in beta
 - No HA (single-node only)

@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = ["sled-backend"]
-sled-backend = ["dep:sled"]
+default = ["fdb-backend"]
 fdb-backend = ["dep:foundationdb"]
 
 [dependencies]
@@ -22,7 +21,6 @@ tracing = { workspace = true }
 foyer = { workspace = true }
 chrono = "0.4"
 async-trait = "0.1"
-sled = { version = "0.34", optional = true }
 foundationdb = { version = "0.10", features = ["fdb-7_4", "embedded-fdb-include"], optional = true }
 
 [dev-dependencies]

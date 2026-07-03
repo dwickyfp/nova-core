@@ -422,7 +422,7 @@ async fn main() {
     println!("║  ✓ Backup & Restore (full backup, listing)                 ║");
     println!("╠════════════════════════════════════════════════════════════╣");
     println!("║  Full Architecture (203 tests, 35 commits):                ║");
-    println!("║  Phase 1: Foundation (Sled/FDB, S3, MVCC, SQL Parser)     ║");
+    println!("║  Phase 1: Foundation (FDB, S3, MVCC, SQL Parser)     ║");
     println!("║  Phase 2: Query Engine (DataFusion, Zone-Map Pruning)      ║");
     println!("║  Phase 3: Snowflake (Time Travel, Clone, Streams/CDC)      ║");
     println!("║  Phase 4: Distributed (Raft, Worker Pool, Auto-Scaling)    ║");

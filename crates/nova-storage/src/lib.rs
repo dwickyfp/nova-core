@@ -11,10 +11,6 @@ pub use cache::NovaCache;
 pub use mp_reader::MpReader;
 pub use mp_writer::MpWriter;
 
-// Metadata store backends
-#[cfg(feature = "sled-backend")]
-pub use metadata::sled_store::SledMetadataStore;
-
 #[cfg(feature = "fdb-backend")]
 pub use metadata::fdb_store::FdbMetadataStore;
 

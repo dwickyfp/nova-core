@@ -6,7 +6,7 @@ mod tests {
     use nova_coordinator::analyzer::{Analyzer, ResolvedStatement};
     use nova_coordinator::executor::{Executor, QueryResult};
     use nova_coordinator::parser::SqlParser;
-    use nova_storage::{MetadataStore, MpReader, MpWriter, SledMetadataStore};
+    use nova_storage::{FdbMetadataStore, MetadataStore, MpReader, MpWriter};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -14,7 +14,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let meta = Arc::new(SledMetadataStore::open(dir.path().join("meta")).unwrap())
+        let meta = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap())
             as Arc<dyn MetadataStore>;
         let store =
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&data_dir).unwrap())
@@ -150,13 +150,13 @@ mod tests {
         ));
     }
 
-    // ── metadata (sled) CRUD ──────────────────────────────────────
+    // ── metadata (FDB) CRUD ──────────────────────────────────────
 
     #[tokio::test]
-    async fn test_sled_dynamic_table_crud() {
+    async fn test_fdb_dynamic_table_crud() {
         use nova_common::{DtRefreshMode, DtRefreshStatus, DynamicTableMeta, now_micros};
         let dir = TempDir::new().unwrap();
-        let meta = SledMetadataStore::open(dir.path().join("meta")).unwrap();
+        let meta = FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap();
         let dt = DynamicTableMeta {
             id: 1,
             db_id: 1,

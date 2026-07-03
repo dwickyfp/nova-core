@@ -127,11 +127,11 @@ impl NovaRaftNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_storage::SledMetadataStore;
+    use nova_storage::FdbMetadataStore;
 
     #[tokio::test]
     async fn test_state_machine_create_database() {
-        let store = Arc::new(SledMetadataStore::open_temporary().unwrap());
+        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         let sm = CoordinatorStateMachine::new(store);
 
         let req = RaftRequest::CreateDatabase {
@@ -145,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_machine_create_database_duplicate() {
-        let store = Arc::new(SledMetadataStore::open_temporary().unwrap());
+        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         let sm = CoordinatorStateMachine::new(store);
 
         let req = RaftRequest::CreateDatabase {
@@ -155,13 +155,13 @@ mod tests {
 
         // Second create should still succeed (idempotent at metadata level)
         let resp2 = sm.apply(&req).await;
-        // SledMetadataStore assigns new ID each time, so it succeeds
+        // FdbMetadataStore assigns new ID each time, so it succeeds
         assert!(resp2.success);
     }
 
     #[tokio::test]
     async fn test_state_machine_create_table() {
-        let store = Arc::new(SledMetadataStore::open_temporary().unwrap());
+        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         let sm = CoordinatorStateMachine::new(store);
 
         // Create database first
@@ -187,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_machine_commit_mp() {
-        let store = Arc::new(SledMetadataStore::open_temporary().unwrap());
+        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         let sm = CoordinatorStateMachine::new(store);
 
         let req = RaftRequest::CommitMp {

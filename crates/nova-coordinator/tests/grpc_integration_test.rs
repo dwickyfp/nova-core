@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod tests {
     use nova_coordinator::grpc_client::WorkerClient;
-    use nova_storage::{MetadataStore, MpReader, SledMetadataStore};
+    use nova_storage::{FdbMetadataStore, MetadataStore, MpReader};
     use nova_worker::{WorkerGrpcServer, WorkerState, WorkerStats};
     use object_store::local::LocalFileSystem;
     use std::sync::{
@@ -26,7 +26,7 @@ mod tests {
         let meta_path = dir.path().join("meta");
         let data_path = dir.path().join("data");
         std::fs::create_dir_all(&data_path).unwrap();
-        let meta: Arc<dyn MetadataStore> = Arc::new(SledMetadataStore::open(&meta_path).unwrap());
+        let meta: Arc<dyn MetadataStore> = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(&data_path).unwrap());
         let reader = MpReader::new(store);

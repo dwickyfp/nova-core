@@ -1,7 +1,7 @@
 // FdbMetadataStore — FoundationDB metadata store for production.
 //
 // Uses FoundationDB (ACID distributed KV) as the metadata backend.
-// Same key layout as SledMetadataStore but with FDB tuples for keys.
+// Same key layout as FdbMetadataStore but with FDB tuples for keys.
 // All operations use FDB transactions for atomicity.
 //
 // Key layout (FDB tuples packed via Subspace):
@@ -605,5 +605,37 @@ impl MetadataStore for FdbMetadataStore {
             Some(bytes) => Ok(Some(Self::deserialize(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    async fn create_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()> {
+        self.fdb_set(self.pack(&("dynamic_table", dt.id)), Self::serialize(&dt)?)
+            .await
+    }
+
+    async fn get_dynamic_table(&self, dt_id: TableId) -> Result<Option<DynamicTableMeta>> {
+        self.fdb_get(self.pack(&("dynamic_table", dt_id)))
+            .await?
+            .map(|v| Self::deserialize(&v))
+            .transpose()
+    }
+
+    async fn list_dynamic_tables(&self, db_id: DatabaseId) -> Result<Vec<DynamicTableMeta>> {
+        let (start, end) = self.category_range(&"dynamic_table");
+        let mut out = Vec::new();
+        for (_, v) in self.fdb_get_range(start, end).await? {
+            let dt: DynamicTableMeta = Self::deserialize(&v)?;
+            if dt.db_id == db_id {
+                out.push(dt);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn update_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()> {
+        self.create_dynamic_table(dt).await
+    }
+
+    async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()> {
+        self.fdb_clear(self.pack(&("dynamic_table", dt_id))).await
     }
 }

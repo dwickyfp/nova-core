@@ -12,7 +12,7 @@ Nova is a production-grade OLAP engine that speaks MySQL wire protocol. Connect 
 
 ## Quick Start
 
-### Dev mode (sled, no Docker needed)
+### Dev mode (FoundationDB dev mode)
 
 ```bash
 cargo build --release
@@ -98,7 +98,7 @@ Full design: [`docs/design/architecture.md`](docs/design/architecture.md)
 | Query Engine | DataFusion 45 | #1 ClickBench Nov 2024 |
 | Columnar | Arrow 54 + Parquet 54 | |
 | Metadata (prod) | FoundationDB 7.4 | ACID distributed KV |
-| Metadata (dev) | sled 0.34 | Embedded KV, zero deps |
+| Metadata | FoundationDB 7.4 | ACID distributed KV |
 | Object Storage | object_store 0.11 | S3 / MinIO |
 | Cache | foyer 0.16 | RAM + SSD hybrid |
 | Consensus | openraft 0.9 | Coordinator HA, 3-node |
@@ -115,7 +115,7 @@ nova-core/
 │   ├── nova-common/         # Shared types, errors, NovaType
 │   ├── nova-coordinator/    # SQL parsing, CBO, scheduling, MySQL protocol, HA
 │   ├── nova-worker/         # DataFusion execution, NovaTableProvider, gRPC server
-│   ├── nova-storage/        # MpReader/MpWriter, SledMetadataStore, FdbMetadataStore
+│   ├── nova-storage/        # MpReader/MpWriter, FdbMetadataStore
 │   └── nova-cli/            # CLI binary — nova server / nova worker
 ├── proto/
 │   └── nova_rpc.proto       # WorkerService + RaftService gRPC definitions
@@ -123,7 +123,7 @@ nova-core/
 │   ├── docker-compose.yml   # Full stack: FDB + MinIO + Coordinator + 2 Workers
 │   ├── Dockerfile           # Multi-stage Rust builder
 │   └── config-fdb.toml      # Config for Docker deployment (FDB backend)
-├── config.toml              # Default dev config (sled + localhost MinIO)
+├── config.toml              # Default dev config (FoundationDB + localhost MinIO)
 └── ROADMAP.md               # Development phases
 ```
 
@@ -436,9 +436,7 @@ s3_secret_key = "nova12345"
 s3_region     = "us-east-1"
 
 [metadata]
-backend = "sled"                          # "sled" (dev) | "fdb" (prod)
-sled_path = "./data/nova-meta"            # Used when backend = "sled"
-fdb_cluster_file = "docker:docker@127.0.0.1:4500"  # Used when backend = "fdb"
+fdb_cluster_file = "docker:docker@127.0.0.1:4500"
 
 [auth]
 enabled          = false         # true = enforce password on MySQL handshake
@@ -532,7 +530,7 @@ Measured on Apple Silicon (M-series), local disk, release build (`cargo bench`).
 ## Build Commands
 
 ```bash
-# Dev build (sled backend, default)
+# Dev build (FoundationDB backend, default)
 cargo build --release
 
 # Production build (FoundationDB)

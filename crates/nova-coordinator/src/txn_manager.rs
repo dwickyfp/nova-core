@@ -145,11 +145,11 @@ impl<M: MetadataStore> TransactionManager<M> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nova_storage::SledMetadataStore;
+    use nova_storage::FdbMetadataStore;
 
-    async fn setup() -> (TransactionManager<SledMetadataStore>, tempfile::TempDir) {
+    async fn setup() -> (TransactionManager<FdbMetadataStore>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(SledMetadataStore::open(dir.path().join("test.sled")).unwrap());
+        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
         (TransactionManager::new(store), dir)
     }
 

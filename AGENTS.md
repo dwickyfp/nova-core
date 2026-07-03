@@ -182,7 +182,7 @@ mod tests {
 | Query Engine | `DataFusion` | Fixed |
 | Columnar Format | `arrow` | Fixed |
 | Storage Format | `parquet` | Fixed |
-| Metadata Store | `foundationdb` (prod), `sled` (dev) | Fixed |
+| Metadata Store | `foundationdb` (prod), `FoundationDB` (dev) | Fixed |
 | Object Storage | `object_store` | Fixed |
 | Hybrid Cache | `foyer` | Fixed |
 | Consensus | `openraft` | Fixed |

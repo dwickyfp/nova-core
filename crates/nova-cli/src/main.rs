@@ -8,7 +8,7 @@ use nova_coordinator::ha::HealthChecker;
 use nova_coordinator::monitoring::QueryMetrics;
 use nova_coordinator::mysql_protocol::MySqlServer;
 use nova_coordinator::mysql_protocol::nova_engine::NovaEngine;
-use nova_storage::{MetadataStore, MpReader, MpWriter, SledMetadataStore};
+use nova_storage::{FdbMetadataStore, MetadataStore, MpReader, MpWriter};
 use object_store::ObjectStore;
 use std::sync::Arc;
 
@@ -102,15 +102,8 @@ fn default_username() -> String {
 
 #[derive(serde::Deserialize)]
 struct MetadataConfig {
-    #[serde(default = "default_backend")]
-    backend: String,
-    sled_path: Option<String>,
     #[allow(dead_code)]
     fdb_cluster_file: Option<String>,
-}
-
-fn default_backend() -> String {
-    "sled".to_string()
 }
 
 #[tokio::main]
@@ -136,37 +129,14 @@ async fn main() -> anyhow::Result<()> {
                 .merge(figment::providers::Env::prefixed("NOVA_"))
                 .extract()?;
 
-            // Setup metadata store (sled or fdb based on config)
-            let meta: Arc<dyn MetadataStore> = match cfg.metadata.backend.as_str() {
-                "fdb" => {
-                    #[cfg(feature = "fdb-backend")]
-                    {
-                        let cluster_file = cfg
-                            .metadata
-                            .fdb_cluster_file
-                            .as_deref()
-                            .unwrap_or("docker:docker@127.0.0.1:4500");
-                        tracing::info!(cluster = %cluster_file, "Using FoundationDB metadata store");
-                        Arc::new(nova_storage::FdbMetadataStore::open(cluster_file)?)
-                    }
-                    #[cfg(not(feature = "fdb-backend"))]
-                    {
-                        anyhow::bail!(
-                            "FDB backend not compiled. Rebuild with: cargo build --features nova-storage/fdb-backend"
-                        );
-                    }
-                }
-                _ => {
-                    let sled_path = cfg
-                        .metadata
-                        .sled_path
-                        .as_deref()
-                        .unwrap_or("./data/nova-meta");
-                    tracing::info!(path = %sled_path, "Using sled metadata store");
-                    std::fs::create_dir_all(sled_path)?;
-                    Arc::new(SledMetadataStore::open(sled_path)?)
-                }
-            };
+            let cluster_file = cfg
+                .metadata
+                .fdb_cluster_file
+                .as_deref()
+                .unwrap_or("docker:docker@127.0.0.1:4500");
+            tracing::info!(cluster = %cluster_file, "Using FoundationDB metadata store");
+            let fdb_store = Arc::new(FdbMetadataStore::open(cluster_file)?);
+            let meta: Arc<dyn MetadataStore> = fdb_store.clone();
 
             // Setup MinIO object store
             let store = object_store::aws::AmazonS3Builder::new()
@@ -215,12 +185,6 @@ async fn main() -> anyhow::Result<()> {
 
             // Phase 15: Start Raft node (single-node by default, cluster if --raft-peers set)
             {
-                let sled_path = cfg
-                    .metadata
-                    .sled_path
-                    .as_deref()
-                    .unwrap_or("./data/nova-meta");
-                let sled_store = Arc::new(SledMetadataStore::open(sled_path)?);
                 let peers: std::collections::HashMap<u64, String> = if raft_peers.is_empty() {
                     Default::default()
                 } else {
@@ -232,9 +196,11 @@ async fn main() -> anyhow::Result<()> {
                         })
                         .collect()
                 };
-                let raft_path = std::path::Path::new(sled_path).join("raft");
                 let raft_node = nova_coordinator::raft_transport::NovaRaftNode::start_durable(
-                    node_id, peers, sled_store, raft_path,
+                    node_id,
+                    peers,
+                    fdb_store.clone(),
+                    cluster_file,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("raft start failed: {e:?}"))?;
@@ -340,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
             println!("nova-core {}", env!("CARGO_PKG_VERSION"));
         }
         Commands::Worker {
-            config: _,
+            config,
             grpc_addr,
             coordinator_addr,
         } => {
@@ -349,11 +315,17 @@ async fn main() -> anyhow::Result<()> {
                 "Starting Nova worker — gRPC server + coordinator registration"
             );
 
-            // Setup metadata store (sled for dev)
-            let sled_path = "./data/nova-worker-meta";
-            std::fs::create_dir_all(sled_path)?;
+            let cfg: Config = figment::Figment::new()
+                .merge(figment::providers::Toml::file(config.clone()))
+                .merge(figment::providers::Env::prefixed("NOVA_"))
+                .extract()?;
+            let cluster_file = cfg
+                .metadata
+                .fdb_cluster_file
+                .as_deref()
+                .unwrap_or("docker:docker@127.0.0.1:4500");
             let meta: Arc<dyn nova_storage::MetadataStore> =
-                Arc::new(nova_storage::SledMetadataStore::open(sled_path)?);
+                Arc::new(FdbMetadataStore::open(cluster_file)?);
 
             // Setup object store (local for dev)
             let data_dir = "./data/nova-worker-data";

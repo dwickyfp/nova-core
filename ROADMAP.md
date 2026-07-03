@@ -9,7 +9,7 @@
 
 | Phase | Name | Duration | Status | Focus |
 |---|---|---|---|---|
-| 1 | Foundation | Month 1-3 | ✅ Complete | Storage, metadata, basic SQL, FDB + sled |
+| 1 | Foundation | Month 1-3 | ✅ Complete | Storage, metadata, basic SQL, FDB |
 | 2 | Query Engine | Month 4-5 | ✅ Complete | Optimizer, planner, scheduler, MP pruning, TableProvider |
 | 3 | Snowflake Features | Month 6-7 | ✅ Complete | Time Travel, Clone, Streams, GC, BEGIN/COMMIT/ROLLBACK |
 | 4 | Distributed | Month 8-9 | ✅ Single-node | WorkerPool, AutoScaler wired (gRPC future) |
@@ -52,7 +52,7 @@
 - [ ] Define `MicroPartitionMeta` struct in `nova-common`
 - [ ] Define `TableMeta`, `DatabaseMeta`, `SchemaMeta` structs
 - [ ] Implement FDB connection layer (`nova-storage::metadata::fdb`)
-- [ ] Implement sled connection layer (for local dev/testing)
+- [ ] Use FoundationDB for local dev/testing and production
 - [ ] Implement metadata CRUD:
   - [ ] `create_database`, `get_database`, `list_databases`, `drop_database`
   - [ ] `create_schema`, `get_schema`, `list_schemas`, `drop_schema`

@@ -36,7 +36,7 @@ mod tests {
     use super::*;
     use crate::executor::Executor;
     use nova_common::*;
-    use nova_storage::{MetadataStore, SledMetadataStore};
+    use nova_storage::{FdbMetadataStore, MetadataStore};
     use object_store::local::LocalFileSystem;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -44,7 +44,7 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_create_database() {
         let dir = TempDir::new().unwrap();
-        let meta = Arc::new(SledMetadataStore::open(dir.path()).unwrap()) as Arc<dyn MetadataStore>;
+        let meta = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap()) as Arc<dyn MetadataStore>;
         let store = Arc::new(LocalFileSystem::new()) as Arc<dyn object_store::ObjectStore>;
         let writer = nova_storage::MpWriter::new(store.clone(), "test".to_string());
         let reader = nova_storage::MpReader::new(store);

@@ -12,7 +12,7 @@ datafusion = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
 bytes = "1.5"
-sled = "0.34"
+foundationdb = { version = "0.10", features = ["fdb-7_4", "embedded-fdb-include"] }
 thiserror = "1.0"
 tracing = "0.1"
 serde = { workspace = true }
