@@ -22,60 +22,94 @@ use fdb::RangeOption;
 use fdb::tuple::{Subspace, TuplePack};
 use foundationdb as fdb;
 use nova_common::{NovaError, Result, *};
-use std::sync::Arc;
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use super::MetadataStore;
 
 /// FoundationDB metadata store for production deployments.
 pub struct FdbMetadataStore {
-    db: Arc<fdb::Database>,
-    subspace: Subspace,
-    _network: Arc<fdb::api::NetworkAutoStop>, // ponytail: keep network alive, drop on store drop
+    pub(crate) db: Arc<fdb::Database>,
+    pub(crate) subspace: Subspace,
+    _network: &'static fdb::api::NetworkAutoStop, // ponytail: one FDB network per process; leak to avoid shutdown-order crashes.
 }
 
 impl FdbMetadataStore {
-    /// Connect to a FoundationDB cluster using the cluster file path.
+    pub(crate) fn pack(&self, tuple: &impl TuplePack) -> Vec<u8> {
+        self.subspace.pack(tuple)
+    }
+
+    fn network() -> &'static fdb::api::NetworkAutoStop {
+        static NETWORK: OnceLock<&'static fdb::api::NetworkAutoStop> = OnceLock::new();
+        NETWORK.get_or_init(|| Box::leak(Box::new(unsafe { fdb::boot() })))
+    }
+
+    /// Connect to a FoundationDB cluster using either a cluster file path or raw cluster contents.
     pub fn open(cluster_file: &str) -> Result<Self> {
-        let network = unsafe { fdb::boot() };
-        let db = fdb::Database::new(Some(cluster_file)).map_err(|e| NovaError::Internal {
+        let network = Self::network();
+        let cluster_file = Self::cluster_file_path(cluster_file)?;
+        let db = fdb::Database::new(Some(&cluster_file)).map_err(|e| NovaError::Internal {
             message: format!("FDB connect failed: {}", e),
         })?;
         Ok(Self {
             db: Arc::new(db),
             subspace: Subspace::from_bytes(b"nova"),
-            _network: Arc::new(network),
+            _network: network,
         })
     }
 
     /// Connect with default cluster file.
     pub fn open_default() -> Result<Self> {
-        let network = unsafe { fdb::boot() };
+        let network = Self::network();
         let db = fdb::Database::default().map_err(|e| NovaError::Internal {
             message: format!("FDB connect failed: {}", e),
         })?;
         Ok(Self {
             db: Arc::new(db),
             subspace: Subspace::from_bytes(b"nova"),
-            _network: Arc::new(network),
+            _network: network,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_test(cluster_file: &str, subspace: Vec<u8>) -> Result<Self> {
+        let network = Self::network();
+        let cluster_file = Self::cluster_file_path(cluster_file)?;
+        let db = fdb::Database::new(Some(&cluster_file)).map_err(|e| NovaError::Internal {
+            message: format!("FDB connect failed: {}", e),
+        })?;
+        Ok(Self {
+            db: Arc::new(db),
+            subspace: Subspace::from_bytes(subspace),
+            _network: network,
         })
     }
 
     // ── Helpers ──
 
-    fn serialize<T: serde::Serialize>(val: &T) -> Result<Vec<u8>> {
+    fn cluster_file_path(cluster_file: &str) -> Result<String> {
+        if Path::new(cluster_file).exists() || !cluster_file.contains('@') {
+            return Ok(cluster_file.to_string());
+        }
+        let path = std::env::temp_dir().join("nova-core-fdb.cluster");
+        std::fs::write(&path, cluster_file).map_err(|e| NovaError::Internal {
+            message: format!("FDB cluster file write failed: {}", e),
+        })?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn serialize<T: serde::Serialize>(val: &T) -> Result<Vec<u8>> {
         bincode::serialize(val).map_err(|e| NovaError::MetadataSerialization { source: e })
     }
 
-    fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         bincode::deserialize(bytes).map_err(|e| NovaError::MetadataSerialization { source: e })
     }
 
-    fn pack(&self, tuple: &impl TuplePack) -> Vec<u8> {
-        self.subspace.pack(tuple)
-    }
-
     /// Get prefix range for a subspace category.
-    fn category_range(&self, prefix: &impl TuplePack) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn category_range(&self, prefix: &impl TuplePack) -> (Vec<u8>, Vec<u8>) {
         let packed = self.subspace.pack(prefix);
         let mut end = packed.clone();
         // Increment last byte to get exclusive upper bound
@@ -86,7 +120,7 @@ impl FdbMetadataStore {
     }
 
     /// Simple single-key get via FDB read transaction.
-    async fn fdb_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn fdb_get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>> {
         let result = self
             .db
             .run(|trx, _maybe_committed| {
@@ -106,7 +140,7 @@ impl FdbMetadataStore {
     }
 
     /// Simple single-key set via FDB read-write transaction.
-    async fn fdb_set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
+    pub(crate) async fn fdb_set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         self.db
             .run(|trx, _maybe_committed| {
                 let key = key.clone();
@@ -124,7 +158,7 @@ impl FdbMetadataStore {
     }
 
     /// Simple single-key clear via FDB transaction.
-    async fn fdb_clear(&self, key: Vec<u8>) -> Result<()> {
+    pub(crate) async fn fdb_clear(&self, key: Vec<u8>) -> Result<()> {
         self.db
             .run(|trx, _maybe_committed| {
                 let key = key.clone();
@@ -141,7 +175,11 @@ impl FdbMetadataStore {
     }
 
     /// Range scan via FDB. Returns all key-value pairs in range.
-    async fn fdb_get_range(&self, start: Vec<u8>, end: Vec<u8>) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub(crate) async fn fdb_get_range(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let result = self
             .db
             .run(|trx, _maybe_committed| {
@@ -165,8 +203,111 @@ impl FdbMetadataStore {
         Ok(result)
     }
 
+    /// Commit a small metadata mutation batch atomically.
+    pub(crate) async fn fdb_write_batch(
+        &self,
+        sets: Vec<(Vec<u8>, Vec<u8>)>,
+        clears: Vec<Vec<u8>>,
+        bump_epoch: bool,
+    ) -> Result<u64> {
+        let epoch_key = self.pack(&("security_epoch",));
+        self.db
+            .run(|trx, _maybe_committed| {
+                let sets = sets.clone();
+                let clears = clears.clone();
+                let epoch_key = epoch_key.clone();
+                async move {
+                    for (key, value) in &sets {
+                        trx.set(key, value);
+                    }
+                    for key in &clears {
+                        trx.clear(key);
+                    }
+                    if !bump_epoch {
+                        return Ok::<u64, fdb::FdbBindingError>(0);
+                    }
+                    let current = trx
+                        .get(&epoch_key, false)
+                        .await
+                        .map_err(fdb::FdbBindingError::from)?
+                        .map(|v| {
+                            let bytes: [u8; 8] = v.as_ref().try_into().unwrap_or([0; 8]);
+                            u64::from_be_bytes(bytes)
+                        })
+                        .unwrap_or(0);
+                    let next = current + 1;
+                    trx.set(&epoch_key, &next.to_be_bytes()[..]);
+                    Ok(next)
+                }
+            })
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("FDB write batch failed: {}", e),
+            })
+    }
+
+    /// Atomically assert keys are absent, then apply a small metadata mutation batch.
+    pub(crate) async fn fdb_checked_write_batch(
+        &self,
+        must_not_exist: Vec<Vec<u8>>,
+        sets: Vec<(Vec<u8>, Vec<u8>)>,
+        clears: Vec<Vec<u8>>,
+        bump_epoch: bool,
+    ) -> Result<u64> {
+        let epoch_key = self.pack(&("security_epoch",));
+        self.db
+            .run(|trx, _maybe_committed| {
+                let must_not_exist = must_not_exist.clone();
+                let sets = sets.clone();
+                let clears = clears.clone();
+                let epoch_key = epoch_key.clone();
+                async move {
+                    for key in &must_not_exist {
+                        if trx
+                            .get(key, false)
+                            .await
+                            .map_err(fdb::FdbBindingError::from)?
+                            .is_some()
+                        {
+                            return Err(fdb::FdbBindingError::CustomError(Box::new(
+                                std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    "FDB checked write precondition failed",
+                                ),
+                            )));
+                        }
+                    }
+                    for (key, value) in &sets {
+                        trx.set(key, value);
+                    }
+                    for key in &clears {
+                        trx.clear(key);
+                    }
+                    if !bump_epoch {
+                        return Ok::<u64, fdb::FdbBindingError>(0);
+                    }
+                    let current = trx
+                        .get(&epoch_key, false)
+                        .await
+                        .map_err(fdb::FdbBindingError::from)?
+                        .map(|v| {
+                            let bytes: [u8; 8] = v.as_ref().try_into().unwrap_or([0; 8]);
+                            u64::from_be_bytes(bytes)
+                        })
+                        .unwrap_or(0);
+                    let next = current + 1;
+                    trx.set(&epoch_key, &next.to_be_bytes()[..]);
+                    Ok(next)
+                }
+            })
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("FDB checked write batch failed: {}", e),
+            })
+    }
+
     /// Atomic increment of a counter key.
-    async fn fdb_atomic_inc(&self, key: Vec<u8>) -> Result<u64> {
+    pub(crate) async fn fdb_atomic_inc(&self, key: Vec<u8>) -> Result<u64> {
         let result = self
             .db
             .run(|trx, _maybe_committed| {
@@ -391,12 +532,11 @@ impl MetadataStore for FdbMetadataStore {
                         message: format!("FDB tuple unpack failed: {}", e),
                     })?;
             let mp_id = unpacked.2;
+            if let Some(mp) = self.get_mp(mp_id).await?
+                && mp.active
+                && mp.superseded_by.is_none()
             {
-                if let Some(mp) = self.get_mp(mp_id).await? {
-                    if mp.active && mp.superseded_by.is_none() {
-                        mps.push(mp);
-                    }
-                }
+                mps.push(mp);
             }
         }
         Ok(mps)
@@ -432,10 +572,10 @@ impl MetadataStore for FdbMetadataStore {
                 match mp.superseded_by {
                     None => visible.push(mp),
                     Some(next_id) => {
-                        if let Some(next_mp) = self.get_mp(next_id).await? {
-                            if next_mp.commit_ts > ts {
-                                visible.push(mp);
-                            }
+                        if let Some(next_mp) = self.get_mp(next_id).await?
+                            && next_mp.commit_ts > ts
+                        {
+                            visible.push(mp);
                         }
                     }
                 }

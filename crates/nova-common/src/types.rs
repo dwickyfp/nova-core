@@ -15,8 +15,214 @@ pub type UserId = u64;
 pub type RoleId = u64;
 pub type ColumnId = u32;
 
+pub const ACCOUNT_OBJECT_ID: u64 = 0;
+pub const ROOT_USER_ID: UserId = 1;
+pub const ACCOUNTADMIN_ROLE_ID: RoleId = 1;
+pub const PUBLIC_ROLE_ID: RoleId = 2;
+
 /// Microsecond-precision timestamp.
 pub type Timestamp = u64;
+
+/// Securable object kinds for enterprise RBAC.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ObjectType {
+    Account,
+    Database,
+    Schema,
+    Table,
+    DynamicTable,
+    Stream,
+    Role,
+    User,
+}
+
+impl std::fmt::Display for ObjectType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ObjectType::Account => write!(f, "ACCOUNT"),
+            ObjectType::Database => write!(f, "DATABASE"),
+            ObjectType::Schema => write!(f, "SCHEMA"),
+            ObjectType::Table => write!(f, "TABLE"),
+            ObjectType::DynamicTable => write!(f, "DYNAMIC TABLE"),
+            ObjectType::Stream => write!(f, "STREAM"),
+            ObjectType::Role => write!(f, "ROLE"),
+            ObjectType::User => write!(f, "USER"),
+        }
+    }
+}
+
+/// Object identity used for grants and ownership.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ObjectRef {
+    pub object_type: ObjectType,
+    pub object_id: u64,
+}
+
+impl ObjectRef {
+    pub const fn new(object_type: ObjectType, object_id: u64) -> Self {
+        Self {
+            object_type,
+            object_id,
+        }
+    }
+}
+
+/// Enterprise RBAC privileges. Not every object type supports every privilege.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum SecurityPrivilege {
+    Usage,
+    Select,
+    Insert,
+    Update,
+    Delete,
+    References,
+    Monitor,
+    Modify,
+    Operate,
+    CreateDatabase,
+    CreateSchema,
+    CreateTable,
+    CreateDynamicTable,
+    CreateStream,
+    CreateRole,
+    CreateUser,
+    ManageGrants,
+    Ownership,
+}
+
+impl SecurityPrivilege {
+    pub const fn bit(self) -> u64 {
+        1u64 << (self as u8)
+    }
+}
+
+impl std::fmt::Display for SecurityPrivilege {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SecurityPrivilege::Usage => write!(f, "USAGE"),
+            SecurityPrivilege::Select => write!(f, "SELECT"),
+            SecurityPrivilege::Insert => write!(f, "INSERT"),
+            SecurityPrivilege::Update => write!(f, "UPDATE"),
+            SecurityPrivilege::Delete => write!(f, "DELETE"),
+            SecurityPrivilege::References => write!(f, "REFERENCES"),
+            SecurityPrivilege::Monitor => write!(f, "MONITOR"),
+            SecurityPrivilege::Modify => write!(f, "MODIFY"),
+            SecurityPrivilege::Operate => write!(f, "OPERATE"),
+            SecurityPrivilege::CreateDatabase => write!(f, "CREATE DATABASE"),
+            SecurityPrivilege::CreateSchema => write!(f, "CREATE SCHEMA"),
+            SecurityPrivilege::CreateTable => write!(f, "CREATE TABLE"),
+            SecurityPrivilege::CreateDynamicTable => write!(f, "CREATE DYNAMIC TABLE"),
+            SecurityPrivilege::CreateStream => write!(f, "CREATE STREAM"),
+            SecurityPrivilege::CreateRole => write!(f, "CREATE ROLE"),
+            SecurityPrivilege::CreateUser => write!(f, "CREATE USER"),
+            SecurityPrivilege::ManageGrants => write!(f, "MANAGE GRANTS"),
+            SecurityPrivilege::Ownership => write!(f, "OWNERSHIP"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PrivilegeSet {
+    pub bits: u64,
+}
+
+impl PrivilegeSet {
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+    pub fn from_privileges(privileges: &[SecurityPrivilege]) -> Self {
+        Self {
+            bits: privileges.iter().fold(0, |acc, p| acc | p.bit()),
+        }
+    }
+    pub fn contains(self, privilege: SecurityPrivilege) -> bool {
+        self.bits & privilege.bit() != 0
+    }
+    pub fn insert(&mut self, privilege: SecurityPrivilege) {
+        self.bits |= privilege.bit();
+    }
+    pub fn remove(&mut self, privilege: SecurityPrivilege) {
+        self.bits &= !privilege.bit();
+    }
+    pub fn is_empty(self) -> bool {
+        self.bits == 0
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMeta {
+    pub id: UserId,
+    pub name: String,
+    pub password_hash: String,
+    pub mysql_native_hash: Vec<u8>,
+    pub default_role_id: RoleId,
+    pub disabled: bool,
+    pub created_at: Timestamp,
+    pub created_by_user_id: UserId,
+    pub created_by_role_id: RoleId,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleMeta {
+    pub id: RoleId,
+    pub name: String,
+    pub owner_role_id: RoleId,
+    pub system: bool,
+    pub created_at: Timestamp,
+    pub created_by_user_id: UserId,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleGrantMeta {
+    pub granted_by_role_id: RoleId,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectOwnerMeta {
+    pub object: ObjectRef,
+    pub owner_role_id: RoleId,
+    pub created_by_user_id: UserId,
+    pub created_at: Timestamp,
+    pub transferred_at: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrantSetMeta {
+    pub role_id: RoleId,
+    pub object: ObjectRef,
+    pub privileges: PrivilegeSet,
+    pub grant_options: PrivilegeSet,
+    pub granted_by_role_id: RoleId,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityContext {
+    pub user_id: UserId,
+    pub username: String,
+    pub primary_role_id: RoleId,
+    pub secondary_role_ids: Vec<RoleId>,
+    pub secondary_all: bool,
+}
+
+impl SecurityContext {
+    pub fn root() -> Self {
+        Self {
+            user_id: ROOT_USER_ID,
+            username: "root".to_string(),
+            primary_role_id: ACCOUNTADMIN_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        }
+    }
+}
+
+pub fn normalize_ident(s: &str) -> String {
+    s.trim_matches('`').trim_matches('"').to_ascii_lowercase()
+}
 
 // ── Enums ──
 

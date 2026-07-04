@@ -6,6 +6,8 @@
 
 #[cfg(feature = "fdb-backend")]
 pub mod fdb_store;
+#[cfg(feature = "fdb-backend")]
+mod security_impl;
 
 use async_trait::async_trait;
 use nova_common::{Result, *};
@@ -16,7 +18,7 @@ use nova_common::{Result, *};
 /// flows through this trait. Implementations must be Send + Sync for
 /// concurrent access.
 #[async_trait]
-pub trait MetadataStore: Send + Sync {
+pub trait MetadataStore: Send + Sync + SecurityStore {
     // ══════════════════════════════════════════════════════════════
     //  DATABASE OPERATIONS
     // ══════════════════════════════════════════════════════════════
@@ -166,4 +168,38 @@ pub trait MetadataStore: Send + Sync {
 
     /// Drop a dynamic table by ID.
     async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()>;
+}
+
+/// Enterprise security metadata operations backed by FoundationDB.
+#[async_trait]
+pub trait SecurityStore: Send + Sync {
+    async fn bootstrap_security(&self) -> Result<()>;
+    async fn create_user(&self, user: UserMeta) -> Result<UserId>;
+    async fn get_user(&self, user_id: UserId) -> Result<Option<UserMeta>>;
+    async fn get_user_by_name(&self, name: &str) -> Result<Option<UserMeta>>;
+    async fn create_role(&self, role: RoleMeta) -> Result<RoleId>;
+    async fn get_role(&self, role_id: RoleId) -> Result<Option<RoleMeta>>;
+    async fn get_role_by_name(&self, name: &str) -> Result<Option<RoleMeta>>;
+    async fn grant_role_to_user(
+        &self,
+        user_id: UserId,
+        role_id: RoleId,
+        granted_by: RoleId,
+    ) -> Result<()>;
+    async fn revoke_role_from_user(&self, user_id: UserId, role_id: RoleId) -> Result<()>;
+    async fn list_user_roles(&self, user_id: UserId) -> Result<Vec<RoleId>>;
+    async fn set_object_owner(&self, owner: ObjectOwnerMeta) -> Result<()>;
+    async fn get_object_owner(&self, object: ObjectRef) -> Result<Option<ObjectOwnerMeta>>;
+    async fn grant_privileges(&self, grant: GrantSetMeta) -> Result<()>;
+    async fn revoke_privileges(
+        &self,
+        role_id: RoleId,
+        object: ObjectRef,
+        privileges: PrivilegeSet,
+    ) -> Result<()>;
+    async fn get_grant(&self, role_id: RoleId, object: ObjectRef) -> Result<Option<GrantSetMeta>>;
+    async fn list_grants_on_object(&self, object: ObjectRef) -> Result<Vec<GrantSetMeta>>;
+    async fn list_grants_to_role(&self, role_id: RoleId) -> Result<Vec<GrantSetMeta>>;
+    async fn security_epoch(&self) -> Result<u64>;
+    async fn bump_security_epoch(&self) -> Result<u64>;
 }
