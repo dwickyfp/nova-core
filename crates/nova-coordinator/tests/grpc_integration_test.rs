@@ -28,7 +28,12 @@ mod tests {
         let meta: Arc<dyn MetadataStore> = Arc::new(
             FdbMetadataStore::open_test(
                 "docker:docker@127.0.0.1:4500",
-                format!("test_{}", nova_common::now_micros()).into_bytes(),
+                format!(
+                    "test_{}_{}",
+                    nova_common::now_micros(),
+                    nova_common::generate_id()
+                )
+                .into_bytes(),
             )
             .unwrap(),
         );

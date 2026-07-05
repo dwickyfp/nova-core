@@ -1,6 +1,9 @@
 // Analyzer — resolve table/column names, check types.
 
-use nova_common::{NovaError, Result, StreamReadMode, Timestamp};
+use nova_common::{
+    FunctionArg, FunctionBody, FunctionLanguage, FunctionNullHandling, FunctionSignature,
+    FunctionVolatility, NovaError, Result, StreamReadMode, Timestamp,
+};
 use sqlparser::ast::Statement;
 
 /// Resolved SQL statement ready for execution.
@@ -14,6 +17,27 @@ pub enum ResolvedStatement {
         schema: String,
         table: String,
         columns: Vec<ResolvedColumn>,
+    },
+    CreateFunction {
+        db: String,
+        schema: String,
+        name: String,
+        args: Vec<FunctionArg>,
+        signature: FunctionSignature,
+        return_type: String,
+        language: FunctionLanguage,
+        body: FunctionBody,
+        volatility: FunctionVolatility,
+        null_handling: FunctionNullHandling,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    DropFunction {
+        db: String,
+        schema: String,
+        name: String,
+        signature: FunctionSignature,
+        if_exists: bool,
     },
     Insert {
         db: String,
@@ -223,6 +247,89 @@ impl Analyzer {
         })
     }
 
+    fn resolve_object_name(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+    ) -> Result<(String, String, String)> {
+        let parts: Vec<String> = name.0.iter().map(|ident| ident.value.clone()).collect();
+        match parts.as_slice() {
+            [function] => Ok((
+                self.default_db.clone(),
+                self.default_schema.clone(),
+                function.clone(),
+            )),
+            [schema, function] => Ok((self.default_db.clone(), schema.clone(), function.clone())),
+            [db, schema, function] => Ok((db.clone(), schema.clone(), function.clone())),
+            _ => Err(NovaError::SqlAnalysisError {
+                message: format!("unsupported object name: {}", name),
+            }),
+        }
+    }
+
+    fn sql_function_body(body: &sqlparser::ast::CreateFunctionBody) -> FunctionBody {
+        let expr = match body {
+            sqlparser::ast::CreateFunctionBody::AsBeforeOptions(expr)
+            | sqlparser::ast::CreateFunctionBody::AsAfterOptions(expr)
+            | sqlparser::ast::CreateFunctionBody::Return(expr) => expr,
+        };
+        match expr {
+            sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(source)) => {
+                FunctionBody::SqlExpression(source.clone())
+            }
+            _ => FunctionBody::SqlExpression(expr.to_string()),
+        }
+    }
+
+    fn function_volatility(
+        behavior: &Option<sqlparser::ast::FunctionBehavior>,
+    ) -> FunctionVolatility {
+        match behavior {
+            Some(sqlparser::ast::FunctionBehavior::Stable) => FunctionVolatility::Stable,
+            Some(sqlparser::ast::FunctionBehavior::Volatile) => FunctionVolatility::Volatile,
+            _ => FunctionVolatility::Immutable,
+        }
+    }
+
+    fn function_null_handling(
+        called_on_null: &Option<sqlparser::ast::FunctionCalledOnNull>,
+    ) -> FunctionNullHandling {
+        match called_on_null {
+            Some(sqlparser::ast::FunctionCalledOnNull::CalledOnNullInput) => {
+                FunctionNullHandling::CalledOnNullInput
+            }
+            Some(sqlparser::ast::FunctionCalledOnNull::Strict) => FunctionNullHandling::Strict,
+            _ => FunctionNullHandling::ReturnsNullOnNullInput,
+        }
+    }
+
+    fn resolve_function_args(
+        args: Option<&Vec<sqlparser::ast::OperateFunctionArg>>,
+    ) -> Result<Vec<FunctionArg>> {
+        args.into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(idx, arg)| {
+                if matches!(
+                    arg.mode,
+                    Some(sqlparser::ast::ArgMode::Out | sqlparser::ast::ArgMode::InOut)
+                ) {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "only scalar IN function arguments are supported".to_string(),
+                    });
+                }
+                Ok(FunctionArg {
+                    name: arg
+                        .name
+                        .as_ref()
+                        .map(|name| name.value.clone())
+                        .unwrap_or_else(|| format!("arg{}", idx + 1)),
+                    data_type: arg.data_type.to_string(),
+                    default_expr: arg.default_expr.as_ref().map(|expr| expr.to_string()),
+                })
+            })
+            .collect()
+    }
+
     fn select_tables(select: &sqlparser::ast::Select) -> Result<Vec<String>> {
         let mut tables = Vec::new();
         for twj in &select.from {
@@ -280,6 +387,65 @@ impl Analyzer {
                     }
                 })?;
                 Ok(ResolvedStatement::CreateDatabase { name })
+            }
+            Statement::CreateFunction {
+                or_replace,
+                if_not_exists,
+                name,
+                args,
+                return_type,
+                function_body,
+                behavior,
+                called_on_null,
+                language,
+                ..
+            } => {
+                let (db, schema, function_name) = self.resolve_object_name(name)?;
+                let language_name = language
+                    .as_ref()
+                    .map(|language| language.value.as_str())
+                    .unwrap_or("SQL");
+                let function_language = FunctionLanguage::from_name(language_name);
+                if function_language != FunctionLanguage::Sql {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: format!(
+                            "function language {} is not supported yet; only SQL is supported",
+                            function_language
+                        ),
+                    });
+                }
+                let return_type = return_type
+                    .as_ref()
+                    .ok_or_else(|| NovaError::SqlAnalysisError {
+                        message: "CREATE FUNCTION requires RETURNS <type>".to_string(),
+                    })?
+                    .to_string();
+                let body = function_body
+                    .as_ref()
+                    .map(Self::sql_function_body)
+                    .ok_or_else(|| NovaError::SqlAnalysisError {
+                        message: "CREATE FUNCTION requires AS <expression>".to_string(),
+                    })?;
+                let args = Self::resolve_function_args(args.as_ref())?;
+                let signature = FunctionSignature::new(
+                    args.iter()
+                        .map(|arg| arg.data_type.clone())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(ResolvedStatement::CreateFunction {
+                    db,
+                    schema,
+                    name: function_name,
+                    args,
+                    signature,
+                    return_type,
+                    language: function_language,
+                    body,
+                    volatility: Self::function_volatility(behavior),
+                    null_handling: Self::function_null_handling(called_on_null),
+                    or_replace: *or_replace,
+                    if_not_exists: *if_not_exists,
+                })
             }
             Statement::CreateTable(ct) => {
                 // Detect Dynamic Table: table name starts with __dt_
@@ -544,6 +710,36 @@ impl Analyzer {
                     schema: self.default_schema.clone(),
                     table,
                     filter,
+                })
+            }
+            Statement::DropFunction {
+                if_exists,
+                func_desc,
+                ..
+            } => {
+                let function = func_desc
+                    .first()
+                    .ok_or_else(|| NovaError::SqlAnalysisError {
+                        message: "DROP FUNCTION requires a function name".to_string(),
+                    })?;
+                if func_desc.len() > 1 {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "DROP FUNCTION supports one function at a time".to_string(),
+                    });
+                }
+                let (db, schema, name) = self.resolve_object_name(&function.name)?;
+                let args = Self::resolve_function_args(function.args.as_ref())?;
+                let signature = FunctionSignature::new(
+                    args.iter()
+                        .map(|arg| arg.data_type.clone())
+                        .collect::<Vec<_>>(),
+                );
+                Ok(ResolvedStatement::DropFunction {
+                    db,
+                    schema,
+                    name,
+                    signature,
+                    if_exists: *if_exists,
                 })
             }
             Statement::Drop {
@@ -948,6 +1144,81 @@ mod tests {
             assert_eq!(dependencies, vec!["customers", "orders"]);
         } else {
             panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn resolves_sql_create_function() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse("CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'")
+            .unwrap();
+        let resolved = analyzer().resolve(&stmts[0]).unwrap();
+
+        if let ResolvedStatement::CreateFunction {
+            db,
+            schema,
+            name,
+            args,
+            return_type,
+            language,
+            body,
+            or_replace,
+            ..
+        } = resolved
+        {
+            assert_eq!(db, "my_db");
+            assert_eq!(schema, "public");
+            assert_eq!(name, "add_one");
+            assert_eq!(args.len(), 1);
+            assert_eq!(args[0].name, "x");
+            assert_eq!(args[0].data_type, "INT");
+            assert_eq!(return_type, "INT");
+            assert_eq!(language, FunctionLanguage::Sql);
+            assert_eq!(body, FunctionBody::SqlExpression("x + 1".to_string()));
+            assert!(!or_replace);
+        } else {
+            panic!("expected CreateFunction");
+        }
+    }
+
+    #[test]
+    fn rejects_non_sql_create_function_language() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse("CREATE FUNCTION py_one(x INT) RETURNS INT LANGUAGE PYTHON AS 'x + 1'")
+            .unwrap();
+        let err = analyzer().resolve(&stmts[0]).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("function language PYTHON is not supported yet; only SQL is supported")
+        );
+    }
+
+    #[test]
+    fn resolves_drop_function_signature() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse("DROP FUNCTION IF EXISTS add_one(INT)")
+            .unwrap();
+        let resolved = analyzer().resolve(&stmts[0]).unwrap();
+
+        if let ResolvedStatement::DropFunction {
+            db,
+            schema,
+            name,
+            signature,
+            if_exists,
+        } = resolved
+        {
+            assert_eq!(db, "my_db");
+            assert_eq!(schema, "public");
+            assert_eq!(name, "add_one");
+            assert_eq!(signature.key(), "INT");
+            assert!(if_exists);
+        } else {
+            panic!("expected DropFunction");
         }
     }
 }

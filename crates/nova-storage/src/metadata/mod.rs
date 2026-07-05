@@ -77,6 +77,43 @@ pub trait MetadataStore: Send + Sync + SecurityStore {
     async fn drop_table(&self, table_id: TableId) -> Result<()>;
 
     // ══════════════════════════════════════════════════════════════
+    //  FUNCTION OPERATIONS
+    // ══════════════════════════════════════════════════════════════
+
+    /// Create a durable function metadata entry.
+    async fn create_function(&self, function: FunctionMeta) -> Result<()>;
+
+    /// Replace an existing function metadata entry while preserving its identity.
+    async fn replace_function(&self, function: FunctionMeta) -> Result<()>;
+
+    /// Get a function by fully qualified ID.
+    async fn get_function(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        function_id: FunctionId,
+    ) -> Result<Option<FunctionMeta>>;
+
+    /// Get a function by name and normalized signature.
+    async fn get_function_by_signature(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        name: &str,
+        signature: &FunctionSignature,
+    ) -> Result<Option<FunctionMeta>>;
+
+    /// List all functions in a schema.
+    async fn list_functions(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+    ) -> Result<Vec<FunctionMeta>>;
+
+    /// Drop a function and clear its owner/grant metadata.
+    async fn drop_function(&self, function_id: FunctionId) -> Result<()>;
+
+    // ══════════════════════════════════════════════════════════════
     //  MICRO-PARTITION OPERATIONS
     // ══════════════════════════════════════════════════════════════
 

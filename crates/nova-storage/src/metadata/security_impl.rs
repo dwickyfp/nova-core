@@ -10,7 +10,7 @@ use super::SecurityStore;
 use super::fdb_store::FdbMetadataStore;
 
 impl FdbMetadataStore {
-    fn object_type_key(object_type: ObjectType) -> u64 {
+    pub(crate) fn object_type_key(object_type: ObjectType) -> u64 {
         object_type as u64
     }
 
@@ -278,6 +278,26 @@ impl FdbMetadataStore {
             .map_err(|e| NovaError::Internal {
                 message: format!("FDB atomic revoke failed: {}", e),
             })
+    }
+
+    pub(crate) async fn rbac_clear_keys_for_object(
+        &self,
+        object: ObjectRef,
+    ) -> Result<Vec<Vec<u8>>> {
+        let object_type = Self::object_type_key(object.object_type);
+        let mut clears = vec![self.pack(&("object_owner", object_type, object.object_id))];
+        let (start, end) = self.category_range(&("grant_by_object", object_type, object.object_id));
+        for (key, _) in self.fdb_get_range(start, end).await? {
+            let unpacked: (String, u64, u64, RoleId) =
+                self.subspace
+                    .unpack(&key)
+                    .map_err(|e| NovaError::Internal {
+                        message: format!("FDB tuple unpack failed: {}", e),
+                    })?;
+            clears.push(self.pack(&("grant", unpacked.3, object_type, object.object_id)));
+            clears.push(key);
+        }
+        Ok(clears)
     }
 }
 
@@ -663,7 +683,12 @@ mod tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_security_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_security_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace.clone())?;
 
         store.bootstrap_security().await?;
@@ -751,7 +776,12 @@ mod tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_security_invariants_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_security_invariants_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
         store.bootstrap_security().await?;
         let epoch_after_bootstrap = store.security_epoch().await?;
