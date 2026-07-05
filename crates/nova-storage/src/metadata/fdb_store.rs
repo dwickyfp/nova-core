@@ -126,7 +126,11 @@ impl FdbMetadataStore {
         if Path::new(cluster_file).exists() || !cluster_file.contains('@') {
             return Ok(cluster_file.to_string());
         }
-        let path = std::env::temp_dir().join("nova-core-fdb.cluster");
+        let path = std::env::temp_dir().join(format!(
+            "nova-core-fdb-{}-{}.cluster",
+            std::process::id(),
+            generate_id()
+        ));
         std::fs::write(&path, cluster_file).map_err(|e| NovaError::Internal {
             message: format!("FDB cluster file write failed: {}", e),
         })?;
@@ -990,6 +994,25 @@ impl MetadataStore for FdbMetadataStore {
 
     async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()> {
         self.fdb_clear(self.pack(&("dynamic_table", dt_id))).await
+    }
+}
+
+#[cfg(test)]
+mod cluster_file_tests {
+    use super::*;
+
+    #[test]
+    fn raw_cluster_strings_get_distinct_temp_files() {
+        let raw = "docker:docker@127.0.0.1:4500";
+        let first = FdbMetadataStore::cluster_file_path(raw).unwrap();
+        let second = FdbMetadataStore::cluster_file_path(raw).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), raw);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), raw);
+
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
     }
 }
 
