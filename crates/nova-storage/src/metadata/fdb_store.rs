@@ -366,6 +366,20 @@ impl FdbMetadataStore {
             })?;
         Ok(result)
     }
+
+    async fn get_function_by_id(&self, function_id: FunctionId) -> Result<Option<FunctionMeta>> {
+        let Some(bytes) = self
+            .fdb_get(self.pack(&("function_by_id", function_id)))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let (db_id, schema_id, id): (DatabaseId, SchemaId, FunctionId) = Self::deserialize(&bytes)?;
+        self.fdb_get(self.pack(&("function", db_id, schema_id, id)))
+            .await?
+            .map(|bytes| Self::deserialize(&bytes))
+            .transpose()
+    }
 }
 
 #[async_trait]
@@ -520,6 +534,164 @@ impl MetadataStore for FdbMetadataStore {
             })?;
 
         Ok(())
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    //  FUNCTION OPERATIONS
+    // ══════════════════════════════════════════════════════════════
+
+    async fn create_function(&self, mut function: FunctionMeta) -> Result<()> {
+        if function.id == 0 {
+            function.id = self
+                .fdb_atomic_inc(self.pack(&("next_id", "function")))
+                .await?;
+        }
+        let function_key =
+            self.pack(&("function", function.db_id, function.schema_id, function.id));
+        let by_name_key = self.pack(&(
+            "function_by_name",
+            function.db_id,
+            function.schema_id,
+            normalize_ident(&function.name),
+            function.signature.key(),
+        ));
+        let by_id_key = self.pack(&("function_by_id", function.id));
+        let by_id_value = Self::serialize(&(function.db_id, function.schema_id, function.id))?;
+        self.fdb_checked_write_batch(
+            vec![function_key.clone(), by_name_key.clone(), by_id_key.clone()],
+            vec![
+                (function_key, Self::serialize(&function)?),
+                (by_name_key, function.id.to_be_bytes().to_vec()),
+                (by_id_key, by_id_value),
+            ],
+            vec![],
+            false,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn replace_function(&self, function: FunctionMeta) -> Result<()> {
+        let old =
+            self.get_function_by_id(function.id)
+                .await?
+                .ok_or_else(|| NovaError::Internal {
+                    message: format!("function '{}' not found", function.id),
+                })?;
+        let by_name_key = self.pack(&(
+            "function_by_name",
+            function.db_id,
+            function.schema_id,
+            normalize_ident(&function.name),
+            function.signature.key(),
+        ));
+        if let Some(bytes) = self.fdb_get(by_name_key.clone()).await? {
+            let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
+            let existing_id = u64::from_be_bytes(arr);
+            if existing_id != function.id {
+                return Err(NovaError::Internal {
+                    message: format!(
+                        "function '{}' with signature '{}' already exists",
+                        function.name,
+                        function.signature.key()
+                    ),
+                });
+            }
+        }
+        let old_by_name_key = self.pack(&(
+            "function_by_name",
+            old.db_id,
+            old.schema_id,
+            normalize_ident(&old.name),
+            old.signature.key(),
+        ));
+        let function_key =
+            self.pack(&("function", function.db_id, function.schema_id, function.id));
+        let old_function_key = self.pack(&("function", old.db_id, old.schema_id, old.id));
+        let by_id_key = self.pack(&("function_by_id", function.id));
+        let sets = vec![
+            (function_key.clone(), Self::serialize(&function)?),
+            (by_name_key.clone(), function.id.to_be_bytes().to_vec()),
+            (
+                by_id_key,
+                Self::serialize(&(function.db_id, function.schema_id, function.id))?,
+            ),
+        ];
+        let mut clears = Vec::new();
+        if old_function_key != function_key {
+            clears.push(old_function_key);
+        }
+        if old_by_name_key != by_name_key {
+            clears.push(old_by_name_key);
+        }
+        self.fdb_write_batch(sets, clears, false).await.map(|_| ())
+    }
+
+    async fn get_function(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        function_id: FunctionId,
+    ) -> Result<Option<FunctionMeta>> {
+        self.fdb_get(self.pack(&("function", db_id, schema_id, function_id)))
+            .await?
+            .map(|bytes| Self::deserialize(&bytes))
+            .transpose()
+    }
+
+    async fn get_function_by_signature(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        name: &str,
+        signature: &FunctionSignature,
+    ) -> Result<Option<FunctionMeta>> {
+        let key = self.pack(&(
+            "function_by_name",
+            db_id,
+            schema_id,
+            normalize_ident(name),
+            signature.key(),
+        ));
+        let Some(bytes) = self.fdb_get(key).await? else {
+            return Ok(None);
+        };
+        let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
+        self.get_function(db_id, schema_id, u64::from_be_bytes(arr))
+            .await
+    }
+
+    async fn list_functions(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+    ) -> Result<Vec<FunctionMeta>> {
+        let (start, end) = self.category_range(&("function", db_id, schema_id));
+        self.fdb_get_range(start, end)
+            .await?
+            .into_iter()
+            .map(|(_, value)| Self::deserialize(&value))
+            .collect()
+    }
+
+    async fn drop_function(&self, function_id: FunctionId) -> Result<()> {
+        let Some(function) = self.get_function_by_id(function_id).await? else {
+            return Ok(());
+        };
+        let object = ObjectRef::new(ObjectType::Function, function_id);
+        let mut clears = vec![
+            self.pack(&("function", function.db_id, function.schema_id, function.id)),
+            self.pack(&(
+                "function_by_name",
+                function.db_id,
+                function.schema_id,
+                normalize_ident(&function.name),
+                function.signature.key(),
+            )),
+            self.pack(&("function_by_id", function_id)),
+        ];
+        clears.extend(self.rbac_clear_keys_for_object(object).await?);
+        self.fdb_write_batch(vec![], clears, true).await.map(|_| ())
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -818,5 +990,173 @@ impl MetadataStore for FdbMetadataStore {
 
     async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()> {
         self.fdb_clear(self.pack(&("dynamic_table", dt_id))).await
+    }
+}
+
+#[cfg(test)]
+mod function_tests {
+    use super::*;
+    use crate::metadata::{MetadataStore, SecurityStore};
+
+    fn sample_function(id: FunctionId) -> FunctionMeta {
+        FunctionMeta {
+            id,
+            db_id: 1,
+            schema_id: 2,
+            name: "add_one".to_string(),
+            signature: FunctionSignature::new(vec!["INT".to_string()]),
+            args: vec![FunctionArg {
+                name: "x".to_string(),
+                data_type: "INT".to_string(),
+                default_expr: None,
+            }],
+            return_type: "INT".to_string(),
+            language: FunctionLanguage::Sql,
+            body: FunctionBody::SqlExpression("x + 1".to_string()),
+            volatility: FunctionVolatility::Immutable,
+            null_handling: FunctionNullHandling::ReturnsNullOnNullInput,
+            created_at: now_micros(),
+            updated_at: now_micros(),
+            owner_role_id: ACCOUNTADMIN_ROLE_ID,
+            comment: None,
+            properties: std::collections::HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn function_metadata_persists_and_indexes_by_signature_when_fdb_configured() -> Result<()>
+    {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_function_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        let function = sample_function(42);
+
+        store.create_function(function.clone()).await?;
+
+        assert_eq!(
+            store
+                .get_function(function.db_id, function.schema_id, function.id)
+                .await?
+                .map(|function| function.name),
+            Some("add_one".to_string())
+        );
+        assert_eq!(
+            store
+                .get_function_by_signature(
+                    function.db_id,
+                    function.schema_id,
+                    "ADD_ONE",
+                    &function.signature,
+                )
+                .await?
+                .map(|function| function.id),
+            Some(function.id)
+        );
+        assert_eq!(
+            store
+                .list_functions(function.db_id, function.schema_id)
+                .await?
+                .len(),
+            1
+        );
+        assert!(store.create_function(function).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_function_preserves_same_signature_indexes_when_fdb_configured() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_function_replace_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        let mut function = sample_function(126);
+
+        store.create_function(function.clone()).await?;
+        function.body = FunctionBody::SqlExpression("x + 2".to_string());
+        function.updated_at = now_micros();
+        store.replace_function(function.clone()).await?;
+
+        let replaced = store
+            .get_function_by_signature(
+                function.db_id,
+                function.schema_id,
+                &function.name,
+                &function.signature,
+            )
+            .await?
+            .expect("replaced function should keep its name/signature index");
+        assert_eq!(replaced.id, function.id);
+        assert_eq!(
+            replaced.body,
+            FunctionBody::SqlExpression("x + 2".to_string())
+        );
+        assert_eq!(
+            store
+                .get_function(function.db_id, function.schema_id, function.id)
+                .await?
+                .map(|function| function.id),
+            Some(function.id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_function_removes_metadata_indexes_owner_and_grants_when_fdb_configured()
+    -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_function_drop_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let function = sample_function(84);
+        let object = ObjectRef::new(ObjectType::Function, function.id);
+
+        store.create_function(function.clone()).await?;
+        store
+            .set_object_owner(ObjectOwnerMeta {
+                object,
+                owner_role_id: ACCOUNTADMIN_ROLE_ID,
+                created_by_user_id: ROOT_USER_ID,
+                created_at: now_micros(),
+                transferred_at: None,
+            })
+            .await?;
+        store
+            .grant_privileges(GrantSetMeta {
+                role_id: PUBLIC_ROLE_ID,
+                object,
+                privileges: PrivilegeSet::from_privileges(&[SecurityPrivilege::Usage]),
+                grant_options: PrivilegeSet::empty(),
+                granted_by_role_id: ACCOUNTADMIN_ROLE_ID,
+                updated_at: now_micros(),
+            })
+            .await?;
+
+        store.drop_function(function.id).await?;
+
+        assert!(
+            store
+                .get_function(function.db_id, function.schema_id, function.id)
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .get_function_by_signature(
+                    function.db_id,
+                    function.schema_id,
+                    &function.name,
+                    &function.signature,
+                )
+                .await?
+                .is_none()
+        );
+        assert!(store.get_object_owner(object).await?.is_none());
+        assert!(store.get_grant(PUBLIC_ROLE_ID, object).await?.is_none());
+        Ok(())
     }
 }
