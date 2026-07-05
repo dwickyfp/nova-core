@@ -33,6 +33,11 @@ impl MpReader {
         }
     }
 
+    /// Return a clone of the object store handle used by this reader.
+    pub fn store_arc(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
     /// Set batch size (default 8192 rows).
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;

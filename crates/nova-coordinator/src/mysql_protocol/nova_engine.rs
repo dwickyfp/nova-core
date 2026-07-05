@@ -37,6 +37,45 @@ fn security_cache_sql(sql: &str, security: &SecurityContext, security_epoch: u64
     )
 }
 
+async fn resolved_statement_uses_stream_state(
+    executor: &Arc<crate::executor::Executor>,
+    stmt: &ResolvedStatement,
+) -> Result<bool> {
+    match stmt {
+        ResolvedStatement::ReadStream { .. } | ResolvedStatement::SystemStreamHasData { .. } => {
+            Ok(true)
+        }
+        ResolvedStatement::Select {
+            db, schema, table, ..
+        } => {
+            let db_meta = executor
+                .meta()
+                .list_databases()
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.name == *db);
+            let Some(db_meta) = db_meta else {
+                return Ok(false);
+            };
+            let schema_meta = executor
+                .meta()
+                .list_schemas(db_meta.id)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.name == *schema);
+            let Some(schema_meta) = schema_meta else {
+                return Ok(false);
+            };
+            Ok(executor
+                .meta()
+                .get_stream_by_name(db_meta.id, schema_meta.id, table)
+                .await?
+                .is_some())
+        }
+        _ => Ok(false),
+    }
+}
+
 #[async_trait]
 impl QueryEngine for NovaEngine {
     async fn execute_sql(
@@ -61,24 +100,10 @@ impl QueryEngine for NovaEngine {
             .unwrap_or(0);
         let cache_sql = security_cache_sql(sql, security, security_epoch);
 
-        // Check result cache for SELECT queries. Key includes security context + epoch.
-        if is_select {
-            let empty_versions = HashMap::new();
-            if let Some((columns, rows)) = self.result_cache.get(&cache_sql, &empty_versions).await
-            {
-                tracing::debug!(sql = %sql, "Result cache HIT");
-                return Ok(QueryResult::Rows { columns, rows });
-            }
-        }
-
-        // Parse all statements
+        // Parse all statements before cache lookup so stream reads and stream status
+        // functions can be excluded from result caching.
         let stmts = self.parser.parse(sql)?;
-
-        // Execute each statement in order. Return result of the last one.
-        let mut last_result = QueryResult::Success {
-            message: format!("{} statement(s) executed", stmts.len()),
-        };
-
+        let mut resolved_stmts = Vec::with_capacity(stmts.len());
         for stmt in &stmts {
             let analyzer = Analyzer::new(current_db.to_string(), "public".to_string());
             let mut resolved = analyzer.resolve(stmt)?;
@@ -87,12 +112,39 @@ impl QueryEngine for NovaEngine {
             if let ResolvedStatement::Select { raw_sql, .. } = &mut resolved {
                 *raw_sql = Some(sql.to_string());
             }
+            resolved_stmts.push(resolved);
+        }
 
+        let mut uses_stream_state = false;
+        for resolved in &resolved_stmts {
+            if resolved_statement_uses_stream_state(self.scheduler.executor(), resolved).await? {
+                uses_stream_state = true;
+                break;
+            }
+        }
+        let can_use_result_cache = is_select && resolved_stmts.len() == 1 && !uses_stream_state;
+
+        // Check result cache for deterministic non-stream SELECT queries. Key includes security context + epoch.
+        if can_use_result_cache {
+            let empty_versions = HashMap::new();
+            if let Some((columns, rows)) = self.result_cache.get(&cache_sql, &empty_versions).await
+            {
+                tracing::debug!(sql = %sql, "Result cache HIT");
+                return Ok(QueryResult::Rows { columns, rows });
+            }
+        }
+
+        // Execute each statement in order. Return result of the last one.
+        let mut last_result = QueryResult::Success {
+            message: format!("{} statement(s) executed", resolved_stmts.len()),
+        };
+
+        for resolved in resolved_stmts {
             let planned = self.planner.plan(resolved)?;
             last_result = self.scheduler.execute(planned, security).await?;
 
-            // Cache SELECT results
-            if let QueryResult::Rows { columns, rows } = &last_result {
+            // Cache deterministic non-stream SELECT results.
+            if can_use_result_cache && let QueryResult::Rows { columns, rows } = &last_result {
                 let empty_versions = HashMap::new();
                 self.result_cache
                     .put(&cache_sql, empty_versions, columns.clone(), rows.clone())

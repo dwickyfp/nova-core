@@ -162,20 +162,46 @@ pub trait MetadataStore: Send + Sync + SecurityStore {
     async fn get_transaction(&self, txn_id: TxnId) -> Result<Option<TransactionMeta>>;
 
     // ══════════════════════════════════════════════════════════════
-    //  STREAM OPERATIONS
+    //  STREAM / CDC OPERATIONS
     // ══════════════════════════════════════════════════════════════
 
-    /// Create a new stream on a table.
     async fn create_stream(&self, stream: StreamMeta) -> Result<()>;
-
-    /// Get stream metadata.
     async fn get_stream(&self, stream_id: StreamId) -> Result<Option<StreamMeta>>;
-
-    /// Get stream offset (last consumed position).
+    async fn get_stream_by_name(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Result<Option<StreamMeta>>;
+    async fn list_streams(&self, db_id: DatabaseId, schema_id: SchemaId)
+    -> Result<Vec<StreamMeta>>;
+    async fn drop_stream(&self, stream_id: StreamId) -> Result<()>;
     async fn get_stream_offset(&self, stream_id: StreamId) -> Result<Option<StreamOffset>>;
-
-    /// Update stream offset after consumption.
     async fn set_stream_offset(&self, stream_id: StreamId, offset: StreamOffset) -> Result<()>;
+    async fn compare_and_set_stream_offset(
+        &self,
+        stream_id: StreamId,
+        expected_sequence: u64,
+        new_offset: StreamOffset,
+    ) -> Result<()>;
+    async fn get_table_change_sequence(&self, table_id: TableId) -> Result<u64>;
+    async fn allocate_table_change_sequences(&self, table_id: TableId, count: u64) -> Result<u64>;
+    /// Atomically commit table metadata changes and publish CDC records.
+    async fn commit_table_cdc(
+        &self,
+        txn_id: TxnId,
+        new_mps: Vec<MicroPartitionMeta>,
+        superseded_mps: Vec<(MpId, MpId)>,
+        records: Vec<ChangeRecordMeta>,
+    ) -> Result<()>;
+    async fn insert_change_records(&self, records: Vec<ChangeRecordMeta>) -> Result<()>;
+    async fn get_change_records(
+        &self,
+        table_id: TableId,
+        after_sequence: u64,
+        through_sequence: u64,
+    ) -> Result<Vec<ChangeRecordMeta>>;
+    async fn stream_has_data(&self, stream_id: StreamId) -> Result<bool>;
 
     // ══════════════════════════════════════════════════════════════
     //  CLONE OPERATIONS

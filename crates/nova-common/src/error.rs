@@ -65,6 +65,37 @@ pub enum NovaError {
     #[error("permission denied: user={user}, action={action}")]
     PermissionDenied { user: String, action: String },
 
+    // ── Streams ──
+    #[error("stream not found: {stream_name}")]
+    StreamNotFound { stream_name: String },
+
+    #[error("stream already exists: {stream_name}")]
+    StreamAlreadyExists { stream_name: String },
+
+    #[error("stream concurrent consume conflict: stream_id={stream_id}")]
+    StreamConcurrentConsume { stream_id: u64 },
+
+    #[error(
+        "stream is stale: stream_id={stream_id}, earliest_sequence={earliest_sequence}, offset_sequence={offset_sequence}"
+    )]
+    StreamStale {
+        stream_id: u64,
+        earliest_sequence: u64,
+        offset_sequence: u64,
+    },
+
+    #[error("stream payload missing: stream_id={stream_id}, payload_path={payload_path}")]
+    StreamPayloadMissing {
+        stream_id: u64,
+        payload_path: String,
+    },
+
+    #[error("unsupported stream syntax: {message}")]
+    UnsupportedStreamSyntax { message: String },
+
+    #[error("ambiguous relation name: {name}")]
+    AmbiguousRelationName { name: String },
+
     // ── Internal ──
     #[error("internal error: {message}")]
     Internal { message: String },

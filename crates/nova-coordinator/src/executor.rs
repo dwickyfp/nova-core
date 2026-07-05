@@ -3,10 +3,12 @@
 use crate::analyzer::{ResolvedExpr, ResolvedFilter, ResolvedStatement};
 use crate::function_runtime::{SqlFunctionRuntime, referenced_function_calls};
 use crate::optimizer::NovaOptimizer;
-use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use nova_common::*;
-use nova_storage::{MetadataStore, MpReader, MpWriter};
+use nova_storage::{CdcPayloadReader, CdcPayloadWriter, MetadataStore, MpReader, MpWriter};
 use std::sync::Arc;
 
 /// SQL execution engine. Wires resolved statements to storage layer.
@@ -14,6 +16,8 @@ pub struct Executor {
     meta: Arc<dyn MetadataStore>,
     writer: MpWriter,
     reader: MpReader,
+    cdc_writer: CdcPayloadWriter,
+    cdc_reader: CdcPayloadReader,
     optimizer: NovaOptimizer,
     current_txn: Arc<std::sync::Mutex<Option<TxnId>>>,
 }
@@ -30,12 +34,44 @@ pub enum QueryResult {
     },
 }
 
+struct CdcMetadataColumns {
+    actions: Vec<String>,
+    is_updates: Vec<bool>,
+    row_ids: Vec<String>,
+    txn_ids: Vec<u64>,
+    commit_ts_values: Vec<u64>,
+    sequences: Vec<u64>,
+}
+
+struct CdcRowBatchSpec<'a> {
+    table: &'a TableMeta,
+    source_batch: &'a RecordBatch,
+    row_ordinals: &'a [u64],
+    start_sequence: u64,
+    txn_id: TxnId,
+    commit_ts: Timestamp,
+    mp_id: MpId,
+    action: ChangeAction,
+    is_update: bool,
+}
+
+struct CdcPayloadMetadata {
+    action_counts: ChangeActionCounts,
+    min_row_id: Option<String>,
+    max_row_id: Option<String>,
+}
+
 impl Executor {
     pub fn new(meta: Arc<dyn MetadataStore>, writer: MpWriter, reader: MpReader) -> Self {
+        let cdc_writer =
+            CdcPayloadWriter::new(writer.store_arc(), writer.bucket_name().to_string());
+        let cdc_reader = CdcPayloadReader::new(reader.store_arc());
         Self {
             meta,
             writer,
             reader,
+            cdc_writer,
+            cdc_reader,
             optimizer: NovaOptimizer::new(),
             current_txn: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -243,6 +279,98 @@ impl Executor {
         .await
     }
 
+    async fn authorize_stream_read(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        stream: &StreamMeta,
+    ) -> Result<TableMeta> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Database, db_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Schema, schema_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Stream, stream.stream_id),
+            SecurityPrivilege::Select,
+        )
+        .await?;
+        let source = self
+            .meta
+            .get_table(stream.db_id, stream.schema_id, stream.source_table_id)
+            .await?
+            .ok_or_else(|| NovaError::TableNotFound {
+                table_name: stream.source_table_id.to_string(),
+            })?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Table, source.id),
+            SecurityPrivilege::Select,
+        )
+        .await?;
+        Ok(source)
+    }
+
+    async fn authorize_stream_ownership(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        stream: &StreamMeta,
+    ) -> Result<()> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Database, db_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Schema, schema_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Stream, stream.stream_id),
+            SecurityPrivilege::Ownership,
+        )
+        .await
+    }
+
+    fn sql_like_matches(value: &str, pattern: &str) -> bool {
+        fn matches_inner(value: &[char], pattern: &[char]) -> bool {
+            match pattern.split_first() {
+                None => value.is_empty(),
+                Some(('%', rest)) => {
+                    matches_inner(value, rest)
+                        || (!value.is_empty() && matches_inner(&value[1..], pattern))
+                }
+                Some(('_', rest)) => !value.is_empty() && matches_inner(&value[1..], rest),
+                Some((expected, rest)) => value
+                    .split_first()
+                    .map(|(actual, tail)| actual == expected && matches_inner(tail, rest))
+                    .unwrap_or(false),
+            }
+        }
+        let value_chars: Vec<char> = value.chars().collect();
+        let pattern_chars: Vec<char> = pattern.chars().collect();
+        matches_inner(&value_chars, &pattern_chars)
+    }
+
     /// Internal/test root execution helper. MySQL production paths must use session SecurityContext.
     pub async fn execute_as_root_for_internal(
         &self,
@@ -422,6 +550,26 @@ impl Executor {
                 at_timestamp,
                 raw_sql,
             } => {
+                let stream_candidate = self.find_stream(&db, &schema, &table).await.ok();
+                let table_candidate = self.find_table(&db, &schema, &table).await.ok();
+                if let Some(stream) = stream_candidate {
+                    if table_candidate.is_some() {
+                        return Err(NovaError::AmbiguousRelationName { name: table });
+                    }
+                    let stream_sql =
+                        raw_sql.unwrap_or_else(|| format!("SELECT * FROM {}", stream.name));
+                    return self
+                        .exec_read_stream(
+                            security,
+                            &db,
+                            &schema,
+                            &stream.name,
+                            StreamReadMode::Commit,
+                            &stream_sql,
+                        )
+                        .await;
+                }
+
                 let dependencies = if dependencies.is_empty() {
                     vec![table.clone()]
                 } else {
@@ -515,6 +663,40 @@ impl Executor {
                 )
                 .await?;
                 self.exec_create_stream(security, &db, &schema, &stream_name, &table, append_only)
+                    .await
+            }
+            ResolvedStatement::ReadStream {
+                db,
+                schema,
+                stream_name,
+                read_mode,
+                raw_sql,
+                ..
+            } => {
+                self.exec_read_stream(security, &db, &schema, &stream_name, read_mode, &raw_sql)
+                    .await
+            }
+            ResolvedStatement::SystemStreamHasData {
+                db,
+                schema,
+                stream_name,
+            } => {
+                self.exec_system_stream_has_data(security, &db, &schema, &stream_name)
+                    .await
+            }
+            ResolvedStatement::DropStream { db, schema, name } => {
+                self.exec_drop_stream(security, &db, &schema, &name).await
+            }
+            ResolvedStatement::ShowStreams {
+                db,
+                schema,
+                pattern,
+            } => {
+                self.exec_show_streams(security, &db, &schema, pattern.as_deref())
+                    .await
+            }
+            ResolvedStatement::DescribeStream { db, schema, name } => {
+                self.exec_describe_stream(security, &db, &schema, &name)
                     .await
             }
             ResolvedStatement::Gc { retention_days } => {
@@ -876,6 +1058,435 @@ impl Executor {
         })
     }
 
+    fn append_cdc_metadata_columns(
+        &self,
+        source: &RecordBatch,
+        metadata: CdcMetadataColumns,
+    ) -> Result<RecordBatch> {
+        let mut fields = source.schema().fields().iter().cloned().collect::<Vec<_>>();
+        fields.push(Arc::new(Field::new(
+            "METADATA$ACTION",
+            DataType::Utf8,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$ISUPDATE",
+            DataType::Boolean,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$ROW_ID",
+            DataType::Utf8,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$TXN_ID",
+            DataType::UInt64,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$COMMIT_TS",
+            DataType::UInt64,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$SEQUENCE",
+            DataType::UInt64,
+            false,
+        )));
+        let mut columns: Vec<ArrayRef> = source.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(metadata.actions)) as ArrayRef);
+        columns.push(Arc::new(BooleanArray::from(metadata.is_updates)) as ArrayRef);
+        columns.push(Arc::new(StringArray::from(metadata.row_ids)) as ArrayRef);
+        columns.push(Arc::new(UInt64Array::from(metadata.txn_ids)) as ArrayRef);
+        columns.push(Arc::new(UInt64Array::from(metadata.commit_ts_values)) as ArrayRef);
+        columns.push(Arc::new(UInt64Array::from(metadata.sequences)) as ArrayRef);
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| {
+            NovaError::ArrowError {
+                source: Box::new(e),
+            }
+        })
+    }
+
+    fn build_insert_cdc_batch(
+        &self,
+        table: &TableMeta,
+        source_batch: &RecordBatch,
+        start_sequence: u64,
+        txn_id: TxnId,
+        commit_ts: Timestamp,
+        mp_id: MpId,
+    ) -> Result<RecordBatch> {
+        let row_count = source_batch.num_rows();
+        let mut row_ids = Vec::with_capacity(row_count);
+        let mut sequences = Vec::with_capacity(row_count);
+        for row_idx in 0..row_count {
+            row_ids.push(stream_row_id(table.id, mp_id, row_idx as u64, 0));
+            sequences.push(start_sequence + row_idx as u64);
+        }
+        self.append_cdc_metadata_columns(
+            source_batch,
+            CdcMetadataColumns {
+                actions: vec![ChangeAction::Insert.to_string(); row_count],
+                is_updates: vec![false; row_count],
+                row_ids,
+                txn_ids: vec![txn_id; row_count],
+                commit_ts_values: vec![commit_ts; row_count],
+                sequences,
+            },
+        )
+    }
+
+    fn select_rows_by_indices(
+        &self,
+        batch: &RecordBatch,
+        indices: &[u32],
+    ) -> Result<Option<RecordBatch>> {
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        let take_arr = arrow::array::UInt32Array::from(indices.to_vec());
+        let mut columns = Vec::with_capacity(batch.num_columns());
+        for col_idx in 0..batch.num_columns() {
+            columns.push(
+                arrow::compute::take(batch.column(col_idx), &take_arr, None).map_err(|e| {
+                    NovaError::ArrowError {
+                        source: Box::new(e),
+                    }
+                })?,
+            );
+        }
+        RecordBatch::try_new(batch.schema(), columns)
+            .map(Some)
+            .map_err(|e| NovaError::ArrowError {
+                source: Box::new(e),
+            })
+    }
+
+    fn build_cdc_batch_for_rows(&self, spec: CdcRowBatchSpec<'_>) -> Result<RecordBatch> {
+        let row_count = spec.source_batch.num_rows();
+        if row_count != spec.row_ordinals.len() {
+            return Err(NovaError::Internal {
+                message: "CDC row ordinal count does not match source batch".to_string(),
+            });
+        }
+        let sequences = (0..row_count)
+            .map(|row_idx| spec.start_sequence + row_idx as u64)
+            .collect::<Vec<_>>();
+        let row_ids = spec
+            .row_ordinals
+            .iter()
+            .map(|row_ordinal| stream_row_id(spec.table.id, spec.mp_id, *row_ordinal, 0))
+            .collect::<Vec<_>>();
+        self.append_cdc_metadata_columns(
+            spec.source_batch,
+            CdcMetadataColumns {
+                actions: vec![spec.action.to_string(); row_count],
+                is_updates: vec![spec.is_update; row_count],
+                row_ids,
+                txn_ids: vec![spec.txn_id; row_count],
+                commit_ts_values: vec![spec.commit_ts; row_count],
+                sequences,
+            },
+        )
+    }
+
+    async fn write_cdc_payload_and_metadata(
+        &self,
+        table_id: TableId,
+        txn_id: TxnId,
+        start_sequence: u64,
+        commit_ts: Timestamp,
+        batch: &RecordBatch,
+        metadata: CdcPayloadMetadata,
+    ) -> Result<ChangeRecordMeta> {
+        let payload = self
+            .cdc_writer
+            .write_payload(table_id, txn_id, start_sequence, batch)
+            .await?;
+        Ok(ChangeRecordMeta {
+            table_id,
+            sequence: start_sequence,
+            txn_id,
+            commit_ts,
+            payload,
+            action_counts: metadata.action_counts,
+            min_row_id: metadata.min_row_id,
+            max_row_id: metadata.max_row_id,
+        })
+    }
+
+    fn stream_schema_for_table(&self, table: &TableMeta) -> Arc<Schema> {
+        let mut fields = table
+            .columns
+            .iter()
+            .map(|column| {
+                Arc::new(Field::new(
+                    &column.name,
+                    nova_type_to_arrow(&column.data_type),
+                    column.nullable,
+                ))
+            })
+            .collect::<Vec<_>>();
+        fields.push(Arc::new(Field::new(
+            "METADATA$ACTION",
+            DataType::Utf8,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$ISUPDATE",
+            DataType::Boolean,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$ROW_ID",
+            DataType::Utf8,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$TXN_ID",
+            DataType::UInt64,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$COMMIT_TS",
+            DataType::UInt64,
+            false,
+        )));
+        fields.push(Arc::new(Field::new(
+            "METADATA$SEQUENCE",
+            DataType::UInt64,
+            false,
+        )));
+        Arc::new(Schema::new(fields))
+    }
+
+    fn empty_stream_batch(&self, table: &TableMeta) -> Result<RecordBatch> {
+        let schema = self.stream_schema_for_table(table);
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| arrow::array::new_empty_array(field.data_type()))
+            .collect::<Vec<_>>();
+        RecordBatch::try_new(schema, columns).map_err(|e| NovaError::ArrowError {
+            source: Box::new(e),
+        })
+    }
+
+    fn remove_stream_preview_clause(sql: &str) -> String {
+        let upper = sql.to_uppercase();
+        let Some(with_pos) = upper.find("WITH") else {
+            return sql.to_string();
+        };
+        let suffix_upper = &upper[with_pos..];
+        if !suffix_upper.contains("COMMIT") {
+            return sql.to_string();
+        }
+        let Some(open_rel) = suffix_upper.find('(') else {
+            return sql.to_string();
+        };
+        let open_pos = with_pos + open_rel;
+        let Some(close_rel) = upper[open_pos..].find(')') else {
+            return sql.to_string();
+        };
+        let after_pos = open_pos + close_rel + 1;
+        let before = sql[..with_pos].trim_end();
+        let after = sql[after_pos..].trim_start();
+        if after.is_empty() {
+            before.to_string()
+        } else {
+            format!("{} {}", before, after)
+        }
+    }
+
+    async fn read_stream_payload_batches(
+        &self,
+        stream: &StreamMeta,
+        records: &[ChangeRecordMeta],
+    ) -> Result<Vec<RecordBatch>> {
+        let mut batches = Vec::new();
+        for record in records {
+            let payload_batches = self
+                .cdc_reader
+                .read_payload(&record.payload)
+                .await
+                .map_err(|err| match err {
+                    NovaError::ObjectStoreError { .. } => NovaError::StreamPayloadMissing {
+                        stream_id: stream.stream_id,
+                        payload_path: record.payload.path.clone(),
+                    },
+                    other => other,
+                })?;
+            let mut rows_to_skip = record.payload.row_start as usize;
+            let mut rows_remaining = record.payload.row_count as usize;
+            for batch in payload_batches {
+                if rows_remaining == 0 {
+                    break;
+                }
+                if rows_to_skip >= batch.num_rows() {
+                    rows_to_skip -= batch.num_rows();
+                    continue;
+                }
+                let offset = rows_to_skip;
+                let length = rows_remaining.min(batch.num_rows() - offset);
+                batches.push(batch.slice(offset, length));
+                rows_remaining -= length;
+                rows_to_skip = 0;
+            }
+            if rows_remaining != 0 {
+                return Err(NovaError::StreamPayloadMissing {
+                    stream_id: stream.stream_id,
+                    payload_path: record.payload.path.clone(),
+                });
+            }
+        }
+        Ok(batches)
+    }
+
+    async fn exec_system_stream_has_data(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        stream_name: &str,
+    ) -> Result<QueryResult> {
+        let stream = self.find_stream(db, schema, stream_name).await?;
+        self.authorize_stream_read(security, db, schema, &stream)
+            .await?;
+        let has_data = self.meta.stream_has_data(stream.stream_id).await?;
+        Ok(QueryResult::Rows {
+            columns: vec!["SYSTEM$STREAM_HAS_DATA".to_string()],
+            rows: vec![vec![has_data.to_string()]],
+        })
+    }
+
+    fn contiguous_published_stream_sequence(
+        committed_sequence: u64,
+        records: &[ChangeRecordMeta],
+    ) -> u64 {
+        let mut next_sequence = committed_sequence + 1;
+        let mut published_through = committed_sequence;
+        for record in records {
+            let row_count = record.payload.row_count;
+            if row_count == 0 {
+                continue;
+            }
+            let record_start = record.sequence;
+            let record_end = record.sequence.saturating_add(row_count).saturating_sub(1);
+            if record_end < next_sequence {
+                continue;
+            }
+            if record_start > next_sequence {
+                break;
+            }
+            published_through = record_end;
+            next_sequence = record_end.saturating_add(1);
+        }
+        published_through
+    }
+
+    async fn exec_read_stream(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        stream_name: &str,
+        read_mode: StreamReadMode,
+        raw_sql: &str,
+    ) -> Result<QueryResult> {
+        let stream = self.find_stream(db, schema, stream_name).await?;
+        let source_table = self
+            .authorize_stream_read(security, db, schema, &stream)
+            .await?;
+        let offset = self
+            .meta
+            .get_stream_offset(stream.stream_id)
+            .await?
+            .ok_or_else(|| NovaError::StreamNotFound {
+                stream_name: stream.name.clone(),
+            })?;
+        let current_sequence = self
+            .meta
+            .get_table_change_sequence(stream.source_table_id)
+            .await?;
+        let records = self
+            .meta
+            .get_change_records(
+                stream.source_table_id,
+                offset.committed_sequence,
+                current_sequence,
+            )
+            .await?;
+        let published_sequence =
+            Self::contiguous_published_stream_sequence(offset.committed_sequence, &records);
+        let consumable_records = records
+            .iter()
+            .filter(|record| {
+                record
+                    .sequence
+                    .saturating_add(record.payload.row_count)
+                    .saturating_sub(1)
+                    <= published_sequence
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut batches = self
+            .read_stream_payload_batches(&stream, &consumable_records)
+            .await?;
+        if batches.is_empty() {
+            batches.push(self.empty_stream_batch(&source_table)?);
+        }
+
+        let mut config = datafusion::prelude::SessionConfig::new().with_target_partitions(1);
+        config.options_mut().optimizer.skip_failed_rules = true;
+        let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+        let table_schema =
+            batches
+                .first()
+                .map(|batch| batch.schema())
+                .ok_or_else(|| NovaError::Internal {
+                    message: "stream read produced no schema".to_string(),
+                })?;
+        let provider = datafusion::datasource::MemTable::try_new(table_schema, vec![batches])
+            .map_err(|e| NovaError::Internal {
+                message: format!("DataFusion stream table registration failed: {}", e),
+            })?;
+        ctx.register_table(&stream.name, Arc::new(provider))
+            .map_err(|e| NovaError::Internal {
+                message: format!("DataFusion register stream failed: {}", e),
+            })?;
+
+        let stream_sql = Self::remove_stream_preview_clause(raw_sql);
+        let df = ctx
+            .sql(&stream_sql)
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("DataFusion stream SQL execution failed: {}", e),
+            })?;
+        let result_batches = df.collect().await.map_err(|e| NovaError::Internal {
+            message: format!("DataFusion stream collect failed: {}", e),
+        })?;
+
+        if read_mode == StreamReadMode::Commit && published_sequence > offset.committed_sequence {
+            self.meta
+                .compare_and_set_stream_offset(
+                    stream.stream_id,
+                    offset.committed_sequence,
+                    StreamOffset {
+                        table_id: stream.source_table_id,
+                        committed_sequence: published_sequence,
+                        committed_ts: now_micros(),
+                        last_consumed_at: Some(now_micros()),
+                        last_consumed_txn_id: consumable_records.last().map(|record| record.txn_id),
+                    },
+                )
+                .await?;
+        }
+
+        let (columns, rows) = batches_to_query_result(&result_batches);
+        Ok(QueryResult::Rows { columns, rows })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn exec_create_function(
         &self,
@@ -1040,27 +1651,72 @@ impl Executor {
         // Convert resolved values to Arrow RecordBatch
         let batch = self.values_to_batch(&table_meta, values)?;
 
-        // Write as micro-partition
+        // Write as micro-partition and as an immutable CDC payload.
         let mp_id = generate_id();
         let version = self.meta.increment_table_version(table_meta.id).await?;
         let txn_id = self.meta.begin_transaction().await?;
+        let commit_ts = now_micros();
 
         let mp = self
             .writer
-            .write(table_meta.id, mp_id, version, &[batch], txn_id)
+            .write(
+                table_meta.id,
+                mp_id,
+                version,
+                std::slice::from_ref(&batch),
+                txn_id,
+            )
             .await?;
 
-        // Insert MP metadata with commit timestamp (skip commit_mp for local storage)
+        let start_sequence = self
+            .meta
+            .allocate_table_change_sequences(table_meta.id, row_count as u64)
+            .await?;
+        let cdc_batch = self.build_insert_cdc_batch(
+            &table_meta,
+            &batch,
+            start_sequence,
+            txn_id,
+            commit_ts,
+            mp_id,
+        )?;
+        let min_row_id = Some(stream_row_id(table_meta.id, mp_id, 0, 0));
+        let max_row_id = Some(stream_row_id(
+            table_meta.id,
+            mp_id,
+            row_count.saturating_sub(1) as u64,
+            0,
+        ));
+        let change_meta = self
+            .write_cdc_payload_and_metadata(
+                table_meta.id,
+                txn_id,
+                start_sequence,
+                commit_ts,
+                &cdc_batch,
+                CdcPayloadMetadata {
+                    action_counts: ChangeActionCounts {
+                        inserts: row_count as u64,
+                        deletes: 0,
+                        update_pairs: 0,
+                    },
+                    min_row_id,
+                    max_row_id,
+                },
+            )
+            .await?;
+
+        // Publish MP metadata, transaction commit status, and CDC metadata atomically.
         let mut committed_mp = mp;
         committed_mp.s3_path = committed_mp
             .s3_temp_path
             .take()
             .unwrap_or(committed_mp.s3_path);
-        committed_mp.commit_ts = now_micros();
+        committed_mp.commit_ts = commit_ts;
         committed_mp.active = true;
-        self.meta.insert_mp(committed_mp).await?;
-
-        self.meta.commit_transaction(txn_id).await?;
+        self.meta
+            .commit_table_cdc(txn_id, vec![committed_mp], vec![], vec![change_meta])
+            .await?;
 
         Ok(QueryResult::Success {
             message: format!(
@@ -1207,31 +1863,122 @@ impl Executor {
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(db, schema, table).await?;
         let mps = self.meta.get_active_mps(table_meta.id).await?;
+        let txn_id = self.meta.begin_transaction().await?;
+        let commit_ts = now_micros();
+        let mut new_mps = Vec::new();
+        let mut superseded_mps = Vec::new();
+        let mut change_records = Vec::new();
 
-        // For each MP: read, apply UPDATE to matching rows, write new MP
         for mp in &mps {
             let batches = self.reader.read(mp, None).await?;
             let mut modified_batches = Vec::new();
+            let mut matched_in_mp = 0usize;
+            let mut base_row_ordinal = 0u64;
+
             for batch in batches {
+                let mask = match &filter {
+                    Some(f) => self.eval_filter_on_batch(&batch, f, &table_meta)?,
+                    None => vec![true; batch.num_rows()],
+                };
+                let matched_indices = mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, matched)| matched.then_some(idx as u32))
+                    .collect::<Vec<_>>();
+                let row_ordinals = matched_indices
+                    .iter()
+                    .map(|idx| base_row_ordinal + *idx as u64)
+                    .collect::<Vec<_>>();
                 let modified =
                     self.apply_update_to_batch(&batch, &assignments, &filter, &table_meta)?;
+
+                if let (Some(old_rows), Some(new_rows)) = (
+                    self.select_rows_by_indices(&batch, &matched_indices)?,
+                    self.select_rows_by_indices(&modified, &matched_indices)?,
+                ) {
+                    let row_count = matched_indices.len() as u64;
+                    let start_sequence = self
+                        .meta
+                        .allocate_table_change_sequences(table_meta.id, row_count * 2)
+                        .await?;
+                    let old_cdc = self.build_cdc_batch_for_rows(CdcRowBatchSpec {
+                        table: &table_meta,
+                        source_batch: &old_rows,
+                        row_ordinals: &row_ordinals,
+                        start_sequence,
+                        txn_id,
+                        commit_ts,
+                        mp_id: mp.mp_id,
+                        action: ChangeAction::Delete,
+                        is_update: true,
+                    })?;
+                    let new_cdc = self.build_cdc_batch_for_rows(CdcRowBatchSpec {
+                        table: &table_meta,
+                        source_batch: &new_rows,
+                        row_ordinals: &row_ordinals,
+                        start_sequence: start_sequence + row_count,
+                        txn_id,
+                        commit_ts,
+                        mp_id: mp.mp_id,
+                        action: ChangeAction::Insert,
+                        is_update: true,
+                    })?;
+                    let cdc_batch =
+                        arrow::compute::concat_batches(&old_cdc.schema(), vec![&old_cdc, &new_cdc])
+                            .map_err(|e| NovaError::ArrowError {
+                                source: Box::new(e),
+                            })?;
+                    let min_row_id = row_ordinals
+                        .first()
+                        .map(|row_ordinal| stream_row_id(table_meta.id, mp.mp_id, *row_ordinal, 0));
+                    let max_row_id = row_ordinals
+                        .last()
+                        .map(|row_ordinal| stream_row_id(table_meta.id, mp.mp_id, *row_ordinal, 0));
+                    let change_meta = self
+                        .write_cdc_payload_and_metadata(
+                            table_meta.id,
+                            txn_id,
+                            start_sequence,
+                            commit_ts,
+                            &cdc_batch,
+                            CdcPayloadMetadata {
+                                action_counts: ChangeActionCounts {
+                                    inserts: row_count,
+                                    deletes: row_count,
+                                    update_pairs: row_count,
+                                },
+                                min_row_id,
+                                max_row_id,
+                            },
+                        )
+                        .await?;
+                    change_records.push(change_meta);
+                    matched_in_mp += matched_indices.len();
+                }
+
+                base_row_ordinal += batch.num_rows() as u64;
                 modified_batches.push(modified);
             }
-            // Write new MP
-            let new_mp = self
-                .writer
-                .write(
-                    table_meta.id,
-                    mp.mp_id + 1000,
-                    mp.version + 1,
-                    &modified_batches,
-                    1,
-                )
-                .await?;
-            // Mark old MP as superseded
-            self.meta.mark_superseded(mp.mp_id, new_mp.mp_id).await?;
+
+            if matched_in_mp > 0 {
+                let new_mp_id = generate_id();
+                let version = self.meta.increment_table_version(table_meta.id).await?;
+                let mut new_mp = self
+                    .writer
+                    .write(table_meta.id, new_mp_id, version, &modified_batches, txn_id)
+                    .await?;
+                new_mp.s3_path = new_mp.s3_temp_path.take().unwrap_or(new_mp.s3_path);
+                new_mp.commit_ts = commit_ts;
+                new_mp.active = true;
+                new_mp.supersedes = Some(mp.mp_id);
+                new_mps.push(new_mp);
+                superseded_mps.push((mp.mp_id, new_mp_id));
+            }
         }
 
+        self.meta
+            .commit_table_cdc(txn_id, new_mps, superseded_mps, change_records)
+            .await?;
         Ok(QueryResult::Rows {
             columns: vec!["status".to_string()],
             rows: vec![vec!["UPDATE OK".to_string()]],
@@ -1248,35 +1995,108 @@ impl Executor {
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(db, schema, table).await?;
         let mps = self.meta.get_active_mps(table_meta.id).await?;
+        let txn_id = self.meta.begin_transaction().await?;
+        let commit_ts = now_micros();
+        let mut new_mps = Vec::new();
+        let mut superseded_mps = Vec::new();
+        let mut change_records = Vec::new();
 
         for mp in &mps {
             let batches = self.reader.read(mp, None).await?;
             let mut kept_batches = Vec::new();
+            let mut deleted_in_mp = 0usize;
+            let mut base_row_ordinal = 0u64;
+
             for batch in batches {
+                let match_mask = match &filter {
+                    Some(f) => self.eval_filter_on_batch(&batch, f, &table_meta)?,
+                    None => vec![true; batch.num_rows()],
+                };
+                let deleted_indices = match_mask
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, matched)| matched.then_some(idx as u32))
+                    .collect::<Vec<_>>();
+                let row_ordinals = deleted_indices
+                    .iter()
+                    .map(|idx| base_row_ordinal + *idx as u64)
+                    .collect::<Vec<_>>();
+
+                if let Some(deleted_rows) = self.select_rows_by_indices(&batch, &deleted_indices)? {
+                    let row_count = deleted_indices.len() as u64;
+                    let start_sequence = self
+                        .meta
+                        .allocate_table_change_sequences(table_meta.id, row_count)
+                        .await?;
+                    let cdc_batch = self.build_cdc_batch_for_rows(CdcRowBatchSpec {
+                        table: &table_meta,
+                        source_batch: &deleted_rows,
+                        row_ordinals: &row_ordinals,
+                        start_sequence,
+                        txn_id,
+                        commit_ts,
+                        mp_id: mp.mp_id,
+                        action: ChangeAction::Delete,
+                        is_update: false,
+                    })?;
+                    let min_row_id = row_ordinals
+                        .first()
+                        .map(|row_ordinal| stream_row_id(table_meta.id, mp.mp_id, *row_ordinal, 0));
+                    let max_row_id = row_ordinals
+                        .last()
+                        .map(|row_ordinal| stream_row_id(table_meta.id, mp.mp_id, *row_ordinal, 0));
+                    let change_meta = self
+                        .write_cdc_payload_and_metadata(
+                            table_meta.id,
+                            txn_id,
+                            start_sequence,
+                            commit_ts,
+                            &cdc_batch,
+                            CdcPayloadMetadata {
+                                action_counts: ChangeActionCounts {
+                                    inserts: 0,
+                                    deletes: row_count,
+                                    update_pairs: 0,
+                                },
+                                min_row_id,
+                                max_row_id,
+                            },
+                        )
+                        .await?;
+                    change_records.push(change_meta);
+                    deleted_in_mp += deleted_indices.len();
+                }
+
                 let kept = self.apply_delete_to_batch(&batch, &filter, &table_meta)?;
                 if kept.num_rows() > 0 {
                     kept_batches.push(kept);
                 }
+                base_row_ordinal += batch.num_rows() as u64;
             }
-            // Write new MP only if there are remaining rows
-            if !kept_batches.is_empty() {
-                let new_mp = self
-                    .writer
-                    .write(
-                        table_meta.id,
-                        mp.mp_id + 1000,
-                        mp.version + 1,
-                        &kept_batches,
-                        1,
-                    )
-                    .await?;
-                self.meta.mark_superseded(mp.mp_id, new_mp.mp_id).await?;
-            } else {
-                // All rows deleted — just mark old MP as superseded (no new MP)
-                self.meta.mark_superseded(mp.mp_id, mp.mp_id + 1000).await?;
+
+            if deleted_in_mp > 0 {
+                if kept_batches.is_empty() {
+                    superseded_mps.push((mp.mp_id, generate_id()));
+                } else {
+                    let new_mp_id = generate_id();
+                    let version = self.meta.increment_table_version(table_meta.id).await?;
+                    let mut new_mp = self
+                        .writer
+                        .write(table_meta.id, new_mp_id, version, &kept_batches, txn_id)
+                        .await?;
+                    new_mp.s3_path = new_mp.s3_temp_path.take().unwrap_or(new_mp.s3_path);
+                    new_mp.commit_ts = commit_ts;
+                    new_mp.active = true;
+                    new_mp.supersedes = Some(mp.mp_id);
+                    new_mps.push(new_mp);
+                    superseded_mps.push((mp.mp_id, new_mp_id));
+                }
             }
         }
 
+        self.meta
+            .commit_table_cdc(txn_id, new_mps, superseded_mps, change_records)
+            .await?;
         Ok(QueryResult::Rows {
             columns: vec!["status".to_string()],
             rows: vec![vec!["DELETE OK".to_string()]],
@@ -1591,7 +2411,9 @@ impl Executor {
     }
 
     /// CREATE STREAM: register a CDC stream on a table.
-    /// Stream tracks changes (INSERT/UPDATE/DELETE) via MP version diffs.
+    ///
+    /// The initial stream offset is the table's current CDC sequence so rows
+    /// that existed before stream creation are not emitted by later reads.
     async fn exec_create_stream(
         &self,
         security: &SecurityContext,
@@ -1599,19 +2421,39 @@ impl Executor {
         schema: &str,
         stream_name: &str,
         table: &str,
-        append_only: bool,
+        _append_only: bool,
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(db, schema, table).await?;
         let stream_id = generate_id();
+        let now = now_micros();
+        let current_sequence = self.meta.get_table_change_sequence(table_meta.id).await?;
 
         let stream = StreamMeta {
             stream_id,
-            table_id: table_meta.id,
+            db_id: table_meta.db_id,
+            schema_id: table_meta.schema_id,
+            source_table_id: table_meta.id,
             name: stream_name.to_string(),
-            append_only,
-            created_at: now_micros(),
+            created_at: now,
+            updated_at: now,
+            owner_role_id: security.primary_role_id,
+            comment: None,
+            stale_after: None,
+            dropped: false,
         };
         self.meta.create_stream(stream).await?;
+        self.meta
+            .set_stream_offset(
+                stream_id,
+                StreamOffset {
+                    table_id: table_meta.id,
+                    committed_sequence: current_sequence,
+                    committed_ts: now,
+                    last_consumed_at: None,
+                    last_consumed_txn_id: None,
+                },
+            )
+            .await?;
         if self
             .meta
             .get_role(security.primary_role_id)
@@ -1631,9 +2473,145 @@ impl Executor {
 
         Ok(QueryResult::Success {
             message: format!(
-                "Stream '{}' created on table '{}' (append_only={}, id={})",
-                stream_name, table, append_only, stream_id
+                "Stream '{}' created on table '{}' (id={})",
+                stream_name, table, stream_id
             ),
+        })
+    }
+
+    async fn exec_drop_stream(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<QueryResult> {
+        let stream = self.find_stream(db, schema, name).await?;
+        self.authorize_stream_ownership(security, db, schema, &stream)
+            .await?;
+        self.meta.drop_stream(stream.stream_id).await?;
+        Ok(QueryResult::Success {
+            message: format!("Stream '{}.{}.{}' dropped", db, schema, name),
+        })
+    }
+
+    async fn exec_show_streams(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        pattern: Option<&str>,
+    ) -> Result<QueryResult> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Database, db_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Schema, schema_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+
+        let streams = self.meta.list_streams(db_meta.id, schema_meta.id).await?;
+        let mut rows = Vec::new();
+        for stream in streams {
+            if let Some(pattern) = pattern
+                && !Self::sql_like_matches(&stream.name, pattern)
+            {
+                continue;
+            }
+            if !self
+                .has_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Stream, stream.stream_id),
+                    SecurityPrivilege::Select,
+                )
+                .await?
+            {
+                continue;
+            }
+            let Some(source) = self
+                .meta
+                .get_table(stream.db_id, stream.schema_id, stream.source_table_id)
+                .await?
+            else {
+                continue;
+            };
+            if !self
+                .has_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Table, source.id),
+                    SecurityPrivilege::Select,
+                )
+                .await?
+            {
+                continue;
+            }
+            rows.push(vec![
+                stream.name,
+                stream.stream_id.to_string(),
+                source.name,
+                stream.source_table_id.to_string(),
+                stream.created_at.to_string(),
+                stream
+                    .stale_after
+                    .map(|ts| ts.to_string())
+                    .unwrap_or_else(|| "".to_string()),
+            ]);
+        }
+        Ok(QueryResult::Rows {
+            columns: vec![
+                "name".to_string(),
+                "stream_id".to_string(),
+                "source_table".to_string(),
+                "source_table_id".to_string(),
+                "created_at".to_string(),
+                "stale_after".to_string(),
+            ],
+            rows,
+        })
+    }
+
+    async fn exec_describe_stream(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<QueryResult> {
+        let stream = self.find_stream(db, schema, name).await?;
+        let source = self
+            .authorize_stream_read(security, db, schema, &stream)
+            .await?;
+        let offset = self.meta.get_stream_offset(stream.stream_id).await?;
+        Ok(QueryResult::Rows {
+            columns: vec![
+                "name".to_string(),
+                "stream_id".to_string(),
+                "source_table".to_string(),
+                "source_table_id".to_string(),
+                "owner_role_id".to_string(),
+                "created_at".to_string(),
+                "updated_at".to_string(),
+                "committed_sequence".to_string(),
+            ],
+            rows: vec![vec![
+                stream.name,
+                stream.stream_id.to_string(),
+                source.name,
+                stream.source_table_id.to_string(),
+                stream.owner_role_id.to_string(),
+                stream.created_at.to_string(),
+                stream.updated_at.to_string(),
+                offset
+                    .map(|offset| offset.committed_sequence.to_string())
+                    .unwrap_or_else(|| "0".to_string()),
+            ]],
         })
     }
 
@@ -2308,6 +3286,17 @@ impl Executor {
             })
     }
 
+    async fn find_stream(&self, db: &str, schema: &str, stream_name: &str) -> Result<StreamMeta> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        self.meta
+            .get_stream_by_name(db_meta.id, schema_meta.id, stream_name)
+            .await?
+            .ok_or_else(|| NovaError::StreamNotFound {
+                stream_name: stream_name.to_string(),
+            })
+    }
+
     async fn find_dynamic_table(
         &self,
         db: &str,
@@ -2613,6 +3602,12 @@ fn array_value_to_string(arr: &dyn arrow::array::Array, row: usize) -> String {
         return a.value(row).to_string();
     }
     if let Some(a) = arr.as_any().downcast_ref::<Float32Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<UInt64Array>() {
+        return a.value(row).to_string();
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
         return a.value(row).to_string();
     }
     "?".to_string()
@@ -3063,7 +4058,7 @@ mod tests {
                 schema: "public".to_string(),
                 stream_name: "events_stream".to_string(),
                 table: "events".to_string(),
-                append_only: true,
+                append_only: false,
             })
             .await
             .unwrap();
@@ -3071,7 +4066,8 @@ mod tests {
         match result {
             QueryResult::Success { message } => {
                 assert!(message.contains("events_stream"));
-                assert!(message.contains("append_only=true"));
+                assert!(message.contains("events"));
+                assert!(!message.contains("append_only"));
             }
             _ => panic!("expected Success"),
         }

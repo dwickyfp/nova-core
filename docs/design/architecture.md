@@ -462,10 +462,18 @@ FoundationDB Keyspace Layout:
 └── next_id                                    → u64 (auto-increment)
 
 /stream/
-├── {stream_id}/meta                           → StreamMeta {table_id, type, created_at}
-├── {stream_id}/offset                         → StreamOffset {last_consumed_ts, last_consumed_mp}
-└── {stream_id}/changes/
-    └── {change_id}                            → ChangeRecord {op, row_data, txn_id}
+├── {stream_id}/meta                           → StreamMeta {source_table_id, owner_role_id, stale_after, ...}
+├── {stream_id}/offset                         → StreamOffset {committed_sequence, committed_ts, ...}
+└── by_name/{db_id}/{schema_id}/{name}          → stream_id
+
+/table_change_sequence/
+└── {table_id}                                  → u64 (monotonic CDC sequence)
+
+/table_change_log/
+└── {table_id}/{sequence}                       → ChangeRecordMeta {txn_id, payload, action_counts, ...}
+
+Object storage CDC payloads:
+└── {bucket}/cdc/tables/{table_id}/txn-{txn_id}/seq-{start}-{end}.parquet
 
 /user/
 ├── {user_id}                                  → User {name, password_hash, roles[], ...}
@@ -1380,62 +1388,41 @@ fn clone_table(source_table_id: u64, at_ts: Option<Timestamp>) -> u64 {
 ### 12.3 Streams (CDC)
 
 ```sql
--- Create stream on table
+-- Create stream on table; pre-existing rows are not emitted
 CREATE STREAM orders_stream ON TABLE orders;
 
--- Consume changes (advances offset)
-INSERT INTO orders_archive
+-- Preview changes without advancing the stream offset
+SELECT * FROM orders_stream WITH (COMMIT = FALSE);
+
+-- Default SELECT consumes changes and commits the full backlog after success
 SELECT * FROM orders_stream WHERE METADATA$ACTION = 'INSERT';
 
--- Stream types
-CREATE STREAM orders_append ON TABLE orders APPEND_ONLY = TRUE;
+-- Snowflake-compatible has-data probe
+SELECT SYSTEM$STREAM_HAS_DATA('orders_stream');
 ```
 
 **Implementation:**
-- Stream stores offset (last consumed timestamp) in FDB
-- When queried: find MPs created AFTER offset
-- For each new MP:
-  - If no previous version (supersedes=None) → INSERT records
-  - If supersedes previous MP → diff old vs new → INSERT/UPDATE/DELETE records
-- Offset advances after successful consumption
+- Each DML transaction writes row-level CDC payloads as immutable Parquet files in object storage and compact `ChangeRecordMeta` entries in FoundationDB.
+- Stream offsets are monotonic table change sequences, not timestamps. `CREATE STREAM` initializes the offset to the table's current sequence.
+- A consuming `SELECT` reads change records after the committed offset through a stable current sequence, executes projection/filter/LIMIT through DataFusion, then advances the offset with compare-and-set. This commits the full backlog even if the query returns only a subset.
+- Preview reads (`WITH (COMMIT = FALSE)`) use the same CDC payloads but never update the stream offset.
+- UPDATE is represented as a Snowflake-style pair: old row as `METADATA$ACTION = 'DELETE'`, new row as `METADATA$ACTION = 'INSERT'`, both with `METADATA$ISUPDATE = true`.
+- DELETE rows use `METADATA$ACTION = 'DELETE'` and `METADATA$ISUPDATE = false`.
+- Stream reads and `SYSTEM$STREAM_HAS_DATA` require `SELECT` on both the stream object and its source table.
 
 ```rust
-fn read_stream(stream_id: u64) -> Vec<ChangeRecord> {
-    let offset = get_stream_offset(stream_id);  // last_consumed_ts
-    let table_id = get_stream_table_id(stream_id);
+async fn read_stream(stream_id: StreamId, mode: StreamReadMode) -> Result<Vec<RecordBatch>> {
+    let stream = get_stream(stream_id).await?;
+    let offset = get_stream_offset(stream_id).await?;
+    let through = get_table_change_sequence(stream.source_table_id).await?;
+    let records = get_change_records(stream.source_table_id, offset.committed_sequence, through).await?;
+    let batches = read_cdc_payloads(records).await?;
 
-    // Get MPs created AFTER offset
-    let new_mps = get_mps_committed_after(table_id, offset.last_consumed_ts);
-
-    let mut changes = Vec::new();
-
-    for new_mp in new_mps {
-        match new_mp.supersedes {
-            None => {
-                // New MP (pure INSERT)
-                let data = read_parquet(&new_mp.s3_path);
-                for row in data {
-                    changes.push(ChangeRecord::Insert(row));
-                }
-            }
-            Some(old_mp_id) => {
-                // Updated/Deleted MP → diff
-                let old_mp = get_mp(old_mp_id);
-                let old_data = read_parquet(&old_mp.s3_path);
-                let new_data = read_parquet(&new_mp.s3_path);
-
-                // Diff by primary key
-                let diff = diff_by_pk(old_data, new_data, &pk_columns);
-                changes.extend(diff);
-                // diff produces: Insert(new rows), Update(changed rows), Delete(removed rows)
-            }
-        }
+    if mode == StreamReadMode::Commit && through > offset.committed_sequence {
+        compare_and_set_stream_offset(stream_id, offset.committed_sequence, through).await?;
     }
 
-    // Advance offset
-    set_stream_offset(stream_id, now());
-
-    changes
+    Ok(batches)
 }
 ```
 

@@ -32,6 +32,16 @@ impl MpWriter {
         }
     }
 
+    /// Return a clone of the object store handle used by this writer.
+    pub fn store_arc(&self) -> Arc<dyn ObjectStore> {
+        self.store.clone()
+    }
+
+    /// Return the configured object storage bucket/prefix name.
+    pub fn bucket_name(&self) -> &str {
+        &self.bucket
+    }
+
     /// Set target MP size (default 50MB).
     pub fn with_target_size(mut self, size: usize) -> Self {
         self.target_size_bytes = size;

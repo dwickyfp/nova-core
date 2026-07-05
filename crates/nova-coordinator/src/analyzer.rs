@@ -2,7 +2,7 @@
 
 use nova_common::{
     FunctionArg, FunctionBody, FunctionLanguage, FunctionNullHandling, FunctionSignature,
-    FunctionVolatility, NovaError, Result, Timestamp,
+    FunctionVolatility, NovaError, Result, StreamReadMode, Timestamp,
 };
 use sqlparser::ast::Statement;
 
@@ -81,6 +81,34 @@ pub enum ResolvedStatement {
         stream_name: String,
         table: String,
         append_only: bool,
+    },
+    ReadStream {
+        db: String,
+        schema: String,
+        stream_name: String,
+        projection: Vec<String>,
+        read_mode: StreamReadMode,
+        raw_sql: String,
+    },
+    DropStream {
+        db: String,
+        schema: String,
+        name: String,
+    },
+    ShowStreams {
+        db: String,
+        schema: String,
+        pattern: Option<String>,
+    },
+    DescribeStream {
+        db: String,
+        schema: String,
+        name: String,
+    },
+    SystemStreamHasData {
+        db: String,
+        schema: String,
+        stream_name: String,
     },
     /// Garbage collect expired micro-partitions.
     Gc {
@@ -199,6 +227,26 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
+    fn decode_hex_payload(value: &str) -> Result<String> {
+        if !value.len().is_multiple_of(2) {
+            return Err(NovaError::SqlAnalysisError {
+                message: "invalid encoded stream payload".to_string(),
+            });
+        }
+        let mut bytes = Vec::with_capacity(value.len() / 2);
+        for idx in (0..value.len()).step_by(2) {
+            let byte = u8::from_str_radix(&value[idx..idx + 2], 16).map_err(|_| {
+                NovaError::SqlAnalysisError {
+                    message: "invalid encoded stream payload".to_string(),
+                }
+            })?;
+            bytes.push(byte);
+        }
+        String::from_utf8(bytes).map_err(|_| NovaError::SqlAnalysisError {
+            message: "invalid UTF-8 stream payload".to_string(),
+        })
+    }
+
     fn resolve_object_name(
         &self,
         name: &sqlparser::ast::ObjectName,
@@ -730,6 +778,94 @@ impl Analyzer {
                         .unwrap_or(30);
                     return Ok(ResolvedStatement::Gc {
                         retention_days: retention,
+                    });
+                }
+                // Detect DROP STREAM: DROP TABLE __drop_stream__<stream>
+                if table_name.starts_with("__drop_stream__") {
+                    let name = table_name
+                        .strip_prefix("__drop_stream__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::DropStream {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        name,
+                    });
+                }
+                // Detect SHOW STREAMS: DROP TABLE __show_streams_hex__<hex-pattern>
+                if table_name.starts_with("__show_streams_hex__") {
+                    let pattern_str = table_name
+                        .strip_prefix("__show_streams_hex__")
+                        .unwrap_or("");
+                    let pattern = if pattern_str.is_empty() {
+                        None
+                    } else {
+                        Some(Self::decode_hex_payload(pattern_str)?)
+                    };
+                    return Ok(ResolvedStatement::ShowStreams {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        pattern,
+                    });
+                }
+                // Detect DESCRIBE STREAM: DROP TABLE __describe_stream__<stream>
+                if table_name.starts_with("__describe_stream__") {
+                    let name = table_name
+                        .strip_prefix("__describe_stream__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::DescribeStream {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        name,
+                    });
+                }
+                // Detect stream preview SELECT: DROP TABLE __stream_read_preview_hex__<stream-hex>__<sql-hex>
+                if table_name.starts_with("__stream_read_preview_hex__") {
+                    let payload = table_name
+                        .strip_prefix("__stream_read_preview_hex__")
+                        .unwrap_or("");
+                    let (stream_hex, sql_hex) = payload.split_once("__").ok_or_else(|| {
+                        NovaError::UnsupportedStreamSyntax {
+                            message: "invalid stream preview marker".to_string(),
+                        }
+                    })?;
+                    let stream_name = Self::decode_hex_payload(stream_hex)?;
+                    let raw_sql = Self::decode_hex_payload(sql_hex)?;
+                    return Ok(ResolvedStatement::ReadStream {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        stream_name,
+                        projection: vec!["*".to_string()],
+                        read_mode: StreamReadMode::Preview,
+                        raw_sql,
+                    });
+                }
+                // Detect legacy stream preview SELECT: DROP TABLE __stream_read_preview__<stream>
+                if table_name.starts_with("__stream_read_preview__") {
+                    let stream_name = table_name
+                        .strip_prefix("__stream_read_preview__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::ReadStream {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        stream_name: stream_name.clone(),
+                        projection: vec!["*".to_string()],
+                        read_mode: StreamReadMode::Preview,
+                        raw_sql: format!("SELECT * FROM {}", stream_name),
+                    });
+                }
+                // Detect SYSTEM$STREAM_HAS_DATA: DROP TABLE __stream_has_data__<stream>
+                if table_name.starts_with("__stream_has_data__") {
+                    let stream_name = table_name
+                        .strip_prefix("__stream_has_data__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::SystemStreamHasData {
+                        db: self.default_db.clone(),
+                        schema: self.default_schema.clone(),
+                        stream_name,
                     });
                 }
                 // Detect BACKUP: DROP TABLE __backup__[<path>]
