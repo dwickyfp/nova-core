@@ -294,7 +294,11 @@ impl RaftLogReader<NovaTypeConfig> for FdbLogStore {
             })
             .await
             .map_err(Self::read_err)?;
-        vals.iter().map(|v| Self::de(v)).collect()
+        let mut entries = Vec::with_capacity(vals.len());
+        for value in vals {
+            entries.push(Self::de(&value)?);
+        }
+        Ok(entries)
     }
 }
 
@@ -304,11 +308,10 @@ impl RaftLogStorage<NovaTypeConfig> for FdbLogStore {
     async fn get_log_state(&mut self) -> Result<LogState<NovaTypeConfig>, StorageError<u64>> {
         let entries = self.try_get_log_entries(..).await?;
         let last = entries.last().map(|e| e.log_id);
-        let purged = self
-            .get(b"nova/raft/purged".to_vec())
-            .await?
-            .map(|v| Self::de(&v))
-            .transpose()?;
+        let purged = match self.get(b"nova/raft/purged".to_vec()).await? {
+            Some(value) => Some(Self::de(&value)?),
+            None => None,
+        };
         Ok(LogState {
             last_purged_log_id: purged,
             last_log_id: last,
@@ -324,10 +327,10 @@ impl RaftLogStorage<NovaTypeConfig> for FdbLogStore {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        self.get(b"nova/raft/committed".to_vec())
-            .await?
-            .map(|v| Self::de(&v))
-            .transpose()
+        match self.get(b"nova/raft/committed".to_vec()).await? {
+            Some(value) => Ok(Some(Self::de(&value)?)),
+            None => Ok(None),
+        }
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
@@ -335,10 +338,10 @@ impl RaftLogStorage<NovaTypeConfig> for FdbLogStore {
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        self.get(b"nova/raft/vote".to_vec())
-            .await?
-            .map(|v| Self::de(&v))
-            .transpose()
+        match self.get(b"nova/raft/vote".to_vec()).await? {
+            Some(value) => Ok(Some(Self::de(&value)?)),
+            None => Ok(None),
+        }
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
