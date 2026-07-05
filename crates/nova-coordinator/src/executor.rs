@@ -1,6 +1,7 @@
 // Executor — wire resolved SQL statements to storage layer.
 
 use crate::analyzer::{ResolvedExpr, ResolvedFilter, ResolvedStatement};
+use crate::function_runtime::{SqlFunctionRuntime, referenced_function_calls};
 use crate::optimizer::NovaOptimizer;
 use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -292,6 +293,115 @@ impl Executor {
                 self.exec_create_table(security, db, schema, table, columns)
                     .await
             }
+            ResolvedStatement::CreateFunction {
+                db,
+                schema,
+                name,
+                args,
+                signature,
+                return_type,
+                language,
+                body,
+                volatility,
+                null_handling,
+                or_replace,
+                if_not_exists,
+            } => {
+                let db_meta = self.find_database(&db).await?;
+                let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Database, db_meta.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::CreateFunction,
+                )
+                .await?;
+                if let Some(existing) = self
+                    .meta
+                    .get_function_by_signature(db_meta.id, schema_meta.id, &name, &signature)
+                    .await?
+                    && or_replace
+                {
+                    self.require_privilege(
+                        security,
+                        ObjectRef::new(ObjectType::Function, existing.id),
+                        SecurityPrivilege::Ownership,
+                    )
+                    .await?;
+                }
+                self.exec_create_function(
+                    security,
+                    db,
+                    schema,
+                    db_meta.id,
+                    schema_meta.id,
+                    name,
+                    args,
+                    signature,
+                    return_type,
+                    language,
+                    body,
+                    volatility,
+                    null_handling,
+                    or_replace,
+                    if_not_exists,
+                )
+                .await
+            }
+            ResolvedStatement::DropFunction {
+                db,
+                schema,
+                name,
+                signature,
+                if_exists,
+            } => {
+                let db_meta = self.find_database(&db).await?;
+                let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Database, db_meta.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?;
+                if let Some(function) = self
+                    .meta
+                    .get_function_by_signature(db_meta.id, schema_meta.id, &name, &signature)
+                    .await?
+                {
+                    self.require_privilege(
+                        security,
+                        ObjectRef::new(ObjectType::Function, function.id),
+                        SecurityPrivilege::Ownership,
+                    )
+                    .await?;
+                } else if !if_exists {
+                    return Err(NovaError::Internal {
+                        message: format!(
+                            "function '{}' not found",
+                            format_function_name(&db, &schema, &name, &signature)
+                        ),
+                    });
+                }
+                self.exec_drop_function(db, schema, name, signature, if_exists)
+                    .await
+            }
             ResolvedStatement::Insert {
                 db,
                 schema,
@@ -327,8 +437,17 @@ impl Executor {
                     )
                     .await?;
                 }
-                self.exec_select(db, schema, table, projection, filter, at_timestamp, raw_sql)
-                    .await
+                self.exec_select(
+                    security,
+                    db,
+                    schema,
+                    table,
+                    projection,
+                    filter,
+                    at_timestamp,
+                    raw_sql,
+                )
+                .await
             }
             ResolvedStatement::Update {
                 db,
@@ -757,6 +876,156 @@ impl Executor {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn exec_create_function(
+        &self,
+        security: &SecurityContext,
+        db: String,
+        schema: String,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        name: String,
+        args: Vec<FunctionArg>,
+        signature: FunctionSignature,
+        return_type: String,
+        language: FunctionLanguage,
+        body: FunctionBody,
+        volatility: FunctionVolatility,
+        null_handling: FunctionNullHandling,
+        or_replace: bool,
+        if_not_exists: bool,
+    ) -> Result<QueryResult> {
+        if language != FunctionLanguage::Sql {
+            return Err(NovaError::SqlAnalysisError {
+                message: format!(
+                    "function language {} is not supported yet; only SQL is supported",
+                    language
+                ),
+            });
+        }
+        if !matches!(body, FunctionBody::SqlExpression(_)) {
+            return Err(NovaError::SqlAnalysisError {
+                message: "CREATE FUNCTION LANGUAGE SQL requires a SQL expression body".to_string(),
+            });
+        }
+
+        let existing = self
+            .meta
+            .get_function_by_signature(db_id, schema_id, &name, &signature)
+            .await?;
+        let now = now_micros();
+        let message_name = format_function_name(&db, &schema, &name, &signature);
+
+        if let Some(existing) = existing {
+            if if_not_exists && !or_replace {
+                return Ok(QueryResult::Success {
+                    message: format!("Function '{}' already exists", message_name),
+                });
+            }
+            if !or_replace {
+                return Err(NovaError::Internal {
+                    message: format!("function '{}' already exists", message_name),
+                });
+            }
+
+            let replacement = FunctionMeta {
+                id: existing.id,
+                db_id,
+                schema_id,
+                name,
+                signature,
+                args,
+                return_type,
+                language,
+                body,
+                volatility,
+                null_handling,
+                created_at: existing.created_at,
+                updated_at: now,
+                owner_role_id: existing.owner_role_id,
+                comment: existing.comment,
+                properties: existing.properties,
+            };
+            self.meta.replace_function(replacement).await?;
+            return Ok(QueryResult::Success {
+                message: format!("Function '{}' replaced", message_name),
+            });
+        }
+
+        let function_id = generate_id();
+        let function = FunctionMeta {
+            id: function_id,
+            db_id,
+            schema_id,
+            name,
+            signature,
+            args,
+            return_type,
+            language,
+            body,
+            volatility,
+            null_handling,
+            created_at: now,
+            updated_at: now,
+            owner_role_id: security.primary_role_id,
+            comment: None,
+            properties: Default::default(),
+        };
+        self.meta.create_function(function).await?;
+        if self
+            .meta
+            .get_role(security.primary_role_id)
+            .await?
+            .is_some()
+        {
+            self.meta
+                .set_object_owner(ObjectOwnerMeta {
+                    object: ObjectRef::new(ObjectType::Function, function_id),
+                    owner_role_id: security.primary_role_id,
+                    created_by_user_id: security.user_id,
+                    created_at: now,
+                    transferred_at: None,
+                })
+                .await?;
+        }
+
+        Ok(QueryResult::Success {
+            message: format!("Function '{}' created", message_name),
+        })
+    }
+
+    async fn exec_drop_function(
+        &self,
+        db: String,
+        schema: String,
+        name: String,
+        signature: FunctionSignature,
+        if_exists: bool,
+    ) -> Result<QueryResult> {
+        let db_meta = self.find_database(&db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
+        let message_name = format_function_name(&db, &schema, &name, &signature);
+        let Some(function) = self
+            .meta
+            .get_function_by_signature(db_meta.id, schema_meta.id, &name, &signature)
+            .await?
+        else {
+            if if_exists {
+                return Ok(QueryResult::Success {
+                    message: format!("Function '{}' does not exist, skipping", message_name),
+                });
+            }
+            return Err(NovaError::Internal {
+                message: format!("function '{}' not found", message_name),
+            });
+        };
+
+        self.meta.drop_function(function.id).await?;
+        Ok(QueryResult::Success {
+            message: format!("Function '{}' dropped", message_name),
+        })
+    }
+
     async fn exec_insert(
         &self,
         db: String,
@@ -804,6 +1073,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     async fn exec_select(
         &self,
+        security: &SecurityContext,
         db: String,
         schema: String,
         table: String,
@@ -836,7 +1106,7 @@ impl Executor {
         // Route through DataFusion if raw SQL is available (enables AGG, GROUP BY, ORDER BY, LIMIT, JOIN)
         if let Some(sql_text) = raw_sql {
             return self
-                .exec_select_datafusion(&table_meta, &mps, &sql_text)
+                .exec_select_datafusion(security, &table_meta, &mps, &sql_text)
                 .await;
         }
 
@@ -1900,6 +2170,7 @@ impl Executor {
     /// Execute SELECT via DataFusion SessionContext (enables AGG, GROUP BY, ORDER BY, LIMIT, JOIN).
     async fn exec_select_datafusion(
         &self,
+        security: &SecurityContext,
         table_meta: &TableMeta,
         _mps: &[MicroPartitionMeta],
         sql: &str,
@@ -1949,6 +2220,9 @@ impl Executor {
             }
         }
 
+        self.register_sql_functions_for_query(security, &ctx, table_meta, sql)
+            .await?;
+
         let df = ctx.sql(sql).await.map_err(|e| NovaError::Internal {
             message: format!("DataFusion SQL execution failed: {}", e),
         })?;
@@ -1959,6 +2233,54 @@ impl Executor {
 
         let (columns, rows) = batches_to_query_result(&batches);
         Ok(QueryResult::Rows { columns, rows })
+    }
+
+    async fn register_sql_functions_for_query(
+        &self,
+        security: &SecurityContext,
+        ctx: &datafusion::prelude::SessionContext,
+        table_meta: &TableMeta,
+        sql: &str,
+    ) -> Result<()> {
+        let calls = referenced_function_calls(sql)?;
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let functions = self
+            .meta
+            .list_functions(table_meta.db_id, table_meta.schema_id)
+            .await?;
+        for call in calls {
+            let matches = functions
+                .iter()
+                .filter(|function| {
+                    function.name.eq_ignore_ascii_case(&call.name)
+                        && function.args.len() == call.arg_count
+                })
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [] => {}
+                [function] => {
+                    self.require_privilege(
+                        security,
+                        ObjectRef::new(ObjectType::Function, function.id),
+                        SecurityPrivilege::Usage,
+                    )
+                    .await?;
+                    let udf = SqlFunctionRuntime::create_udf(function)?;
+                    ctx.register_udf(udf);
+                }
+                _ => {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: format!(
+                            "ambiguous function call '{}({} args)'",
+                            call.name, call.arg_count
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn find_table(&self, db: &str, schema: &str, table: &str) -> Result<TableMeta> {
@@ -2082,6 +2404,15 @@ impl Executor {
 } // impl Executor
 
 /// Parse SQL type string to NovaType.
+fn format_function_name(
+    db: &str,
+    schema: &str,
+    name: &str,
+    signature: &FunctionSignature,
+) -> String {
+    format!("{}.{}.{}({})", db, schema, name, signature.key())
+}
+
 fn parse_sql_type(s: &str) -> NovaType {
     let upper = s.to_uppercase();
     if upper.starts_with("INT") || upper == "INTEGER" || upper.starts_with("BIGINT") {
@@ -2303,7 +2634,12 @@ mod tests {
         let meta: Arc<dyn MetadataStore> = Arc::new(
             nova_storage::FdbMetadataStore::open_test(
                 "docker:docker@127.0.0.1:4500",
-                format!("test_{}", nova_common::now_micros()).into_bytes(),
+                format!(
+                    "test_{}_{}",
+                    nova_common::now_micros(),
+                    nova_common::generate_id()
+                )
+                .into_bytes(),
             )
             .unwrap(),
         );

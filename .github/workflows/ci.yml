@@ -32,6 +32,25 @@ jobs:
       - name: Install protobuf compiler
         run: sudo apt-get install -y protobuf-compiler
 
+      - name: Install FoundationDB
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p /tmp/foundationdb
+          gh release download 7.4.6 \
+            --repo apple/foundationdb \
+            --pattern 'foundationdb-clients_7.4.6-1_amd64.deb' \
+            --pattern 'foundationdb-server_7.4.6-1_amd64.deb' \
+            --dir /tmp/foundationdb
+          sudo dpkg -i /tmp/foundationdb/foundationdb-clients_7.4.6-1_amd64.deb \
+            /tmp/foundationdb/foundationdb-server_7.4.6-1_amd64.deb
+          echo 'docker:docker@127.0.0.1:4500' | sudo tee /etc/foundationdb/fdb.cluster
+          sudo service foundationdb restart
+          fdbcli --exec 'configure new single memory' || true
+          echo 'FDB_CLIENT_LIB_PATH=/usr/lib' >> "$GITHUB_ENV"
+          echo 'LD_LIBRARY_PATH=/usr/lib' >> "$GITHUB_ENV"
+          echo 'NOVA_FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster' >> "$GITHUB_ENV"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
