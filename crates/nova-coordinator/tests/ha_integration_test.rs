@@ -12,7 +12,13 @@ mod tests {
     use std::time::Duration;
 
     fn make_store() -> Arc<FdbMetadataStore> {
-        Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap())
+        Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        )
     }
 
     #[tokio::test]

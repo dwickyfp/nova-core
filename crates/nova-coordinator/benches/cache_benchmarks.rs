@@ -91,7 +91,7 @@ fn bench_cache_key_generation(c: &mut Criterion) {
     group.sample_size(100);
     group.measurement_time(Duration::from_secs(5));
 
-    let queries = vec![
+    let queries = [
         "SELECT * FROM orders WHERE id = 1",
         "SELECT id, name, total FROM orders o JOIN customers c ON o.customer_id = c.id WHERE c.region = 'APAC' GROUP BY c.country",
         "SELECT COUNT(*), AVG(total) FROM orders WHERE created_at > '2024-01-01' AND status = 'completed' HAVING COUNT(*) > 10 ORDER BY AVG(total) DESC LIMIT 100",

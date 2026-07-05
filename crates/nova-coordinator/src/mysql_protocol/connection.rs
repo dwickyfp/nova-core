@@ -7,6 +7,7 @@
 // - Transaction state
 // - Prepared statements
 
+use nova_common::SecurityContext;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -96,6 +97,9 @@ pub struct Session {
     /// Prepared statements
     pub prepared_statements: HashMap<u32, PreparedStatement>,
 
+    /// Per-session security context carried by every query.
+    pub security: SecurityContext,
+
     /// Next prepared statement ID
     next_stmt_id: u32,
 
@@ -164,6 +168,7 @@ impl Session {
             affected_rows: 0,
             last_insert_id: 0,
             prepared_statements: HashMap::new(),
+            security: SecurityContext::root(),
             next_stmt_id: 1,
             closed: false,
         }

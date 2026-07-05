@@ -156,6 +156,7 @@ mod tests {
             db: "test".to_string(),
             schema: "public".to_string(),
             table: "t".to_string(),
+            dependencies: vec!["t".to_string()],
             projection: vec!["*".to_string()],
             filter: None,
             at_timestamp: None,
@@ -178,6 +179,7 @@ mod tests {
             db: "test".to_string(),
             schema: "public".to_string(),
             table: "t".to_string(),
+            dependencies: vec!["t".to_string()],
             projection: vec!["*".to_string()],
             filter: Some(ResolvedFilter {
                 column: "id".to_string(),

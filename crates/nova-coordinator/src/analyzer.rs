@@ -25,6 +25,7 @@ pub enum ResolvedStatement {
         db: String,
         schema: String,
         table: String,
+        dependencies: Vec<String>,
         projection: Vec<String>,
         filter: Option<ResolvedFilter>,
         at_timestamp: Option<Timestamp>,
@@ -174,6 +175,46 @@ pub struct Analyzer {
 }
 
 impl Analyzer {
+    fn select_tables(select: &sqlparser::ast::Select) -> Result<Vec<String>> {
+        let mut tables = Vec::new();
+        for twj in &select.from {
+            Self::collect_table_factor(&twj.relation, &mut tables)?;
+            for join in &twj.joins {
+                Self::collect_table_factor(&join.relation, &mut tables)?;
+            }
+        }
+        tables.sort();
+        tables.dedup();
+        Ok(tables)
+    }
+
+    fn collect_table_factor(
+        factor: &sqlparser::ast::TableFactor,
+        tables: &mut Vec<String>,
+    ) -> Result<()> {
+        match factor {
+            sqlparser::ast::TableFactor::Table { name, .. } => {
+                if let Some(ident) = name.0.last() {
+                    tables.push(ident.value.clone());
+                }
+                Ok(())
+            }
+            sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+                if let sqlparser::ast::SetExpr::Select(select) = subquery.body.as_ref() {
+                    tables.extend(Self::select_tables(select)?);
+                    Ok(())
+                } else {
+                    Err(NovaError::SqlAnalysisError {
+                        message: "unsupported subquery dependency".to_string(),
+                    })
+                }
+            }
+            _ => Err(NovaError::SqlAnalysisError {
+                message: "unsupported FROM clause".to_string(),
+            }),
+        }
+    }
+
     pub fn new(default_db: String, default_schema: String) -> Self {
         Self {
             default_db,
@@ -347,6 +388,7 @@ impl Analyzer {
                         .ok_or_else(|| NovaError::SqlAnalysisError {
                             message: "SELECT must have a FROM clause".to_string(),
                         })?;
+                    let dependencies = Self::select_tables(select)?;
                     let table_name = match &from.relation {
                         sqlparser::ast::TableFactor::Table { name, .. } => {
                             name.0.last().map(|i| i.value.clone()).unwrap_or_default()
@@ -376,6 +418,7 @@ impl Analyzer {
                         db: self.default_db.clone(),
                         schema: self.default_schema.clone(),
                         table: table_name,
+                        dependencies,
                         projection,
                         filter: None,
                         at_timestamp: None,
@@ -475,6 +518,7 @@ impl Analyzer {
                         db: self.default_db.clone(),
                         schema: self.default_schema.clone(),
                         table: String::new(),
+                        dependencies: vec![],
                         projection: vec!["*".to_string()],
                         filter: None,
                         at_timestamp: Some(ts),
@@ -752,6 +796,20 @@ mod tests {
         {
             assert_eq!(table, "orders");
             assert_eq!(projection, vec!["id", "amount"]);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn phase3_join_dependencies_are_extracted() {
+        let parser = SqlParser::new();
+        let stmts = parser
+            .parse("SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id")
+            .unwrap();
+        let resolved = analyzer().resolve(&stmts[0]).unwrap();
+        if let ResolvedStatement::Select { dependencies, .. } = resolved {
+            assert_eq!(dependencies, vec!["customers", "orders"]);
         } else {
             panic!("expected Select");
         }

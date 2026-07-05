@@ -160,6 +160,18 @@ impl WorkerPool {
             .cloned()
     }
 
+    /// Return workers that can receive rescheduled work.
+    pub async fn reschedule_targets(&self, failed_worker_id: u64) -> Vec<WorkerInfo> {
+        let workers = self.workers.read().await;
+        let mut targets: Vec<_> = workers
+            .values()
+            .filter(|w| w.status == WorkerStatus::Active && w.worker_id != failed_worker_id)
+            .cloned()
+            .collect();
+        targets.sort_by_key(|w| w.active_queries);
+        targets
+    }
+
     /// Get worker count by status.
     pub async fn worker_count(&self) -> (usize, usize, usize) {
         let workers = self.workers.read().await;
@@ -267,6 +279,23 @@ mod tests {
 
         let worker = pool.get_worker(id).await.unwrap();
         assert_eq!(worker.status, WorkerStatus::Dead);
+    }
+
+    #[tokio::test]
+    async fn test_reschedule_targets_skip_failed_and_sort_by_load() {
+        let pool = WorkerPool::new();
+        let failed = pool.register("w1".to_string()).await.unwrap();
+        let busy = pool.register("w2".to_string()).await.unwrap();
+        let idle = pool.register("w3".to_string()).await.unwrap();
+        pool.heartbeat(busy, 20.0, 0.0, 5).await.unwrap();
+        pool.heartbeat(idle, 10.0, 0.0, 0).await.unwrap();
+
+        let targets = pool.reschedule_targets(failed).await;
+
+        assert_eq!(
+            targets.iter().map(|w| w.worker_id).collect::<Vec<_>>(),
+            vec![idle, busy]
+        );
     }
 
     #[tokio::test]

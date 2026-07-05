@@ -131,7 +131,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_machine_create_database() {
-        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let store = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         let sm = CoordinatorStateMachine::new(store);
 
         let req = RaftRequest::CreateDatabase {
@@ -145,7 +151,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_machine_create_database_duplicate() {
-        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let store = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         let sm = CoordinatorStateMachine::new(store);
 
         let req = RaftRequest::CreateDatabase {
@@ -161,7 +173,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_machine_create_table() {
-        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let store = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         let sm = CoordinatorStateMachine::new(store);
 
         // Create database first
@@ -187,7 +205,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_state_machine_commit_mp() {
-        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let store = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         let sm = CoordinatorStateMachine::new(store);
 
         let req = RaftRequest::CommitMp {

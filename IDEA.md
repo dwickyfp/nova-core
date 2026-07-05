@@ -1,0 +1,1 @@
+Database OLAP Snowflake Style

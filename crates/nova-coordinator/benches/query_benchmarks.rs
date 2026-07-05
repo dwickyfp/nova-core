@@ -2,9 +2,13 @@
 // Run: cargo bench -p nova-coordinator --bench query_benchmarks
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use nova_common::{Compression, MicroPartitionMeta};
 use nova_coordinator::cbo::{CboOptimizer, JoinEdge, TableRef};
+use nova_coordinator::distributed::{FragmentDispatcher, JoinRuntimeStats};
 use nova_coordinator::parser::SqlParser;
-use std::time::Duration;
+use nova_coordinator::worker_pool::{WorkerInfo, WorkerStatus};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 fn make_table(id: u64, name: &str, rows: u64) -> TableRef {
     TableRef {
@@ -157,11 +161,76 @@ fn bench_cbo_with_filter(c: &mut Criterion) {
     group.finish();
 }
 
+fn worker(id: u64) -> WorkerInfo {
+    WorkerInfo {
+        worker_id: id,
+        address: format!("w{id}"),
+        status: WorkerStatus::Active,
+        last_heartbeat: Instant::now(),
+        cpu_usage: 0.0,
+        memory_usage: 0.0,
+        active_queries: 0,
+    }
+}
+
+fn mp(id: u64) -> MicroPartitionMeta {
+    MicroPartitionMeta {
+        mp_id: id,
+        table_id: 1,
+        partition_id: Some(id % 16),
+        version: 1,
+        s3_path: format!("s3://nova/mp-{id}.parquet"),
+        s3_temp_path: None,
+        row_count: 1000,
+        byte_size: 1024 * 1024,
+        compression: Compression::Snappy,
+        column_stats: HashMap::new(),
+        commit_ts: 0,
+        txn_id: 0,
+        supersedes: None,
+        superseded_by: None,
+        active: true,
+    }
+}
+
+fn bench_distributed_phase4(c: &mut Criterion) {
+    let mut group = c.benchmark_group("phase4_distributed");
+    let workers: Vec<_> = (0..8).map(worker).collect();
+    let mps: Vec<_> = (0..1_000).map(mp).collect();
+
+    group.bench_function("distributed_scan_1000_mps_8_workers", |b| {
+        b.iter(|| {
+            let mut dispatcher = FragmentDispatcher::new(workers.clone());
+            black_box(dispatcher.distribute_scan(&mps));
+        });
+    });
+    group.bench_function("shuffle_join_partition_1000_mps", |b| {
+        b.iter(|| {
+            let mut dispatcher = FragmentDispatcher::new(workers.clone());
+            black_box(dispatcher.distribute_shuffle(&mps, "customer_id"));
+        });
+    });
+    group.bench_function("adaptive_join_selection", |b| {
+        b.iter(|| {
+            black_box(FragmentDispatcher::select_adaptive_join_strategy(
+                JoinRuntimeStats {
+                    left_rows: 10_000_000,
+                    left_bytes: 2 * 1024 * 1024 * 1024,
+                    right_rows: 10_000,
+                    right_bytes: 10 * 1024 * 1024,
+                    colocated: false,
+                },
+            ))
+        });
+    });
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(50)
         .measurement_time(Duration::from_secs(5));
-    targets = bench_sql_parsing, bench_cbo_join_reorder, bench_cbo_with_filter
+    targets = bench_sql_parsing, bench_cbo_join_reorder, bench_cbo_with_filter, bench_distributed_phase4
 }
 criterion_main!(benches);

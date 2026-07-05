@@ -23,10 +23,15 @@ mod tests {
     }
 
     fn make_worker_state(dir: &TempDir) -> Arc<WorkerState> {
-        let meta_path = dir.path().join("meta");
         let data_path = dir.path().join("data");
         std::fs::create_dir_all(&data_path).unwrap();
-        let meta: Arc<dyn MetadataStore> = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let meta: Arc<dyn MetadataStore> = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(&data_path).unwrap());
         let reader = MpReader::new(store);

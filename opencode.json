@@ -1,0 +1,67 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "superpowers@git+https://github.com/obra/superpowers.git"
+  ],
+  "provider": {
+    "combo": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Combo",
+      "options": {
+        "baseURL": "http://localhost:20128/v1",
+        "apiKey": "{file:.opencode/combo-api-key}"
+      },
+      "models": {
+        "claude-sonnet-5": {
+          "name": "Claude Sonnet 5",
+          "limit": {
+            "context": 200000,
+            "output": 32000
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "model": "combo/claude-sonnet-5",
+  "small_model": "combo/claude-sonnet-5",
+  "agent": {
+    "explorer": {
+      "description": "Fast explorer subagent for codebase exploration and symbol mapping with CodeGraph",
+      "mode": "subagent",
+      "model": "combo/claude-sonnet-5"
+    },
+    "rust-reviewer": {
+      "description": "Reviews Rust changes for correctness, crate boundaries, error handling, async safety, and tests",
+      "mode": "subagent",
+      "model": "combo/claude-sonnet-5"
+    },
+    "query-engine-debugger": {
+      "description": "Investigates SQL parsing, analyzer, planner, optimizer, scheduler, worker, DataFusion, and query result bugs",
+      "mode": "subagent",
+      "model": "combo/claude-sonnet-5"
+    },
+    "fdb-rbac-auditor": {
+      "description": "Audits FoundationDB metadata, transactions, auth, RBAC, roles, privileges, and security context correctness",
+      "mode": "subagent",
+      "model": "combo/claude-sonnet-5"
+    },
+    "test-runner": {
+      "description": "Finds and runs the narrowest relevant cargo tests, then recommends broader validation for nova-core changes",
+      "mode": "subagent",
+      "model": "combo/claude-sonnet-5"
+    }
+  },
+  "enabled_providers": [
+    "combo"
+  ],
+  "permission": "allow"
+}

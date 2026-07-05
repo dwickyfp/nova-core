@@ -218,6 +218,18 @@ impl SecurityContext {
             secondary_all: true,
         }
     }
+
+    pub fn active_role_ids(&self) -> Vec<RoleId> {
+        let mut roles = vec![self.primary_role_id];
+        if self.secondary_all {
+            for role_id in &self.secondary_role_ids {
+                if !roles.contains(role_id) {
+                    roles.push(*role_id);
+                }
+            }
+        }
+        roles
+    }
 }
 
 pub fn normalize_ident(s: &str) -> String {

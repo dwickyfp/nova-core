@@ -14,6 +14,13 @@ Cargo.lock
 .env
 .env.local
 config.toml
+.claude/settings.json
+.config/opencode/opencode.json
+.opencode/combo-api-key
+.opencode/node_modules/
+.opencode/package.json
+.opencode/package-lock.json
+.codegraph/
 
 # Docker
 docker/data/

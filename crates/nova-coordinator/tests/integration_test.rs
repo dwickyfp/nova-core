@@ -85,7 +85,7 @@ async fn test_cache_invalidation_on_table_update() {
     let columns = vec!["id".to_string()];
     let rows = vec![vec!["1".to_string()]];
     let versions_v1 = HashMap::from([(100u64, 1u64)]);
-    let versions_v2 = HashMap::from([(100u64, 2u64)]);
+    let _versions_v2 = HashMap::from([(100u64, 2u64)]);
 
     // Cache with v1
     cache.put(query_key, columns, rows, versions_v1).await;

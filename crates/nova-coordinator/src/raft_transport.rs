@@ -173,6 +173,7 @@ pub struct FdbLogStore {
 }
 
 impl FdbLogStore {
+    #[allow(clippy::result_large_err)]
     pub fn open(cluster_file: &str) -> Result<Self, StorageError<u64>> {
         let network = unsafe { foundationdb::boot() };
         let db = foundationdb::Database::new(Some(cluster_file)).map_err(Self::write_err)?;
@@ -204,10 +205,12 @@ impl FdbLogStore {
         )
     }
 
+    #[allow(clippy::result_large_err)]
     fn de<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<u64>> {
         serde_json::from_slice(bytes).map_err(Self::read_err)
     }
 
+    #[allow(clippy::result_large_err)]
     fn ser<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StorageError<u64>> {
         serde_json::to_vec(value).map_err(Self::write_err)
     }

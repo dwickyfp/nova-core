@@ -181,8 +181,6 @@ impl ExecutionPlan for MicroPartitionScanExec {
     }
 }
 
-/// Project selected columns from a batch.
-
 #[cfg(test)]
 mod tests {
     use super::*;

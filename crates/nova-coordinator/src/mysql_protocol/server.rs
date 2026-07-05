@@ -16,7 +16,7 @@ use crate::mysql_protocol::commands::{
     ColumnDef, Command, CommandResult, build_column_count_packet, build_column_def_packet,
     build_eof_packet, build_error_packet, build_ok_packet, build_row_packet, handle_init_db,
     handle_ping, handle_quit, handle_reset_connection, handle_set_option, handle_stmt_close,
-    handle_stmt_execute, handle_stmt_prepare,
+    handle_stmt_prepare,
 };
 use crate::mysql_protocol::connection::Session;
 use crate::mysql_protocol::errors::MySqlError;
@@ -50,6 +50,37 @@ impl Default for MySqlServerConfig {
             max_connections: 100,
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RoleCommand<'a> {
+    UseRole(&'a str),
+    UseSecondaryAll,
+    UseSecondaryNone,
+}
+
+pub fn parse_role_command(sql: &str) -> Option<RoleCommand<'_>> {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    let mut parts = sql.split_whitespace();
+    if !parts.next()?.eq_ignore_ascii_case("use") {
+        return None;
+    }
+    let second = parts.next()?;
+    if second.eq_ignore_ascii_case("role") {
+        let role = sql[sql.to_ascii_lowercase().find("role")? + 4..]
+            .trim()
+            .trim_matches('`')
+            .trim_matches('"');
+        return (!role.is_empty()).then_some(RoleCommand::UseRole(role));
+    }
+    if second.eq_ignore_ascii_case("secondary") && parts.next()?.eq_ignore_ascii_case("roles") {
+        return match parts.next()? {
+            word if word.eq_ignore_ascii_case("all") => Some(RoleCommand::UseSecondaryAll),
+            word if word.eq_ignore_ascii_case("none") => Some(RoleCommand::UseSecondaryNone),
+            _ => None,
+        };
+    }
+    None
 }
 
 impl MySqlServer {
@@ -168,18 +199,22 @@ async fn handle_connection(
         sessions_guard.push(connection_id);
     }
 
-    // Authentication: verify password if auth manager is configured.
-    // When auth is None (dev mode), accept all connections.
-    if let Some(ref auth_manager) = auth {
+    // Authentication: verify password against FDB-backed user metadata when enabled.
+    // When auth is None (dev mode), accept as root.
+    if auth.is_some() {
         let username = &handshake_response.username;
         let auth_response = &handshake_response.auth_response;
-
-        // Look up user in AuthManager
-        let user_info = auth_manager.get_user_info(username);
-
-        match user_info {
-            None => {
-                // Unknown user
+        let user = match engine.user_for_auth(username).await {
+            Ok(Some(user)) if !user.disabled => user,
+            Ok(Some(_)) => {
+                let err = build_error_packet(
+                    MySqlError::ER_ACCESS_DENIED_ERROR,
+                    &format!("Access denied for user '{}'@'{}'", username, "unknown"),
+                );
+                codec.write_packet(&err.payload).await?;
+                return Ok(());
+            }
+            _ => {
                 let err = build_error_packet(
                     MySqlError::ER_ACCESS_DENIED_ERROR,
                     &format!(
@@ -188,50 +223,36 @@ async fn handle_connection(
                     ),
                 );
                 codec.write_packet(&err.payload).await?;
-                tracing::warn!(
-                    connection_id = connection_id,
-                    username = %username,
-                    "Access denied: unknown user"
-                );
                 return Ok(());
             }
-            Some(info) => {
-                if info.mysql_native_hash.is_empty() {
-                    // No password required for this user (e.g. root in dev mode)
-                    let ok_packet = build_ok_packet(0, 0, session.server_status, "");
-                    codec.write_packet(&ok_packet.payload).await?;
-                } else {
-                    // Verify mysql_native_password response against stored hash
-                    let verified = verify_mysql_native_password(
-                        &scramble,
-                        &info.mysql_native_hash,
-                        auth_response,
-                    );
+        };
 
-                    if !verified {
-                        let err = build_error_packet(
-                            MySqlError::ER_ACCESS_DENIED_ERROR,
-                            &format!(
-                                "Access denied for user '{}'@'{}' (using password: YES)",
-                                username, "unknown"
-                            ),
-                        );
-                        codec.write_packet(&err.payload).await?;
-                        tracing::warn!(
-                            connection_id = connection_id,
-                            username = %username,
-                            "Access denied: invalid password"
-                        );
-                        return Ok(());
-                    }
+        if !user.mysql_native_hash.is_empty()
+            && !verify_mysql_native_password(&scramble, &user.mysql_native_hash, auth_response)
+        {
+            let err = build_error_packet(
+                MySqlError::ER_ACCESS_DENIED_ERROR,
+                &format!(
+                    "Access denied for user '{}'@'{}' (using password: YES)",
+                    username, "unknown"
+                ),
+            );
+            codec.write_packet(&err.payload).await?;
+            return Ok(());
+        }
 
-                    let ok_packet = build_ok_packet(0, 0, session.server_status, "");
-                    codec.write_packet(&ok_packet.payload).await?;
-                }
+        match engine.security_context_for_user(&user.name).await {
+            Ok(security) => session.security = security,
+            Err(e) => {
+                let err = build_error_packet(MySqlError::ER_ACCESS_DENIED_ERROR, &e.to_string());
+                codec.write_packet(&err.payload).await?;
+                return Ok(());
             }
         }
+        let ok_packet = build_ok_packet(0, 0, session.server_status, "");
+        codec.write_packet(&ok_packet.payload).await?;
     } else {
-        // Dev mode: no auth required
+        session.security = nova_common::SecurityContext::root();
         let ok_packet = build_ok_packet(0, 0, session.server_status, "");
         codec.write_packet(&ok_packet.payload).await?;
     }
@@ -293,7 +314,50 @@ async fn handle_connection(
 
                 // Handle special commands first
                 let sql_lower = sql.to_lowercase();
-                if sql_lower.starts_with("use ") {
+                if let Some(role_command) = parse_role_command(sql) {
+                    match role_command {
+                        RoleCommand::UseRole(role) => match engine.role_id_by_name(role).await {
+                            Ok(Some(role_id))
+                                if session.security.active_role_ids().contains(&role_id) =>
+                            {
+                                session.security.primary_role_id = role_id;
+                                CommandResult::Ok {
+                                    affected_rows: 0,
+                                    last_insert_id: 0,
+                                    message: String::new(),
+                                }
+                            }
+                            Ok(Some(_)) => CommandResult::Error {
+                                code: MySqlError::ER_ACCESS_DENIED_ERROR,
+                                message: format!("role '{}' is not granted to current user", role),
+                            },
+                            Ok(None) => CommandResult::Error {
+                                code: MySqlError::ER_PARSE_ERROR,
+                                message: format!("role '{}' not found", role),
+                            },
+                            Err(e) => CommandResult::Error {
+                                code: MySqlError::ER_PARSE_ERROR,
+                                message: e.to_string(),
+                            },
+                        },
+                        RoleCommand::UseSecondaryAll => {
+                            session.security.secondary_all = true;
+                            CommandResult::Ok {
+                                affected_rows: 0,
+                                last_insert_id: 0,
+                                message: String::new(),
+                            }
+                        }
+                        RoleCommand::UseSecondaryNone => {
+                            session.security.secondary_all = false;
+                            CommandResult::Ok {
+                                affected_rows: 0,
+                                last_insert_id: 0,
+                                message: String::new(),
+                            }
+                        }
+                    }
+                } else if sql_lower.starts_with("use ") {
                     let db = sql[4..].trim().trim_end_matches(';').to_string();
                     session.set_database(&db);
                     CommandResult::Ok {
@@ -304,7 +368,10 @@ async fn handle_connection(
                 } else if sql_lower.starts_with("show databases")
                     || sql_lower.starts_with("show schemas")
                 {
-                    let db_names = engine.list_databases().await.unwrap_or_default();
+                    let db_names = engine
+                        .list_databases(&session.security)
+                        .await
+                        .unwrap_or_default();
                     let mut rows: Vec<Vec<Option<String>>> =
                         db_names.into_iter().map(|n| vec![Some(n)]).collect();
                     // Always include system databases
@@ -359,7 +426,10 @@ async fn handle_connection(
                     } else {
                         &session.current_db
                     };
-                    let table_names = engine.list_tables(current_db).await.unwrap_or_default();
+                    let table_names = engine
+                        .list_tables(current_db, &session.security)
+                        .await
+                        .unwrap_or_default();
                     let col_name = format!("Tables_in_{}", session.current_db);
                     let rows = table_names.into_iter().map(|n| vec![Some(n)]).collect();
                     CommandResult::ResultSet {
@@ -389,7 +459,7 @@ async fn handle_connection(
                         &session.current_db
                     };
 
-                    match engine.execute_sql(sql, current_db).await {
+                    match engine.execute_sql(sql, current_db, &session.security).await {
                         Ok(result) => {
                             use crate::executor::QueryResult;
                             match result {
@@ -423,7 +493,75 @@ async fn handle_connection(
                 }
             }
             Command::ComStmtPrepare => handle_stmt_prepare(&mut session, payload),
-            Command::ComStmtExecute => handle_stmt_execute(&mut session, payload),
+            Command::ComStmtExecute => {
+                if payload.len() < 4 {
+                    CommandResult::Error {
+                        code: MySqlError::ER_SYNTAX_ERROR,
+                        message: "Invalid COM_STMT_EXECUTE payload".to_string(),
+                    }
+                } else {
+                    let stmt_id =
+                        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    match session.get_prepared_statement(stmt_id) {
+                        None => CommandResult::Error {
+                            code: MySqlError::ER_UNKNOWN_STMT_HANDLER,
+                            message: format!(
+                                "Unknown prepared statement handler ({}) given",
+                                stmt_id
+                            ),
+                        },
+                        Some(stmt) if stmt.num_params != 0 => CommandResult::Error {
+                            code: MySqlError::ER_NOT_SUPPORTED_YET,
+                            message: "Prepared statement parameters are not yet implemented"
+                                .to_string(),
+                        },
+                        Some(stmt) => {
+                            let sql = stmt.sql.clone();
+                            let current_db = if session.current_db.is_empty() {
+                                "nova"
+                            } else {
+                                &session.current_db
+                            };
+                            match engine
+                                .execute_sql(&sql, current_db, &session.security)
+                                .await
+                            {
+                                Ok(result) => {
+                                    use crate::executor::QueryResult;
+                                    match result {
+                                        QueryResult::Success { message } => CommandResult::Ok {
+                                            affected_rows: 0,
+                                            last_insert_id: 0,
+                                            message,
+                                        },
+                                        QueryResult::Rows { columns, rows } => {
+                                            CommandResult::ResultSet {
+                                                columns: columns
+                                                    .into_iter()
+                                                    .map(|name| ColumnDef {
+                                                        name,
+                                                        col_type: ColumnType::VarString,
+                                                        flags: 0,
+                                                        decimals: 0,
+                                                    })
+                                                    .collect(),
+                                                rows: rows
+                                                    .into_iter()
+                                                    .map(|r| r.into_iter().map(Some).collect())
+                                                    .collect(),
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => CommandResult::Error {
+                                    code: MySqlError::ER_PARSE_ERROR,
+                                    message: e.to_string(),
+                                },
+                            }
+                        }
+                    }
+                }
+            }
             Command::ComStmtClose => {
                 // COM_STMT_CLOSE is silent — no response, just remove statement
                 handle_stmt_close(&mut session, payload);

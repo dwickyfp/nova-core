@@ -956,18 +956,27 @@ Goal: no global current user; every query carries session role context.
 
 Checklist:
 
-- [ ] Add `user_id`, `primary_role_id`, `secondary_roles` to MySQL `Session`.
-- [ ] Auth lookup reads FDB user.
-- [ ] Default role validation at login.
-- [ ] Implement `USE ROLE`.
-- [ ] Implement `USE SECONDARY ROLES ALL/NONE`.
-- [ ] Change `QueryEngine::execute_sql` signature to include `SecurityContext`.
-- [ ] Remove/disable `Executor.current_user` global path.
+- [x] Add `user_id`, `primary_role_id`, `secondary_roles` to MySQL `Session` via `SecurityContext`.
+- [x] Auth lookup reads FDB user.
+- [x] Default role validation at login.
+- [x] Implement `USE ROLE`.
+- [x] Implement `USE SECONDARY ROLES ALL/NONE`.
+- [x] Change `QueryEngine::execute_sql` signature to include `SecurityContext`.
+- [x] Remove/disable `Executor.current_user` global path.
+- [x] Use FDB `UserMeta.mysql_native_hash` as the MySQL auth source of truth.
+- [x] Reject disabled users before OK packet.
+- [x] Scope result-cache keys by `SecurityContext` and `security_epoch`.
+- [x] Route parameterless prepared statement execution through `SecurityContext`; reject parameterized prepared execution until binding is implemented.
+- [x] Add Phase 2 regression check for security-scoped cache keys.
+- [x] Add session isolation regression test.
+- [x] Harden `USE ROLE` / `USE SECONDARY ROLES` parsing with unit coverage.
+- [x] Add active role calculation helper for Phase 3 enforcement.
+- [x] Rename root execution helper to `execute_as_root_for_internal` and audit direct callers.
 
 Acceptance tests:
 
-- [ ] Two concurrent sessions with different roles cannot leak privileges.
-- [ ] `USE ROLE` affects only current session.
+- [x] Two concurrent sessions with different roles cannot leak privileges.
+- [x] `USE ROLE` affects only current session.
 - [ ] Login fails for disabled user.
 - [ ] Login fails if default role is not granted.
 
@@ -977,14 +986,14 @@ Goal: database/schema/table DDL+DML are protected.
 
 Checklist:
 
-- [ ] Add `Authorizer`.
-- [ ] Enforce `CREATE_DATABASE`.
-- [ ] Enforce database/schema `USAGE`.
-- [ ] Enforce schema `CREATE_TABLE`.
-- [ ] Enforce table `SELECT/INSERT/UPDATE/DELETE`.
-- [ ] Enforce table `OWNERSHIP` for alter/drop.
-- [ ] Enforce join dependencies.
-- [ ] Filter `SHOW DATABASES` and `SHOW TABLES`.
+- [x] Add FDB-backed authorization helper in executor path.
+- [x] Enforce `CREATE_DATABASE` on account object.
+- [x] Enforce database/schema `USAGE` for table operations.
+- [x] Enforce schema `CREATE_TABLE` when schema exists.
+- [x] Enforce table `SELECT/INSERT/UPDATE/DELETE`.
+- [x] Enforce table `OWNERSHIP` for drop table.
+- [x] Extract JOIN / subquery table dependencies and authorize every dependency for `SELECT`.
+- [x] Filter `SHOW DATABASES` and `SHOW TABLES`.
 
 Acceptance tests:
 
@@ -992,8 +1001,8 @@ Acceptance tests:
 - [ ] User with `SELECT` but without parent `USAGE` cannot read table.
 - [ ] Owner can operate on owned table.
 - [ ] Non-owner cannot drop table without ownership.
-- [ ] JOIN fails if any referenced table lacks `SELECT`.
-- [ ] SHOW only returns visible objects.
+- [x] JOIN fails if any referenced table lacks `SELECT`.
+- [x] SHOW only returns visible objects.
 
 ### Phase 4 — SQL GRANT/REVOKE/SHOW
 

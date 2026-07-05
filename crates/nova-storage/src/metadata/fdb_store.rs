@@ -374,7 +374,11 @@ impl MetadataStore for FdbMetadataStore {
     //  DATABASE OPERATIONS
     // ══════════════════════════════════════════════════════════════
 
-    async fn create_database(&self, db: DatabaseMeta) -> Result<()> {
+    async fn create_database(&self, mut db: DatabaseMeta) -> Result<()> {
+        if db.id == 0 {
+            let key = self.pack(&("next_id", "database"));
+            db.id = self.fdb_atomic_inc(key).await?;
+        }
         let key = self.pack(&("db", db.id));
         let val = Self::serialize(&db)?;
         self.fdb_set(key, val).await

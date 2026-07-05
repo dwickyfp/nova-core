@@ -48,6 +48,8 @@ pub struct ScalingPolicy {
     pub min_workers: usize,
     /// Idle duration before worker is suspended.
     pub idle_suspend_timeout: Duration,
+    /// Queued queries that trigger scale-up.
+    pub queue_depth_scale_up_threshold: u32,
 }
 
 impl Default for ScalingPolicy {
@@ -58,6 +60,7 @@ impl Default for ScalingPolicy {
             max_workers: 16,
             min_workers: 1,
             idle_suspend_timeout: Duration::from_secs(60),
+            queue_depth_scale_up_threshold: 10,
         }
     }
 }
@@ -92,6 +95,15 @@ impl AutoScaler {
 
     /// Evaluate current worker metrics and produce a scaling decision.
     pub fn evaluate(&self, workers: &[WorkerInfo]) -> ScalingDecision {
+        self.evaluate_with_queue_depth(workers, 0)
+    }
+
+    /// Evaluate current worker metrics and queue depth.
+    pub fn evaluate_with_queue_depth(
+        &self,
+        workers: &[WorkerInfo],
+        queue_depth: u32,
+    ) -> ScalingDecision {
         let active: Vec<&WorkerInfo> = workers
             .iter()
             .filter(|w| w.status == WorkerStatus::Active)
@@ -108,6 +120,18 @@ impl AutoScaler {
         // Calculate average CPU
         let avg_cpu: f64 =
             active.iter().map(|w| w.cpu_usage).sum::<f64>() / active.len() as f64 / 100.0;
+
+        if queue_depth > self.policy.queue_depth_scale_up_threshold
+            && active.len() < self.policy.max_workers
+        {
+            return ScalingDecision::ScaleUp {
+                count: 1,
+                reason: format!(
+                    "queue depth {} > threshold {}",
+                    queue_depth, self.policy.queue_depth_scale_up_threshold
+                ),
+            };
+        }
 
         // Scale up if average CPU > threshold
         if avg_cpu > self.policy.cpu_scale_up_threshold && active.len() < self.policy.max_workers {
@@ -194,6 +218,15 @@ mod tests {
         let workers = vec![mock_worker(1, 90.0, 5), mock_worker(2, 85.0, 4)];
 
         let decision = scaler.evaluate(&workers);
+        assert!(matches!(decision, ScalingDecision::ScaleUp { .. }));
+    }
+
+    #[test]
+    fn test_scale_up_on_queue_depth() {
+        let scaler = AutoScaler::new(ScalingPolicy::default(), WarehouseSize::Medium);
+        let workers = vec![mock_worker(1, 10.0, 0)];
+
+        let decision = scaler.evaluate_with_queue_depth(&workers, 11);
         assert!(matches!(decision, ScalingDecision::ScaleUp { .. }));
     }
 

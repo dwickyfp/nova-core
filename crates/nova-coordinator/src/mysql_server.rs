@@ -131,7 +131,9 @@ async fn execute_sql(
             message: "empty SQL".to_string(),
         })?;
     let resolved = analyzer.resolve(stmt)?;
-    executor.execute(resolved).await
+    executor
+        .execute_with_context(resolved, &nova_common::SecurityContext::root())
+        .await
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -436,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_ok_packet_structure() {
-        let payload = vec![0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
+        let payload = [0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00];
         assert_eq!(payload[0], 0x00); // OK marker
     }
 

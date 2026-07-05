@@ -1,7 +1,7 @@
 // NovaEngine — implements QueryEngine by wiring Parser + Analyzer + Optimizer + Planner + Scheduler + Executor.
 
 use async_trait::async_trait;
-use nova_common::Result;
+use nova_common::{Result, RoleId, SecurityContext, UserMeta};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,9 +30,21 @@ impl NovaEngine {
     }
 }
 
+fn security_cache_sql(sql: &str, security: &SecurityContext, security_epoch: u64) -> String {
+    format!(
+        "/*sec:user={}:role={}:secondary_all={}:epoch={}*/ {}",
+        security.user_id, security.primary_role_id, security.secondary_all, security_epoch, sql
+    )
+}
+
 #[async_trait]
 impl QueryEngine for NovaEngine {
-    async fn execute_sql(&self, sql: &str, current_db: &str) -> Result<QueryResult> {
+    async fn execute_sql(
+        &self,
+        sql: &str,
+        current_db: &str,
+        security: &SecurityContext,
+    ) -> Result<QueryResult> {
         let sql_upper = sql.trim().to_uppercase();
         let is_select = sql_upper.starts_with("SELECT");
         let is_write = sql_upper.starts_with("INSERT")
@@ -41,10 +53,19 @@ impl QueryEngine for NovaEngine {
             || sql_upper.starts_with("CREATE")
             || sql_upper.starts_with("DROP");
 
-        // Check result cache for SELECT queries
+        let security_epoch = self
+            .scheduler
+            .executor()
+            .security_epoch()
+            .await
+            .unwrap_or(0);
+        let cache_sql = security_cache_sql(sql, security, security_epoch);
+
+        // Check result cache for SELECT queries. Key includes security context + epoch.
         if is_select {
             let empty_versions = HashMap::new();
-            if let Some((columns, rows)) = self.result_cache.get(sql, &empty_versions).await {
+            if let Some((columns, rows)) = self.result_cache.get(&cache_sql, &empty_versions).await
+            {
                 tracing::debug!(sql = %sql, "Result cache HIT");
                 return Ok(QueryResult::Rows { columns, rows });
             }
@@ -68,13 +89,13 @@ impl QueryEngine for NovaEngine {
             }
 
             let planned = self.planner.plan(resolved)?;
-            last_result = self.scheduler.execute(planned).await?;
+            last_result = self.scheduler.execute(planned, security).await?;
 
             // Cache SELECT results
             if let QueryResult::Rows { columns, rows } = &last_result {
                 let empty_versions = HashMap::new();
                 self.result_cache
-                    .put(sql, empty_versions, columns.clone(), rows.clone())
+                    .put(&cache_sql, empty_versions, columns.clone(), rows.clone())
                     .await;
             }
         }
@@ -91,11 +112,32 @@ impl QueryEngine for NovaEngine {
         Ok(last_result)
     }
 
-    async fn list_databases(&self) -> Result<Vec<String>> {
-        self.scheduler.executor().list_database_names().await
+    async fn list_databases(&self, security: &SecurityContext) -> Result<Vec<String>> {
+        self.scheduler
+            .executor()
+            .list_database_names(security)
+            .await
     }
 
-    async fn list_tables(&self, db: &str) -> Result<Vec<String>> {
-        self.scheduler.executor().list_table_names(db).await
+    async fn list_tables(&self, db: &str, security: &SecurityContext) -> Result<Vec<String>> {
+        self.scheduler
+            .executor()
+            .list_table_names(db, security)
+            .await
+    }
+
+    async fn user_for_auth(&self, username: &str) -> Result<Option<UserMeta>> {
+        self.scheduler.executor().user_for_auth(username).await
+    }
+
+    async fn security_context_for_user(&self, username: &str) -> Result<SecurityContext> {
+        self.scheduler
+            .executor()
+            .security_context_for_user(username)
+            .await
+    }
+
+    async fn role_id_by_name(&self, role: &str) -> Result<Option<RoleId>> {
+        self.scheduler.executor().role_id_by_name(role).await
     }
 }

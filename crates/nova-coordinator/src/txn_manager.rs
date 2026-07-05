@@ -149,7 +149,13 @@ mod tests {
 
     async fn setup() -> (TransactionManager<FdbMetadataStore>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let store = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         (TransactionManager::new(store), dir)
     }
 
@@ -204,7 +210,7 @@ mod tests {
         let (tm, _dir) = setup().await;
 
         // T1 begins and sees snapshot at t1
-        let (txn1, ts1) = tm.begin().await.unwrap();
+        let (_txn1, ts1) = tm.begin().await.unwrap();
 
         // T2 begins later and commits — its data should NOT be visible to T1
         let (txn2, ts2) = tm.begin().await.unwrap();

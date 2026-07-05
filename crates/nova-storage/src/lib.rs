@@ -14,4 +14,4 @@ pub use mp_writer::MpWriter;
 #[cfg(feature = "fdb-backend")]
 pub use metadata::fdb_store::FdbMetadataStore;
 
-pub use metadata::MetadataStore;
+pub use metadata::{MetadataStore, SecurityStore};

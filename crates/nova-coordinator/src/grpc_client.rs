@@ -170,6 +170,16 @@ impl WorkerClientPool {
         self.clients.get(index)
     }
 
+    /// Find the client index for a registered worker id.
+    pub async fn index_of_worker_id(&self, worker_id: u64) -> Option<usize> {
+        for (idx, client) in self.clients.iter().enumerate() {
+            if client.lock().await.worker_id() == worker_id {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     /// Execute a fragment on a specific worker by index.
     pub async fn execute_on(
         &self,

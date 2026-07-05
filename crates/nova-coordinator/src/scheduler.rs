@@ -5,7 +5,7 @@
 //! When distributed execution (Phase 4) is wired, this will
 //! dispatch fragments to workers via gRPC.
 
-use nova_common::Result;
+use nova_common::{Result, SecurityContext};
 
 use crate::analyzer::ResolvedStatement;
 use crate::executor::{Executor, QueryResult};
@@ -21,8 +21,12 @@ impl QueryScheduler {
     }
 
     /// Execute a planned statement locally.
-    pub async fn execute(&self, stmt: ResolvedStatement) -> Result<QueryResult> {
-        self.executor.execute(stmt).await
+    pub async fn execute(
+        &self,
+        stmt: ResolvedStatement,
+        security: &SecurityContext,
+    ) -> Result<QueryResult> {
+        self.executor.execute_with_context(stmt, security).await
     }
 
     /// Get a reference to the executor (for metadata queries).
@@ -35,7 +39,6 @@ impl QueryScheduler {
 mod tests {
     use super::*;
     use crate::executor::Executor;
-    use nova_common::*;
     use nova_storage::{FdbMetadataStore, MetadataStore};
     use object_store::local::LocalFileSystem;
     use std::sync::Arc;
@@ -43,8 +46,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_scheduler_create_database() {
-        let dir = TempDir::new().unwrap();
-        let meta = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap()) as Arc<dyn MetadataStore>;
+        let _dir = TempDir::new().unwrap();
+        let meta = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        ) as Arc<dyn MetadataStore>;
         let store = Arc::new(LocalFileSystem::new()) as Arc<dyn object_store::ObjectStore>;
         let writer = nova_storage::MpWriter::new(store.clone(), "test".to_string());
         let reader = nova_storage::MpReader::new(store);
@@ -54,7 +63,8 @@ mod tests {
         let stmt = ResolvedStatement::CreateDatabase {
             name: "testdb".to_string(),
         };
-        let result = scheduler.execute(stmt).await.unwrap();
+        let security = SecurityContext::root();
+        let result = scheduler.execute(stmt, &security).await.unwrap();
         assert!(matches!(result, QueryResult::Success { .. }));
     }
 }

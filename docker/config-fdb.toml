@@ -13,7 +13,6 @@ s3_secret_key = "nova12345"
 s3_region    = "us-east-1"
 
 [metadata]
-backend          = "fdb"
 fdb_cluster_file = "docker:docker@nova-fdb:4500"
 
 [auth]

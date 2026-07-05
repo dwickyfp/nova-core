@@ -11,6 +11,7 @@ use futures::Stream;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
+use nova_common::{Compression, MicroPartitionMeta};
 use nova_storage::MetadataStore;
 
 use crate::executor::Executor;
@@ -205,11 +206,19 @@ async fn execute_fragment_inner(
                     .await
                     .map_err(|e| e.to_string())?;
                 if let Some(meta) = tables.iter().find(|t| t.name == table_snap.table_name) {
-                    let mps = state
-                        .meta
-                        .get_active_mps(meta.id)
-                        .await
-                        .map_err(|e| e.to_string())?;
+                    let mps = if table_snap.mps.is_empty() {
+                        state
+                            .meta
+                            .get_active_mps(meta.id)
+                            .await
+                            .map_err(|e| e.to_string())?
+                    } else {
+                        table_snap
+                            .mps
+                            .iter()
+                            .map(|mp| snapshot_mp_to_meta(meta.id, mp))
+                            .collect()
+                    };
                     let provider = crate::NovaTableProvider::new(
                         meta.clone(),
                         mps,
@@ -241,4 +250,24 @@ async fn execute_fragment_inner(
         .await
         .map_err(|e| format!("DataFusion collect: {e}"))?;
     Ok(batches)
+}
+
+fn snapshot_mp_to_meta(table_id: u64, mp: &MicroPartitionInfo) -> MicroPartitionMeta {
+    MicroPartitionMeta {
+        mp_id: mp.mp_id,
+        table_id,
+        partition_id: None,
+        version: 0,
+        s3_path: mp.s3_path.clone(),
+        s3_temp_path: None,
+        row_count: mp.row_count,
+        byte_size: mp.byte_size,
+        compression: Compression::Snappy,
+        column_stats: std::collections::HashMap::new(),
+        commit_ts: 0,
+        txn_id: 0,
+        supersedes: None,
+        superseded_by: None,
+        active: true,
+    }
 }

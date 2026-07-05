@@ -68,7 +68,7 @@ fn write_mps(
         let mut mps = Vec::with_capacity(n_mps as usize);
         for i in 0..n_mps {
             let mp = writer
-                .write(1, i + 1, i + 1, &[batch.clone()], 1)
+                .write(1, i + 1, i + 1, std::slice::from_ref(&batch), 1)
                 .await
                 .unwrap();
             mps.push(mp);
