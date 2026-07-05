@@ -1,7 +1,7 @@
 // SQL Parser — wraps sqlparser-rs with Nova custom dialect support.
 
 use nova_common::{NovaError, Result};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Action, GrantObjects, Ident, ObjectName, ObjectType, Privileges, Statement};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
@@ -54,6 +54,15 @@ impl SqlParser {
         }
         if upper.starts_with("SHOW DYNAMIC TABLES") {
             return self.parse_show_dynamic_tables(sql);
+        }
+        if upper.starts_with("GRANT ") && upper.contains(" ON FUNCTION ") {
+            return self.parse_function_grant(sql, false);
+        }
+        if upper.starts_with("REVOKE ") && upper.contains(" ON FUNCTION ") {
+            return self.parse_function_grant(sql, true);
+        }
+        if upper.starts_with("SHOW GRANTS") {
+            return self.parse_show_grants(sql);
         }
         if upper.starts_with("GC") || upper.starts_with("VACUUM") {
             return self.parse_gc(sql);
@@ -444,6 +453,111 @@ impl SqlParser {
         Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
             message: e.to_string(),
         })
+    }
+
+    /// Parse: GRANT|REVOKE USAGE ON FUNCTION <name>(<types>) TO|FROM ROLE <role>.
+    fn parse_function_grant(&self, sql: &str, revoke: bool) -> Result<Vec<Statement>> {
+        let upper = sql.to_uppercase();
+        let on_function_pos =
+            upper
+                .find(" ON FUNCTION ")
+                .ok_or_else(|| NovaError::SqlParseError {
+                    message: "FUNCTION grant syntax: missing ON FUNCTION".to_string(),
+                })?;
+        let privilege_text = sql
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
+        if privilege_text != "USAGE" {
+            return Err(NovaError::SqlParseError {
+                message: "only USAGE can be granted on FUNCTION".to_string(),
+            });
+        }
+
+        let role_marker = if revoke { " FROM ROLE " } else { " TO ROLE " };
+        let role_marker_pos = upper
+            .find(role_marker)
+            .ok_or_else(|| NovaError::SqlParseError {
+                message: format!(
+                    "FUNCTION {} syntax: missing{}",
+                    if revoke { "revoke" } else { "grant" },
+                    role_marker.trim_end()
+                ),
+            })?;
+        let function_text = sql[on_function_pos + " ON FUNCTION ".len()..role_marker_pos].trim();
+        let role_name = sql[role_marker_pos + role_marker.len()..]
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if function_text.is_empty() || role_name.is_empty() {
+            return Err(NovaError::SqlParseError {
+                message: "FUNCTION grant syntax requires function signature and role".to_string(),
+            });
+        }
+
+        let object_name = ObjectName(vec![Ident::new(format!(
+            "__fn_rbac__{}__{}",
+            function_text.replace(' ', ""),
+            role_name
+        ))]);
+        let privileges = Privileges::Actions(vec![Action::Usage]);
+        let objects = GrantObjects::Tables(vec![object_name]);
+        if revoke {
+            Ok(vec![Statement::Revoke {
+                privileges,
+                objects,
+                grantees: vec![Ident::new(role_name)],
+                granted_by: None,
+                cascade: false,
+            }])
+        } else {
+            Ok(vec![Statement::Grant {
+                privileges,
+                objects,
+                grantees: vec![Ident::new(role_name)],
+                with_grant_option: false,
+                granted_by: None,
+            }])
+        }
+    }
+
+    /// Parse: SHOW GRANTS ON FUNCTION <name>(<types>) or SHOW GRANTS TO ROLE <role>.
+    fn parse_show_grants(&self, sql: &str) -> Result<Vec<Statement>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        let encoded = if let Some(pos) = upper.find("SHOW GRANTS ON FUNCTION ") {
+            let function_text = trimmed[pos + "SHOW GRANTS ON FUNCTION ".len()..].trim();
+            if function_text.is_empty() {
+                return Err(NovaError::SqlParseError {
+                    message: "SHOW GRANTS ON FUNCTION requires a function signature".to_string(),
+                });
+            }
+            format!("__show_fn_grants_on__{}", function_text.replace(' ', ""))
+        } else if let Some(pos) = upper.find("SHOW GRANTS TO ROLE ") {
+            let role_name = trimmed[pos + "SHOW GRANTS TO ROLE ".len()..].trim();
+            if role_name.is_empty() {
+                return Err(NovaError::SqlParseError {
+                    message: "SHOW GRANTS TO ROLE requires a role name".to_string(),
+                });
+            }
+            format!("__show_fn_grants_to__{}", role_name)
+        } else {
+            return Err(NovaError::SqlParseError {
+                message: "SHOW GRANTS syntax: SHOW GRANTS ON FUNCTION <name>(<types>) or SHOW GRANTS TO ROLE <role>".to_string(),
+            });
+        };
+        let statement = Statement::Drop {
+            object_type: ObjectType::Table,
+            if_exists: false,
+            names: vec![ObjectName(vec![Ident::new(encoded)])],
+            cascade: false,
+            restrict: false,
+            purge: false,
+            temporary: false,
+        };
+        Ok(vec![statement])
     }
 
     /// Parse: SELECT ... FROM t AT(TIMESTAMP => <unix_micros>)

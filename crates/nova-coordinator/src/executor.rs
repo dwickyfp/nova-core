@@ -530,6 +530,38 @@ impl Executor {
                 self.exec_drop_function(db, schema, name, signature, if_exists)
                     .await
             }
+            ResolvedStatement::GrantFunctionUsage {
+                db,
+                schema,
+                name,
+                signature,
+                role,
+            } => {
+                self.exec_grant_function_usage(security, &db, &schema, &name, &signature, &role)
+                    .await
+            }
+            ResolvedStatement::RevokeFunctionUsage {
+                db,
+                schema,
+                name,
+                signature,
+                role,
+            } => {
+                self.exec_revoke_function_usage(security, &db, &schema, &name, &signature, &role)
+                    .await
+            }
+            ResolvedStatement::ShowGrantsOnFunction {
+                db,
+                schema,
+                name,
+                signature,
+            } => {
+                self.exec_show_grants_on_function(security, &db, &schema, &name, &signature)
+                    .await
+            }
+            ResolvedStatement::ShowGrantsToRole { role } => {
+                self.exec_show_grants_to_role(security, &role).await
+            }
             ResolvedStatement::Insert {
                 db,
                 schema,
@@ -1635,6 +1667,247 @@ impl Executor {
         Ok(QueryResult::Success {
             message: format!("Function '{}' dropped", message_name),
         })
+    }
+
+    async fn resolve_function(
+        &self,
+        db: &str,
+        schema: &str,
+        name: &str,
+        signature: &FunctionSignature,
+    ) -> Result<(DatabaseMeta, SchemaMeta, FunctionMeta)> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        let function = self
+            .meta
+            .get_function_by_signature(db_meta.id, schema_meta.id, name, signature)
+            .await?
+            .ok_or_else(|| NovaError::Internal {
+                message: format!(
+                    "function '{}' not found",
+                    format_function_name(db, schema, name, signature)
+                ),
+            })?;
+        Ok((db_meta, schema_meta, function))
+    }
+
+    async fn require_can_manage_function_grants(
+        &self,
+        security: &SecurityContext,
+        function_id: FunctionId,
+    ) -> Result<()> {
+        let function = ObjectRef::new(ObjectType::Function, function_id);
+        let account = ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID);
+        if self
+            .has_privilege(security, function, SecurityPrivilege::Ownership)
+            .await?
+            || self
+                .has_privilege(security, account, SecurityPrivilege::ManageGrants)
+                .await?
+        {
+            return Ok(());
+        }
+        Err(NovaError::PermissionDenied {
+            user: security.username.clone(),
+            action: format!("MANAGE GRANTS on FUNCTION:{}", function_id),
+        })
+    }
+
+    async fn exec_grant_function_usage(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        name: &str,
+        signature: &FunctionSignature,
+        role: &str,
+    ) -> Result<QueryResult> {
+        let (db_meta, schema_meta, function) =
+            self.resolve_function(db, schema, name, signature).await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Database, db_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Schema, schema_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_can_manage_function_grants(security, function.id)
+            .await?;
+        let target_role =
+            self.meta
+                .get_role_by_name(role)
+                .await?
+                .ok_or_else(|| NovaError::Internal {
+                    message: format!("role '{}' not found", role),
+                })?;
+        self.meta
+            .grant_privileges(GrantSetMeta {
+                role_id: target_role.id,
+                object: ObjectRef::new(ObjectType::Function, function.id),
+                privileges: PrivilegeSet::from_privileges(&[SecurityPrivilege::Usage]),
+                grant_options: PrivilegeSet::empty(),
+                granted_by_role_id: security.primary_role_id,
+                updated_at: now_micros(),
+            })
+            .await?;
+        Ok(QueryResult::Success {
+            message: format!(
+                "Granted USAGE on FUNCTION '{}' to role '{}'",
+                format_function_name(db, schema, &function.name, &function.signature),
+                target_role.name
+            ),
+        })
+    }
+
+    async fn exec_revoke_function_usage(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        name: &str,
+        signature: &FunctionSignature,
+        role: &str,
+    ) -> Result<QueryResult> {
+        let (db_meta, schema_meta, function) =
+            self.resolve_function(db, schema, name, signature).await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Database, db_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Schema, schema_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_can_manage_function_grants(security, function.id)
+            .await?;
+        let target_role =
+            self.meta
+                .get_role_by_name(role)
+                .await?
+                .ok_or_else(|| NovaError::Internal {
+                    message: format!("role '{}' not found", role),
+                })?;
+        self.meta
+            .revoke_privileges(
+                target_role.id,
+                ObjectRef::new(ObjectType::Function, function.id),
+                PrivilegeSet::from_privileges(&[SecurityPrivilege::Usage]),
+            )
+            .await?;
+        Ok(QueryResult::Success {
+            message: format!(
+                "Revoked USAGE on FUNCTION '{}' from role '{}'",
+                format_function_name(db, schema, &function.name, &function.signature),
+                target_role.name
+            ),
+        })
+    }
+
+    async fn exec_show_grants_on_function(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        name: &str,
+        signature: &FunctionSignature,
+    ) -> Result<QueryResult> {
+        let (_db_meta, _schema_meta, function) =
+            self.resolve_function(db, schema, name, signature).await?;
+        self.require_can_manage_function_grants(security, function.id)
+            .await?;
+        let grants = self
+            .meta
+            .list_grants_on_object(ObjectRef::new(ObjectType::Function, function.id))
+            .await?;
+        let mut rows = Vec::new();
+        for grant in grants {
+            if let Some(role) = self.meta.get_role(grant.role_id).await? {
+                rows.extend(function_grant_rows(
+                    &role.name,
+                    &format_function_name(db, schema, &function.name, &function.signature),
+                    &grant,
+                ));
+            }
+        }
+        Ok(QueryResult::Rows {
+            columns: grant_result_columns(),
+            rows,
+        })
+    }
+
+    async fn exec_show_grants_to_role(
+        &self,
+        security: &SecurityContext,
+        role: &str,
+    ) -> Result<QueryResult> {
+        let target_role =
+            self.meta
+                .get_role_by_name(role)
+                .await?
+                .ok_or_else(|| NovaError::Internal {
+                    message: format!("role '{}' not found", role),
+                })?;
+        let account = ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID);
+        if !security.active_role_ids().contains(&target_role.id)
+            && !self
+                .has_privilege(security, account, SecurityPrivilege::ManageGrants)
+                .await?
+        {
+            return Err(NovaError::PermissionDenied {
+                user: security.username.clone(),
+                action: format!("SHOW GRANTS TO ROLE:{}", target_role.id),
+            });
+        }
+        let grants = self.meta.list_grants_to_role(target_role.id).await?;
+        let mut rows = Vec::new();
+        for grant in grants
+            .into_iter()
+            .filter(|grant| grant.object.object_type == ObjectType::Function)
+        {
+            if let Some((db_name, schema_name, function)) =
+                self.find_function_by_id(grant.object.object_id).await?
+            {
+                rows.extend(function_grant_rows(
+                    &target_role.name,
+                    &format_function_name(
+                        &db_name,
+                        &schema_name,
+                        &function.name,
+                        &function.signature,
+                    ),
+                    &grant,
+                ));
+            }
+        }
+        Ok(QueryResult::Rows {
+            columns: grant_result_columns(),
+            rows,
+        })
+    }
+
+    async fn find_function_by_id(
+        &self,
+        function_id: FunctionId,
+    ) -> Result<Option<(String, String, FunctionMeta)>> {
+        for db in self.meta.list_databases().await? {
+            for schema in self.meta.list_schemas(db.id).await? {
+                for function in self.meta.list_functions(db.id, schema.id).await? {
+                    if function.id == function_id {
+                        return Ok(Some((db.name, schema.name, function)));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn exec_insert(
@@ -3391,6 +3664,36 @@ impl Executor {
         })
     }
 } // impl Executor
+
+fn grant_result_columns() -> Vec<String> {
+    vec![
+        "role".to_string(),
+        "object_type".to_string(),
+        "object_name".to_string(),
+        "privilege".to_string(),
+        "grant_option".to_string(),
+    ]
+}
+
+fn function_grant_rows(
+    role_name: &str,
+    function_name: &str,
+    grant: &GrantSetMeta,
+) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for privilege in [SecurityPrivilege::Usage] {
+        if grant.privileges.contains(privilege) {
+            rows.push(vec![
+                role_name.to_string(),
+                ObjectType::Function.to_string(),
+                function_name.to_string(),
+                privilege.to_string(),
+                grant.grant_options.contains(privilege).to_string(),
+            ]);
+        }
+    }
+    rows
+}
 
 /// Parse SQL type string to NovaType.
 fn format_function_name(

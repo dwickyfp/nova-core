@@ -782,6 +782,268 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_owner_can_grant_and_revoke_function_usage_with_sql() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE functiondb", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE numbers (id INT)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "INSERT INTO numbers VALUES (1)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        executor.meta().bootstrap_security().await.unwrap();
+        let analyst_role_id = create_test_role(&executor, "function_sql_grant_analyst").await;
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "functiondb").await;
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|table| table.name == "numbers")
+            .unwrap();
+        for (object, privilege) in [
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Table, table_meta.id),
+                nova_common::SecurityPrivilege::Select,
+            ),
+        ] {
+            grant_privilege(&executor, analyst_role_id, object, privilege).await;
+        }
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 105,
+            username: "function_sql_grant_analyst_user".to_string(),
+            primary_role_id: analyst_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let denied = exec_sql_as(
+            &executor,
+            "SELECT add_one(id) AS incremented FROM numbers",
+            "functiondb",
+            &analyst,
+        )
+        .await
+        .expect_err("analyst should not invoke before GRANT USAGE ON FUNCTION");
+        assert!(
+            matches!(denied, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {denied:?}"
+        );
+
+        exec_sql(
+            &executor,
+            "GRANT USAGE ON FUNCTION add_one(INT) TO ROLE function_sql_grant_analyst",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        let result = exec_sql_as(
+            &executor,
+            "SELECT add_one(id) AS incremented FROM numbers",
+            "functiondb",
+            &analyst,
+        )
+        .await
+        .unwrap();
+        match result {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec!["2".to_string()]]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        exec_sql(
+            &executor,
+            "REVOKE USAGE ON FUNCTION add_one(INT) FROM ROLE function_sql_grant_analyst",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        let denied_after_revoke = exec_sql_as(
+            &executor,
+            "SELECT add_one(id) AS incremented FROM numbers",
+            "functiondb",
+            &analyst,
+        )
+        .await
+        .expect_err("analyst should not invoke after REVOKE USAGE ON FUNCTION");
+        assert!(
+            matches!(
+                denied_after_revoke,
+                nova_common::NovaError::PermissionDenied { .. }
+            ),
+            "expected PermissionDenied, got {denied_after_revoke:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_owner_cannot_grant_function_usage_with_sql() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE functiondb", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE grant_setup (id INT)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        executor.meta().bootstrap_security().await.unwrap();
+        let grantor_role_id = create_test_role(&executor, "function_sql_bad_grantor").await;
+        let grantee_role_id = create_test_role(&executor, "function_sql_bad_grantee").await;
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "functiondb").await;
+        for role_id in [grantor_role_id, grantee_role_id] {
+            for (object, privilege) in [
+                (
+                    nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                    nova_common::SecurityPrivilege::Usage,
+                ),
+                (
+                    nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                    nova_common::SecurityPrivilege::Usage,
+                ),
+            ] {
+                grant_privilege(&executor, role_id, object, privilege).await;
+            }
+        }
+        let grantor = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 106,
+            username: "function_sql_bad_grantor_user".to_string(),
+            primary_role_id: grantor_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "GRANT USAGE ON FUNCTION add_one(INT) TO ROLE function_sql_bad_grantee",
+            "functiondb",
+            &grantor,
+        )
+        .await
+        .expect_err("non-owner must not grant function usage");
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_show_grants_reports_function_usage_grants() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE functiondb", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE show_setup (id INT)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+        executor.meta().bootstrap_security().await.unwrap();
+        create_test_role(&executor, "function_sql_show_analyst").await;
+
+        exec_sql(
+            &executor,
+            "GRANT USAGE ON FUNCTION add_one(INT) TO ROLE function_sql_show_analyst",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        let grants_on = exec_sql(
+            &executor,
+            "SHOW GRANTS ON FUNCTION add_one(INT)",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+        match grants_on {
+            nova_coordinator::executor::QueryResult::Rows { columns, rows } => {
+                assert_eq!(
+                    columns,
+                    vec![
+                        "role".to_string(),
+                        "object_type".to_string(),
+                        "object_name".to_string(),
+                        "privilege".to_string(),
+                        "grant_option".to_string(),
+                    ]
+                );
+                assert!(
+                    rows.iter().any(|row| row
+                        == &vec![
+                            "function_sql_show_analyst".to_string(),
+                            "FUNCTION".to_string(),
+                            "functiondb.public.add_one(INT)".to_string(),
+                            "USAGE".to_string(),
+                            "false".to_string(),
+                        ]),
+                    "expected function grant in SHOW GRANTS ON FUNCTION, got {rows:?}"
+                );
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        let grants_to = exec_sql(
+            &executor,
+            "SHOW GRANTS TO ROLE function_sql_show_analyst",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+        match grants_to {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => {
+                assert!(
+                    rows.iter().any(|row| row
+                        == &vec![
+                            "function_sql_show_analyst".to_string(),
+                            "FUNCTION".to_string(),
+                            "functiondb.public.add_one(INT)".to_string(),
+                            "USAGE".to_string(),
+                            "false".to_string(),
+                        ]),
+                    "expected function grant in SHOW GRANTS TO ROLE, got {rows:?}"
+                );
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_stream_records_object_owner() {
         let (executor, _dir) = setup();
 
