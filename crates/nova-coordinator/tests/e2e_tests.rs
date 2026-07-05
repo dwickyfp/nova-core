@@ -7,8 +7,10 @@
 mod tests {
     use nova_coordinator::analyzer::Analyzer;
     use nova_coordinator::executor::Executor;
+    use nova_coordinator::mysql_protocol::nova_engine::NovaEngine;
+    use nova_coordinator::mysql_protocol::query_engine::QueryEngine;
     use nova_coordinator::parser::SqlParser;
-    use nova_storage::{FdbMetadataStore, MetadataStore, MpReader, MpWriter};
+    use nova_storage::{CdcPayloadReader, FdbMetadataStore, MetadataStore, MpReader, MpWriter};
     use std::sync::Arc;
     use tempfile::TempDir;
     fn setup() -> (Executor, TempDir) {
@@ -28,6 +30,11 @@ mod tests {
         let writer = MpWriter::new(store.clone(), "nova".to_string());
         let reader = MpReader::new(store);
         (Executor::new(meta, writer, reader), dir)
+    }
+
+    fn setup_engine() -> (NovaEngine, TempDir) {
+        let (executor, dir) = setup();
+        (NovaEngine::new(Arc::new(executor)), dir)
     }
 
     async fn exec_sql(
@@ -385,6 +392,1000 @@ mod tests {
             .unwrap()
             .expect("stream should have an object owner record");
         assert_eq!(owner_meta.owner_role_id, owner_role_id);
+    }
+
+    #[tokio::test]
+    async fn stream_lifecycle_requires_rbac_and_shows_metadata() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE orders (id INT)", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM orders_stream ON TABLE orders",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        let show = exec_sql(&executor, "SHOW STREAMS", "streamdb")
+            .await
+            .unwrap();
+        match show {
+            nova_coordinator::executor::QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"name".to_string()));
+                assert!(
+                    rows.iter()
+                        .any(|row| row.iter().any(|cell| cell == "orders_stream"))
+                );
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        let desc = exec_sql(&executor, "DESCRIBE STREAM orders_stream", "streamdb")
+            .await
+            .unwrap();
+        match desc {
+            nova_coordinator::executor::QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"source_table_id".to_string()));
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        exec_sql(&executor, "DROP STREAM orders_stream", "streamdb")
+            .await
+            .unwrap();
+        let err = exec_sql(&executor, "DESCRIBE STREAM orders_stream", "streamdb")
+            .await
+            .expect_err("dropped stream should not resolve");
+        assert!(matches!(err, nova_common::NovaError::StreamNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_read_and_has_data_require_stream_and_source_select() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE orders (id INT)", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM orders_stream ON TABLE orders",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(&executor, "INSERT INTO orders VALUES (1)", "streamdb")
+            .await
+            .unwrap();
+
+        executor.meta().bootstrap_security().await.unwrap();
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|db| db.name == "streamdb")
+            .unwrap();
+        let schema_meta = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|schema| schema.name == "public")
+            .unwrap();
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|table| table.name == "orders")
+            .unwrap();
+        let stream = executor
+            .meta()
+            .get_stream_by_name(db_meta.id, schema_meta.id, "orders_stream")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stream_only_role = executor
+            .meta()
+            .create_role(nova_common::RoleMeta {
+                id: 0,
+                name: "stream_only_reader".to_string(),
+                owner_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                system: false,
+                created_at: nova_common::now_micros(),
+                created_by_user_id: nova_common::ROOT_USER_ID,
+                comment: None,
+            })
+            .await
+            .unwrap();
+        let source_only_role = executor
+            .meta()
+            .create_role(nova_common::RoleMeta {
+                id: 0,
+                name: "source_only_reader".to_string(),
+                owner_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                system: false,
+                created_at: nova_common::now_micros(),
+                created_by_user_id: nova_common::ROOT_USER_ID,
+                comment: None,
+            })
+            .await
+            .unwrap();
+        let full_reader_role = executor
+            .meta()
+            .create_role(nova_common::RoleMeta {
+                id: 0,
+                name: "full_stream_reader".to_string(),
+                owner_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                system: false,
+                created_at: nova_common::now_micros(),
+                created_by_user_id: nova_common::ROOT_USER_ID,
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        for role_id in [stream_only_role, source_only_role, full_reader_role] {
+            for object in [
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+            ] {
+                executor
+                    .meta()
+                    .grant_privileges(nova_common::GrantSetMeta {
+                        role_id,
+                        object,
+                        privileges: nova_common::PrivilegeSet::from_privileges(&[
+                            nova_common::SecurityPrivilege::Usage,
+                        ]),
+                        grant_options: nova_common::PrivilegeSet::empty(),
+                        granted_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                        updated_at: nova_common::now_micros(),
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        for (role_id, object) in [
+            (
+                stream_only_role,
+                nova_common::ObjectRef::new(nova_common::ObjectType::Stream, stream.stream_id),
+            ),
+            (
+                source_only_role,
+                nova_common::ObjectRef::new(nova_common::ObjectType::Table, table_meta.id),
+            ),
+            (
+                full_reader_role,
+                nova_common::ObjectRef::new(nova_common::ObjectType::Stream, stream.stream_id),
+            ),
+            (
+                full_reader_role,
+                nova_common::ObjectRef::new(nova_common::ObjectType::Table, table_meta.id),
+            ),
+        ] {
+            executor
+                .meta()
+                .grant_privileges(nova_common::GrantSetMeta {
+                    role_id,
+                    object,
+                    privileges: nova_common::PrivilegeSet::from_privileges(&[
+                        nova_common::SecurityPrivilege::Select,
+                    ]),
+                    grant_options: nova_common::PrivilegeSet::empty(),
+                    granted_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                    updated_at: nova_common::now_micros(),
+                })
+                .await
+                .unwrap();
+        }
+
+        for (role_id, username) in [
+            (stream_only_role, "stream_only"),
+            (source_only_role, "source_only"),
+        ] {
+            let security = nova_common::SecurityContext {
+                user_id: nova_common::ROOT_USER_ID + role_id,
+                username: username.to_string(),
+                primary_role_id: role_id,
+                secondary_role_ids: vec![],
+                secondary_all: true,
+            };
+            let read_err = exec_sql_as(
+                &executor,
+                "SELECT * FROM orders_stream",
+                "streamdb",
+                &security,
+            )
+            .await
+            .expect_err("stream read must require both stream and source SELECT");
+            assert!(matches!(
+                read_err,
+                nova_common::NovaError::PermissionDenied { .. }
+            ));
+            let has_data_err = exec_sql_as(
+                &executor,
+                "SELECT SYSTEM$STREAM_HAS_DATA('orders_stream')",
+                "streamdb",
+                &security,
+            )
+            .await
+            .expect_err("has-data must require both stream and source SELECT");
+            assert!(matches!(
+                has_data_err,
+                nova_common::NovaError::PermissionDenied { .. }
+            ));
+        }
+
+        let full_reader = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + full_reader_role,
+            username: "full_reader".to_string(),
+            primary_role_id: full_reader_role,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+        let has_data = exec_sql_as(
+            &executor,
+            "SELECT SYSTEM$STREAM_HAS_DATA('orders_stream')",
+            "streamdb",
+            &full_reader,
+        )
+        .await
+        .unwrap();
+        match has_data {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec!["true".to_string()]])
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let read = exec_sql_as(
+            &executor,
+            "SELECT * FROM orders_stream",
+            "streamdb",
+            &full_reader,
+        )
+        .await
+        .unwrap();
+        match read {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_insert_writes_change_record_metadata_and_payload() {
+        let (executor, dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE TABLE orders (id INT, status TEXT)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM orders_stream ON TABLE orders",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "INSERT INTO orders VALUES (1, 'new'), (2, 'new')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|db| db.name == "streamdb")
+            .unwrap();
+        let schema_meta = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|schema| schema.name == "public")
+            .unwrap();
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|table| table.name == "orders")
+            .unwrap();
+        let stream = executor
+            .meta()
+            .get_stream_by_name(db_meta.id, schema_meta.id, "orders_stream")
+            .await
+            .unwrap()
+            .unwrap();
+        let offset = executor
+            .meta()
+            .get_stream_offset(stream.stream_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(offset.committed_sequence, 0);
+
+        let current_sequence = executor
+            .meta()
+            .get_table_change_sequence(table_meta.id)
+            .await
+            .unwrap();
+        assert_eq!(current_sequence, 2);
+        let records = executor
+            .meta()
+            .get_change_records(table_meta.id, 0, current_sequence)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].action_counts.inserts, 2);
+        assert_eq!(records[0].action_counts.deletes, 0);
+        assert_eq!(records[0].payload.row_count, 2);
+
+        let store = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(dir.path().join("data")).unwrap(),
+        ) as Arc<dyn object_store::ObjectStore>;
+        let reader = CdcPayloadReader::new(store);
+        let batches = reader.read_payload(&records[0].payload).await.unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].schema().field(2).name(), "METADATA$ACTION");
+        let actions = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(actions.value(0), "INSERT");
+        assert_eq!(actions.value(1), "INSERT");
+    }
+
+    #[tokio::test]
+    async fn stream_update_delete_write_change_record_metadata_and_payloads() {
+        let (executor, dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE TABLE orders (id INT, status TEXT)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM orders_stream ON TABLE orders",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "INSERT INTO orders VALUES (1, 'new'), (2, 'new'), (3, 'new')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "UPDATE orders SET status = 'paid' WHERE id = 2",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(&executor, "DELETE FROM orders WHERE id = 3", "streamdb")
+            .await
+            .unwrap();
+
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|db| db.name == "streamdb")
+            .unwrap();
+        let schema_meta = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|schema| schema.name == "public")
+            .unwrap();
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|table| table.name == "orders")
+            .unwrap();
+        let current_sequence = executor
+            .meta()
+            .get_table_change_sequence(table_meta.id)
+            .await
+            .unwrap();
+        assert_eq!(current_sequence, 6);
+        let records = executor
+            .meta()
+            .get_change_records(table_meta.id, 0, current_sequence)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action_counts.inserts == 3)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action_counts.update_pairs == 1)
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.action_counts.deletes == 1
+                    && record.action_counts.update_pairs == 0)
+        );
+
+        let store = Arc::new(
+            object_store::local::LocalFileSystem::new_with_prefix(dir.path().join("data")).unwrap(),
+        ) as Arc<dyn object_store::ObjectStore>;
+        let reader = CdcPayloadReader::new(store);
+        let mut action_update_pairs = Vec::new();
+        for record in records {
+            for batch in reader.read_payload(&record.payload).await.unwrap() {
+                let actions = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .unwrap();
+                let is_updates = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap();
+                for row_idx in 0..batch.num_rows() {
+                    action_update_pairs.push((
+                        actions.value(row_idx).to_string(),
+                        is_updates.value(row_idx),
+                    ));
+                }
+            }
+        }
+        assert!(action_update_pairs.contains(&("INSERT".to_string(), false)));
+        assert!(action_update_pairs.contains(&("DELETE".to_string(), false)));
+        assert!(action_update_pairs.contains(&("DELETE".to_string(), true)));
+        assert!(action_update_pairs.contains(&("INSERT".to_string(), true)));
+    }
+
+    #[tokio::test]
+    async fn select_stream_consumes_once_and_preview_does_not_commit() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE events (id INT)", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM events_stream ON TABLE events",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "INSERT INTO events VALUES (1), (2), (3)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        let preview_1 = exec_sql(
+            &executor,
+            "SELECT * FROM events_stream WITH (COMMIT = FALSE)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let preview_2 = exec_sql(
+            &executor,
+            "SELECT * FROM events_stream WITH (COMMIT = FALSE)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let rows_1 = match preview_1 {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        let rows_2 = match preview_2 {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(rows_1.len(), 3);
+        assert_eq!(rows_2.len(), 3);
+
+        let consumed = exec_sql(&executor, "SELECT * FROM events_stream", "streamdb")
+            .await
+            .unwrap();
+        let consumed_rows = match consumed {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(consumed_rows.len(), 3);
+
+        let empty = exec_sql(&executor, "SELECT * FROM events_stream", "streamdb")
+            .await
+            .unwrap();
+        let empty_rows = match empty {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert!(empty_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mysql_engine_does_not_cache_consuming_stream_selects() {
+        let (engine, _dir) = setup_engine();
+        let security = nova_common::SecurityContext::root();
+        engine
+            .execute_sql("CREATE DATABASE streamcachedb", "streamcachedb", &security)
+            .await
+            .unwrap();
+        engine
+            .execute_sql("CREATE TABLE events (id INT)", "streamcachedb", &security)
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "CREATE STREAM events_stream ON TABLE events",
+                "streamcachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "INSERT INTO events VALUES (1), (2)",
+                "streamcachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+
+        let first = engine
+            .execute_sql("SELECT * FROM events_stream", "streamcachedb", &security)
+            .await
+            .unwrap();
+        let first_rows = match first {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(first_rows.len(), 2);
+
+        let second = engine
+            .execute_sql("SELECT * FROM events_stream", "streamcachedb", &security)
+            .await
+            .unwrap();
+        let second_rows = match second {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert!(second_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mysql_engine_does_not_cache_stream_has_data() {
+        let (engine, _dir) = setup_engine();
+        let security = nova_common::SecurityContext::root();
+        engine
+            .execute_sql(
+                "CREATE DATABASE streamhascachedb",
+                "streamhascachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "CREATE TABLE events (id INT)",
+                "streamhascachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute_sql(
+                "CREATE STREAM events_stream ON TABLE events",
+                "streamhascachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+
+        let initial = engine
+            .execute_sql(
+                "SELECT SYSTEM$STREAM_HAS_DATA('events_stream')",
+                "streamhascachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+        let initial_rows = match initial {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(initial_rows, vec![vec!["false".to_string()]]);
+
+        engine
+            .execute_sql(
+                "INSERT INTO events VALUES (1)",
+                "streamhascachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+        let after_insert = engine
+            .execute_sql(
+                "SELECT SYSTEM$STREAM_HAS_DATA('events_stream')",
+                "streamhascachedb",
+                &security,
+            )
+            .await
+            .unwrap();
+        let after_insert_rows = match after_insert {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(after_insert_rows, vec![vec!["true".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn consuming_stream_does_not_advance_over_unpublished_sequence_gap() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE events (id INT)", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM events_stream ON TABLE events",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|db| db.name == "streamdb")
+            .unwrap();
+        let schema_meta = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|schema| schema.name == "public")
+            .unwrap();
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|table| table.name == "events")
+            .unwrap();
+        let stream = executor
+            .meta()
+            .get_stream_by_name(db_meta.id, schema_meta.id, "events_stream")
+            .await
+            .unwrap()
+            .unwrap();
+
+        executor
+            .meta()
+            .allocate_table_change_sequences(table_meta.id, 3)
+            .await
+            .unwrap();
+
+        let result = exec_sql(&executor, "SELECT * FROM events_stream", "streamdb")
+            .await
+            .unwrap();
+        match result {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => {
+                assert!(rows.is_empty());
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        let offset = executor
+            .meta()
+            .get_stream_offset(stream.stream_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(offset.committed_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn system_stream_has_data_tracks_preview_and_consume_offsets() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE events (id INT)", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM events_stream ON TABLE events",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        let initial = exec_sql(
+            &executor,
+            "SELECT SYSTEM$STREAM_HAS_DATA('events_stream')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let initial_rows = match initial {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(initial_rows, vec![vec!["false".to_string()]]);
+
+        exec_sql(&executor, "INSERT INTO events VALUES (1)", "streamdb")
+            .await
+            .unwrap();
+        let after_insert = exec_sql(
+            &executor,
+            "SELECT SYSTEM$STREAM_HAS_DATA('events_stream')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let after_insert_rows = match after_insert {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(after_insert_rows, vec![vec!["true".to_string()]]);
+
+        exec_sql(
+            &executor,
+            "SELECT * FROM events_stream WITH (COMMIT = FALSE)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let after_preview = exec_sql(
+            &executor,
+            "SELECT SYSTEM$STREAM_HAS_DATA('events_stream')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let after_preview_rows = match after_preview {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(after_preview_rows, vec![vec!["true".to_string()]]);
+
+        exec_sql(&executor, "SELECT * FROM events_stream", "streamdb")
+            .await
+            .unwrap();
+        let after_consume = exec_sql(
+            &executor,
+            "SELECT SYSTEM$STREAM_HAS_DATA('events_stream')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let after_consume_rows = match after_consume {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(after_consume_rows, vec![vec!["false".to_string()]]);
+    }
+
+    #[tokio::test]
+    async fn preview_stream_select_preserves_projection_filter_and_limit() {
+        let (executor, _dir) = setup();
+        exec_sql(
+            &executor,
+            "CREATE DATABASE streampreviewdb",
+            "streampreviewdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(&executor, "CREATE TABLE events (id INT)", "streampreviewdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM events_stream ON TABLE events",
+            "streampreviewdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "INSERT INTO events VALUES (1), (2), (3)",
+            "streampreviewdb",
+        )
+        .await
+        .unwrap();
+
+        let preview = exec_sql(
+            &executor,
+            "SELECT id FROM events_stream WITH (COMMIT = FALSE) WHERE id >= 2 LIMIT 1",
+            "streampreviewdb",
+        )
+        .await
+        .unwrap();
+        let (columns, rows) = match preview {
+            nova_coordinator::executor::QueryResult::Rows { columns, rows } => (columns, rows),
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(columns, vec!["id".to_string()]);
+        assert_eq!(rows, vec![vec!["2".to_string()]]);
+
+        let consume = exec_sql(&executor, "SELECT * FROM events_stream", "streampreviewdb")
+            .await
+            .unwrap();
+        let consume_rows = match consume {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(consume_rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn filtered_stream_select_commits_entire_backlog() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE events (id INT)", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM events_stream ON TABLE events",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "INSERT INTO events VALUES (1), (2), (3)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        let filtered = exec_sql(
+            &executor,
+            "SELECT * FROM events_stream WHERE id = 2 LIMIT 1",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        let filtered_rows = match filtered {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(filtered_rows.len(), 1);
+        assert_eq!(filtered_rows[0][0], "2");
+
+        let empty = exec_sql(&executor, "SELECT * FROM events_stream", "streamdb")
+            .await
+            .unwrap();
+        let empty_rows = match empty {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert!(empty_rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_captures_insert_update_delete_with_snowflake_metadata() {
+        let (executor, _dir) = setup();
+        exec_sql(&executor, "CREATE DATABASE streamdb", "streamdb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE TABLE orders (id INT, status TEXT)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE STREAM orders_stream ON TABLE orders",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+
+        exec_sql(
+            &executor,
+            "INSERT INTO orders VALUES (1, 'new'), (2, 'new'), (3, 'new')",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(
+            &executor,
+            "UPDATE orders SET status = 'paid' WHERE id = 2",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        exec_sql(&executor, "DELETE FROM orders WHERE id = 3", "streamdb")
+            .await
+            .unwrap();
+
+        let preview = exec_sql(
+            &executor,
+            "SELECT * FROM orders_stream WITH (COMMIT = FALSE)",
+            "streamdb",
+        )
+        .await
+        .unwrap();
+        match preview {
+            nova_coordinator::executor::QueryResult::Rows { columns, rows } => {
+                assert!(columns.contains(&"METADATA$ACTION".to_string()));
+                assert!(columns.contains(&"METADATA$ISUPDATE".to_string()));
+                assert!(
+                    rows.iter()
+                        .any(|row| row.iter().any(|cell| cell == "INSERT"))
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row.iter().any(|cell| cell == "DELETE"))
+                );
+                assert!(rows.iter().any(|row| row.iter().any(|cell| cell == "true")));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
     }
 
     #[tokio::test]

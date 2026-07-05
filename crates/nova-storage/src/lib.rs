@@ -2,12 +2,14 @@
 
 pub mod backup;
 pub mod cache;
+pub mod cdc;
 pub mod metadata;
 pub mod mp_reader;
 pub mod mp_writer;
 
 // Re-exports
 pub use cache::NovaCache;
+pub use cdc::{CdcPayloadReader, CdcPayloadWriter, cdc_payload_path};
 pub use mp_reader::MpReader;
 pub use mp_writer::MpWriter;
 

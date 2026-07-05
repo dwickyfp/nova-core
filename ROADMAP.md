@@ -245,14 +245,16 @@
 
 ### Milestone 3.5: Streams (CDC)
 
-- [ ] Implement `CREATE STREAM ... ON TABLE ...` SQL syntax
-- [ ] Implement stream offset tracking in FDB
-- [ ] Implement stream read: find MPs after offset, diff versions
-- [ ] Implement change record format (INSERT, UPDATE_BEFORE, UPDATE_AFTER, DELETE)
-- [ ] Implement offset advance on consume
-- [ ] Support: standard (delta) streams
-- [ ] Support: append-only streams
-- [ ] Integration tests: insert, update, delete → verify stream records
+- [x] Implement `CREATE STREAM ... ON TABLE ...` SQL syntax
+- [x] Implement stream offset tracking in FDB
+- [x] Implement durable CDC change-log metadata in FDB and Parquet payloads in object storage
+- [x] Implement consuming stream `SELECT` with compare-and-set offset commit
+- [x] Implement preview reads with `WITH (COMMIT = FALSE)`
+- [x] Implement Snowflake-compatible `SYSTEM$STREAM_HAS_DATA('<stream>')`
+- [x] Implement change record format (`INSERT`, `DELETE`; UPDATE as DELETE+INSERT with `METADATA$ISUPDATE = true`)
+- [x] Support: standard (delta) streams
+- [x] Integration tests: insert, update, delete → verify stream records, metadata columns, RBAC, preview, consume offsets
+- [x] Reject append-only stream syntax; Nova supports standard delta streams only
 
 ### Milestone 3.6: Garbage Collection
 

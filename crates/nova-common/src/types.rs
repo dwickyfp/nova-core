@@ -390,41 +390,97 @@ pub struct TransactionMeta {
     pub affected_tables: Vec<TableId>,
 }
 
-// ── Stream ──
+// ── Stream / CDC ──
 
-/// Stream metadata.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum StreamReadMode {
+    #[default]
+    Commit,
+    Preview,
+}
+
+/// Stream metadata stored in FoundationDB.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamMeta {
     pub stream_id: StreamId,
-    pub table_id: TableId,
+    pub db_id: DatabaseId,
+    pub schema_id: SchemaId,
+    pub source_table_id: TableId,
     pub name: String,
-    pub append_only: bool,
     pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub owner_role_id: RoleId,
+    pub comment: Option<String>,
+    pub stale_after: Option<Timestamp>,
+    pub dropped: bool,
 }
 
-/// Stream offset (last consumed position).
+/// Stream offset cursor for Kafka-like consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamOffset {
-    pub last_consumed_ts: Timestamp,
-    pub last_consumed_mp: Option<MpId>,
+    pub table_id: TableId,
+    pub committed_sequence: u64,
+    pub committed_ts: Timestamp,
+    pub last_consumed_at: Option<Timestamp>,
+    pub last_consumed_txn_id: Option<TxnId>,
 }
 
-/// Change record (for CDC).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ChangeActionCounts {
+    pub inserts: u64,
+    pub deletes: u64,
+    pub update_pairs: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChangeRecord {
-    pub action: ChangeAction,
-    pub row_data: Vec<u8>,
-    pub mp_id: MpId,
-    pub txn_id: TxnId,
+pub struct ChangePayloadRef {
+    pub path: String,
+    pub row_start: u64,
+    pub row_count: u64,
 }
 
-/// CDC action type.
+/// Ordered metadata for a CDC payload range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangeRecordMeta {
+    pub table_id: TableId,
+    pub sequence: u64,
+    pub txn_id: TxnId,
+    pub commit_ts: Timestamp,
+    pub payload: ChangePayloadRef,
+    pub action_counts: ChangeActionCounts,
+    pub min_row_id: Option<String>,
+    pub max_row_id: Option<String>,
+}
+
+/// Row-level CDC action type.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChangeAction {
     Insert,
-    UpdateBefore,
-    UpdateAfter,
     Delete,
+}
+
+impl std::fmt::Display for ChangeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChangeAction::Insert => write!(f, "INSERT"),
+            ChangeAction::Delete => write!(f, "DELETE"),
+        }
+    }
+}
+
+/// Lightweight row pointer used by coordinator CDC construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdcRowRef {
+    pub action: ChangeAction,
+    pub is_update: bool,
+    pub row_id: String,
+    pub sequence: u64,
+    pub txn_id: TxnId,
+    pub commit_ts: Timestamp,
+}
+
+pub fn stream_row_id(table_id: TableId, mp_id: MpId, row_ordinal: u64, generation: u64) -> String {
+    format!("{table_id}:{mp_id}:{row_ordinal}:{generation}")
 }
 
 // ── Clone ──
@@ -621,4 +677,20 @@ pub fn now_micros() -> Timestamp {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+
+    #[test]
+    fn stream_row_id_is_stable_and_parseable_text() {
+        let row_id = stream_row_id(10, 20, 3, 1);
+        assert_eq!(row_id, "10:20:3:1");
+    }
+
+    #[test]
+    fn stream_read_mode_defaults_to_commit() {
+        assert_eq!(StreamReadMode::default(), StreamReadMode::Commit);
+    }
 }

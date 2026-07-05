@@ -352,16 +352,28 @@ SELECT COUNT(*) FROM users_backup;  -- reduced
 
 ### Streams (CDC)
 
-Capture inserts into a table as a change stream.
+Capture table changes as a Snowflake-style CDC stream. Streams start at the table's current change sequence, so rows that existed before `CREATE STREAM` are not emitted.
 
 ```sql
--- Create a stream on the orders table (append-only mode)
-CREATE STREAM orders_stream FROM orders (APPEND_ONLY);
+-- Create a standard CDC stream on the orders table
+CREATE STREAM orders_stream ON TABLE orders;
 
--- After inserts, query the stream for new rows
+-- DML writes durable CDC payloads in object storage plus offsets in FoundationDB
 INSERT INTO orders VALUES (2000, 1, 999.99, 'new');
--- ponytail: stream consumption API (CONSUME FROM stream) is future work
+UPDATE orders SET status = 'paid' WHERE order_id = 2000;
+DELETE FROM orders WHERE order_id = 2000;
+
+-- Preview without advancing the stream offset
+SELECT * FROM orders_stream WITH (COMMIT = FALSE);
+
+-- Default SELECT consumes and commits the full backlog after successful execution
+SELECT * FROM orders_stream;
+
+-- Check if a stream has unconsumed changes
+SELECT SYSTEM$STREAM_HAS_DATA('orders_stream');
 ```
+
+Stream rows include source columns plus metadata columns: `METADATA$ACTION`, `METADATA$ISUPDATE`, `METADATA$ROW_ID`, `METADATA$TXN_ID`, `METADATA$COMMIT_TS`, and `METADATA$SEQUENCE`. UPDATE emits a `DELETE` row for the old version and an `INSERT` row for the new version, both with `METADATA$ISUPDATE = true`. Filter/projection/LIMIT can reduce returned rows, but a consuming `SELECT` still commits the full unconsumed backlog.
 
 ### Garbage Collection & Auto Compaction
 

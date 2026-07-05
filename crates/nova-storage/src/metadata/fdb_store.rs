@@ -141,6 +141,17 @@ impl FdbMetadataStore {
         bincode::deserialize(bytes).map_err(|e| NovaError::MetadataSerialization { source: e })
     }
 
+    pub(crate) fn read_u64(bytes: &[u8]) -> Result<u64> {
+        let arr: [u8; 8] = bytes.try_into().map_err(|_| NovaError::Internal {
+            message: "invalid u64 metadata value".to_string(),
+        })?;
+        Ok(u64::from_be_bytes(arr))
+    }
+
+    pub(crate) fn u64_bytes(value: u64) -> Vec<u8> {
+        value.to_be_bytes().to_vec()
+    }
+
     /// Get prefix range for a subspace category.
     pub(crate) fn category_range(&self, prefix: &impl TuplePack) -> (Vec<u8>, Vec<u8>) {
         let packed = self.subspace.pack(prefix);
@@ -742,10 +753,41 @@ impl MetadataStore for FdbMetadataStore {
     //  STREAM OPERATIONS
     // ══════════════════════════════════════════════════════════════
 
-    async fn create_stream(&self, stream: StreamMeta) -> Result<()> {
-        let key = self.pack(&("stream", stream.stream_id));
-        let val = Self::serialize(&stream)?;
-        self.fdb_set(key, val).await
+    async fn create_stream(&self, mut stream: StreamMeta) -> Result<()> {
+        if stream.stream_id == 0 {
+            let key = self.pack(&("next_id", "stream"));
+            stream.stream_id = self.fdb_atomic_inc(key).await?;
+        }
+
+        let stream_key = self.pack(&("stream", stream.stream_id));
+        let name_key = self.pack(&(
+            "stream_by_name",
+            stream.db_id,
+            stream.schema_id,
+            normalize_ident(&stream.name),
+        ));
+        let table_key = self.pack(&("streams_by_table", stream.source_table_id, stream.stream_id));
+        let stream_id_bytes = Self::u64_bytes(stream.stream_id);
+        self.fdb_checked_write_batch(
+            vec![stream_key.clone(), name_key.clone()],
+            vec![
+                (stream_key, Self::serialize(&stream)?),
+                (name_key, stream_id_bytes),
+                (table_key, Vec::new()),
+            ],
+            vec![],
+            false,
+        )
+        .await
+        .map_err(|err| match err {
+            NovaError::Internal { message } if message.contains("checked write") => {
+                NovaError::StreamAlreadyExists {
+                    stream_name: stream.name.clone(),
+                }
+            }
+            other => other,
+        })?;
+        Ok(())
     }
 
     async fn get_stream(&self, stream_id: StreamId) -> Result<Option<StreamMeta>> {
@@ -754,6 +796,57 @@ impl MetadataStore for FdbMetadataStore {
             Some(bytes) => Ok(Some(Self::deserialize(&bytes)?)),
             None => Ok(None),
         }
+    }
+
+    async fn get_stream_by_name(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+        name: &str,
+    ) -> Result<Option<StreamMeta>> {
+        let key = self.pack(&("stream_by_name", db_id, schema_id, normalize_ident(name)));
+        match self.fdb_get(key).await? {
+            Some(bytes) => self.get_stream(Self::read_u64(&bytes)?).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn list_streams(
+        &self,
+        db_id: DatabaseId,
+        schema_id: SchemaId,
+    ) -> Result<Vec<StreamMeta>> {
+        let (start, end) = self.category_range(&("stream_by_name", db_id, schema_id));
+        let mut streams = Vec::new();
+        for (_, value) in self.fdb_get_range(start, end).await? {
+            if let Some(stream) = self.get_stream(Self::read_u64(&value)?).await? {
+                streams.push(stream);
+            }
+        }
+        streams.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(streams)
+    }
+
+    async fn drop_stream(&self, stream_id: StreamId) -> Result<()> {
+        let Some(stream) = self.get_stream(stream_id).await? else {
+            return Ok(());
+        };
+        let stream_key = self.pack(&("stream", stream_id));
+        let offset_key = self.pack(&("stream_offset", stream_id));
+        let name_key = self.pack(&(
+            "stream_by_name",
+            stream.db_id,
+            stream.schema_id,
+            normalize_ident(&stream.name),
+        ));
+        let table_key = self.pack(&("streams_by_table", stream.source_table_id, stream_id));
+        self.fdb_write_batch(
+            vec![],
+            vec![stream_key, offset_key, name_key, table_key],
+            false,
+        )
+        .await?;
+        Ok(())
     }
 
     async fn get_stream_offset(&self, stream_id: StreamId) -> Result<Option<StreamOffset>> {
@@ -768,6 +861,306 @@ impl MetadataStore for FdbMetadataStore {
         let key = self.pack(&("stream_offset", stream_id));
         let val = Self::serialize(&offset)?;
         self.fdb_set(key, val).await
+    }
+
+    async fn compare_and_set_stream_offset(
+        &self,
+        stream_id: StreamId,
+        expected_sequence: u64,
+        new_offset: StreamOffset,
+    ) -> Result<()> {
+        let key = self.pack(&("stream_offset", stream_id));
+        let value = Self::serialize(&new_offset)?;
+        self.db
+            .run(|trx, _| {
+                let key = key.clone();
+                let value = value.clone();
+                async move {
+                    let current = trx
+                        .get(&key, false)
+                        .await
+                        .map_err(fdb::FdbBindingError::from)?;
+                    let Some(bytes) = current else {
+                        return Err(fdb::FdbBindingError::CustomError(Box::new(
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "stream offset missing",
+                            ),
+                        )));
+                    };
+                    let offset: StreamOffset =
+                        bincode::deserialize(bytes.as_ref()).map_err(|e| {
+                            fdb::FdbBindingError::CustomError(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                e.to_string(),
+                            )))
+                        })?;
+                    if offset.committed_sequence != expected_sequence {
+                        return Err(fdb::FdbBindingError::CustomError(Box::new(
+                            std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "stream offset conflict",
+                            ),
+                        )));
+                    }
+                    trx.set(&key, &value);
+                    Ok::<(), fdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .map_err(|_| NovaError::StreamConcurrentConsume { stream_id })
+    }
+
+    async fn get_table_change_sequence(&self, table_id: TableId) -> Result<u64> {
+        let key = self.pack(&("table_change_seq", table_id));
+        match self.fdb_get(key).await? {
+            Some(bytes) => Self::read_u64(&bytes),
+            None => Ok(0),
+        }
+    }
+
+    async fn allocate_table_change_sequences(&self, table_id: TableId, count: u64) -> Result<u64> {
+        let next_key = self.pack(&("table_change_next_seq", table_id));
+        let published_key = self.pack(&("table_change_seq", table_id));
+        self.db
+            .run(|trx, _| {
+                let next_key = next_key.clone();
+                let published_key = published_key.clone();
+                async move {
+                    let next_value = trx
+                        .get(&next_key, false)
+                        .await
+                        .map_err(fdb::FdbBindingError::from)?;
+                    let current_allocated = match next_value {
+                        Some(bytes) => {
+                            let arr: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
+                                fdb::FdbBindingError::CustomError(Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "invalid table change allocation sequence",
+                                )))
+                            })?;
+                            u64::from_be_bytes(arr)
+                        }
+                        None => {
+                            let published = trx
+                                .get(&published_key, false)
+                                .await
+                                .map_err(fdb::FdbBindingError::from)?;
+                            match published {
+                                Some(bytes) => {
+                                    let arr: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
+                                        fdb::FdbBindingError::CustomError(Box::new(
+                                            std::io::Error::new(
+                                                std::io::ErrorKind::InvalidData,
+                                                "invalid table change sequence",
+                                            ),
+                                        ))
+                                    })?;
+                                    u64::from_be_bytes(arr)
+                                }
+                                None => 0,
+                            }
+                        }
+                    };
+                    let first = current_allocated + 1;
+                    let new_allocated = current_allocated.saturating_add(count);
+                    trx.set(&next_key, &new_allocated.to_be_bytes()[..]);
+                    Ok::<u64, fdb::FdbBindingError>(first)
+                }
+            })
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("allocate table change sequence failed: {e}"),
+            })
+    }
+
+    async fn commit_table_cdc(
+        &self,
+        txn_id: TxnId,
+        new_mps: Vec<MicroPartitionMeta>,
+        superseded_mps: Vec<(MpId, MpId)>,
+        records: Vec<ChangeRecordMeta>,
+    ) -> Result<()> {
+        let mp_sets = new_mps
+            .into_iter()
+            .map(|mp| {
+                let mp_key = self.pack(&("mp", mp.mp_id));
+                let idx_key = self.pack(&("table_mps", mp.table_id, mp.mp_id));
+                Ok((mp_key, idx_key, Self::serialize(&mp)?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let superseded_sets = superseded_mps
+            .into_iter()
+            .map(|(old_mp_id, new_mp_id)| (self.pack(&("mp", old_mp_id)), new_mp_id))
+            .collect::<Vec<_>>();
+        let mut record_sets = Vec::with_capacity(records.len() * 2);
+        let mut table_ranges: std::collections::BTreeMap<TableId, Vec<(u64, u64)>> =
+            std::collections::BTreeMap::new();
+        for record in records {
+            let row_count = record.payload.row_count;
+            let record_end = record.sequence.saturating_add(row_count).saturating_sub(1);
+            table_ranges
+                .entry(record.table_id)
+                .or_default()
+                .push((record.sequence, record_end));
+            let log_key = self.pack(&("table_change_log", record.table_id, record.sequence));
+            let txn_key = self.pack(&(
+                "table_change_log_by_txn",
+                record.txn_id,
+                record.table_id,
+                record.sequence,
+            ));
+            record_sets.push((log_key, Self::serialize(&record)?));
+            record_sets.push((txn_key, Vec::new()));
+        }
+        let table_ranges = table_ranges
+            .into_iter()
+            .map(|(table_id, mut ranges)| {
+                ranges.sort_unstable_by_key(|(start, _)| *start);
+                (self.pack(&("table_change_seq", table_id)), ranges)
+            })
+            .collect::<Vec<_>>();
+        let txn_key = (txn_id != 0).then(|| self.pack(&("txn", txn_id)));
+        self.db
+            .run(|trx, _| {
+                let mp_sets = mp_sets.clone();
+                let superseded_sets = superseded_sets.clone();
+                let record_sets = record_sets.clone();
+                let table_ranges = table_ranges.clone();
+                let txn_key = txn_key.clone();
+                async move {
+                    for (mp_key, idx_key, value) in &mp_sets {
+                        trx.set(mp_key, value);
+                        trx.set(idx_key, b"");
+                    }
+                    for (old_mp_key, new_mp_id) in &superseded_sets {
+                        let old_value = trx
+                            .get(old_mp_key, false)
+                            .await
+                            .map_err(fdb::FdbBindingError::from)?
+                            .ok_or_else(|| {
+                                fdb::FdbBindingError::CustomError(Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "micro-partition not found while committing CDC",
+                                )))
+                            })?;
+                        let mut old_mp: MicroPartitionMeta =
+                            bincode::deserialize(old_value.as_ref())
+                                .map_err(|err| fdb::FdbBindingError::CustomError(Box::new(err)))?;
+                        old_mp.superseded_by = Some(*new_mp_id);
+                        old_mp.active = false;
+                        let old_mp_value = bincode::serialize(&old_mp)
+                            .map_err(|err| fdb::FdbBindingError::CustomError(Box::new(err)))?;
+                        trx.set(old_mp_key, &old_mp_value);
+                    }
+                    for (key, value) in &record_sets {
+                        trx.set(key, value);
+                    }
+                    for (published_key, ranges) in &table_ranges {
+                        let current = trx
+                            .get(published_key, false)
+                            .await
+                            .map_err(fdb::FdbBindingError::from)?;
+                        let current = match current {
+                            Some(bytes) => {
+                                let arr: [u8; 8] = bytes.as_ref().try_into().map_err(|_| {
+                                    fdb::FdbBindingError::CustomError(Box::new(
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "invalid table change sequence",
+                                        ),
+                                    ))
+                                })?;
+                                u64::from_be_bytes(arr)
+                            }
+                            None => 0,
+                        };
+                        let mut next_sequence = current.saturating_add(1);
+                        let mut published_through = current;
+                        for (record_start, record_end) in ranges {
+                            if *record_end < next_sequence {
+                                continue;
+                            }
+                            if *record_start > next_sequence {
+                                break;
+                            }
+                            published_through = *record_end;
+                            next_sequence = record_end.saturating_add(1);
+                        }
+                        if published_through > current {
+                            trx.set(published_key, &published_through.to_be_bytes()[..]);
+                        }
+                    }
+                    if let Some(txn_key) = &txn_key {
+                        let txn_value = trx
+                            .get(txn_key, false)
+                            .await
+                            .map_err(fdb::FdbBindingError::from)?
+                            .ok_or_else(|| {
+                                fdb::FdbBindingError::CustomError(Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "transaction not found while committing CDC",
+                                )))
+                            })?;
+                        let mut txn_meta: TransactionMeta =
+                            bincode::deserialize(txn_value.as_ref())
+                                .map_err(|err| fdb::FdbBindingError::CustomError(Box::new(err)))?;
+                        txn_meta.status = TxnStatus::Committed;
+                        txn_meta.commit_ts = Some(now_micros());
+                        let txn_value = bincode::serialize(&txn_meta)
+                            .map_err(|err| fdb::FdbBindingError::CustomError(Box::new(err)))?;
+                        trx.set(txn_key, &txn_value);
+                    }
+                    Ok::<(), fdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("commit table CDC failed: {e}"),
+            })?;
+        Ok(())
+    }
+
+    async fn insert_change_records(&self, records: Vec<ChangeRecordMeta>) -> Result<()> {
+        self.commit_table_cdc(0, vec![], vec![], records).await
+    }
+
+    async fn get_change_records(
+        &self,
+        table_id: TableId,
+        after_sequence: u64,
+        through_sequence: u64,
+    ) -> Result<Vec<ChangeRecordMeta>> {
+        if through_sequence <= after_sequence {
+            return Ok(vec![]);
+        }
+        let start = self.pack(&("table_change_log", table_id, after_sequence + 1));
+        let end = self.pack(&("table_change_log", table_id, through_sequence + 1));
+        let mut records = Vec::new();
+        for (_, value) in self.fdb_get_range(start, end).await? {
+            records.push(Self::deserialize(&value)?);
+        }
+        records.sort_by_key(|record: &ChangeRecordMeta| record.sequence);
+        Ok(records)
+    }
+
+    async fn stream_has_data(&self, stream_id: StreamId) -> Result<bool> {
+        let stream =
+            self.get_stream(stream_id)
+                .await?
+                .ok_or_else(|| NovaError::StreamNotFound {
+                    stream_name: stream_id.to_string(),
+                })?;
+        let offset =
+            self.get_stream_offset(stream_id)
+                .await?
+                .ok_or_else(|| NovaError::StreamNotFound {
+                    stream_name: stream.name.clone(),
+                })?;
+        let current = self
+            .get_table_change_sequence(stream.source_table_id)
+            .await?;
+        Ok(current > offset.committed_sequence)
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -818,5 +1211,224 @@ impl MetadataStore for FdbMetadataStore {
 
     async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()> {
         self.fdb_clear(self.pack(&("dynamic_table", dt_id))).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn fdb_cluster_file() -> Option<String> {
+        std::env::var("NOVA_FDB_CLUSTER_FILE").ok()
+    }
+
+    fn test_subspace(name: &str) -> Vec<u8> {
+        format!("nova_test_{name}_{}", now_micros()).into_bytes()
+    }
+
+    fn database(name: &str) -> DatabaseMeta {
+        DatabaseMeta {
+            id: 0,
+            name: name.to_string(),
+            created_at: now_micros(),
+            owner: ROOT_USER_ID,
+        }
+    }
+
+    fn schema(db_id: DatabaseId, name: &str) -> SchemaMeta {
+        SchemaMeta {
+            id: 1,
+            db_id,
+            name: name.to_string(),
+            created_at: now_micros(),
+        }
+    }
+
+    fn table(db_id: DatabaseId, schema_id: SchemaId, name: &str) -> TableMeta {
+        TableMeta {
+            id: 0,
+            db_id,
+            schema_id,
+            name: name.to_string(),
+            columns: vec![],
+            created_at: now_micros(),
+            owner: ROOT_USER_ID,
+            comment: None,
+            version: 0,
+            properties: HashMap::new(),
+        }
+    }
+
+    fn mp(mp_id: MpId, table_id: TableId, txn_id: TxnId) -> MicroPartitionMeta {
+        MicroPartitionMeta {
+            mp_id,
+            table_id,
+            partition_id: None,
+            version: 1,
+            s3_path: format!("nova/tables/{table_id}/mp-{mp_id}.parquet"),
+            s3_temp_path: None,
+            row_count: 1,
+            byte_size: 1,
+            compression: Compression::Snappy,
+            column_stats: HashMap::new(),
+            commit_ts: now_micros(),
+            txn_id,
+            supersedes: None,
+            superseded_by: None,
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_table_cdc_atomically_publishes_mp_txn_and_stream_watermark() -> Result<()> {
+        let Some(cluster_file) = fdb_cluster_file() else {
+            return Ok(());
+        };
+        let subspace = test_subspace("commit_table_cdc");
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+
+        let txn_id = store.begin_transaction().await?;
+        let first_sequence = store.allocate_table_change_sequences(77_001, 1).await?;
+        assert_eq!(first_sequence, 1);
+
+        store
+            .commit_table_cdc(
+                txn_id,
+                vec![mp(55_001, 77_001, txn_id)],
+                vec![],
+                vec![ChangeRecordMeta {
+                    table_id: 77_001,
+                    sequence: first_sequence,
+                    txn_id,
+                    commit_ts: now_micros(),
+                    payload: ChangePayloadRef {
+                        path: "nova/cdc/tables/77001/txn-1/seq-1-1.parquet".to_string(),
+                        row_start: 0,
+                        row_count: 1,
+                    },
+                    action_counts: ChangeActionCounts {
+                        inserts: 1,
+                        deletes: 0,
+                        update_pairs: 0,
+                    },
+                    min_row_id: None,
+                    max_row_id: None,
+                }],
+            )
+            .await?;
+
+        assert!(store.get_mp(55_001).await?.is_some());
+        assert_eq!(store.get_table_change_sequence(77_001).await?, 1);
+        let txn = store.get_transaction(txn_id).await?.unwrap();
+        assert_eq!(txn.status, TxnStatus::Committed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_offset_cas_and_has_data_are_transactional() -> Result<()> {
+        let Some(cluster_file) = fdb_cluster_file() else {
+            return Ok(());
+        };
+        let subspace = test_subspace("stream_offset_cas");
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+
+        store.create_database(database("streamdb")).await?;
+        let db_id = store.list_databases().await?.into_iter().next().unwrap().id;
+        store.create_schema(schema(db_id, "public")).await?;
+        let schema_id = store
+            .list_schemas(db_id)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        let mut source = table(db_id, schema_id, "orders");
+        source.id = 88_001;
+        store.create_table(source).await?;
+
+        let stream = StreamMeta {
+            stream_id: 99_001,
+            db_id,
+            schema_id,
+            source_table_id: 88_001,
+            name: "orders_stream".to_string(),
+            created_at: now_micros(),
+            updated_at: now_micros(),
+            owner_role_id: ACCOUNTADMIN_ROLE_ID,
+            comment: None,
+            stale_after: None,
+            dropped: false,
+        };
+        store.create_stream(stream).await?;
+        store
+            .set_stream_offset(
+                99_001,
+                StreamOffset {
+                    table_id: 88_001,
+                    committed_sequence: 0,
+                    committed_ts: now_micros(),
+                    last_consumed_at: None,
+                    last_consumed_txn_id: None,
+                },
+            )
+            .await?;
+
+        let first_sequence = store.allocate_table_change_sequences(88_001, 2).await?;
+        assert_eq!(first_sequence, 1);
+        assert!(!store.stream_has_data(99_001).await?);
+        store
+            .insert_change_records(vec![ChangeRecordMeta {
+                table_id: 88_001,
+                sequence: first_sequence,
+                txn_id: 7,
+                commit_ts: now_micros(),
+                payload: ChangePayloadRef {
+                    path: "nova/cdc/tables/88001/txn-7/seq-1-2.parquet".to_string(),
+                    row_start: 0,
+                    row_count: 2,
+                },
+                action_counts: ChangeActionCounts {
+                    inserts: 2,
+                    deletes: 0,
+                    update_pairs: 0,
+                },
+                min_row_id: None,
+                max_row_id: None,
+            }])
+            .await?;
+        assert!(store.stream_has_data(99_001).await?);
+
+        store
+            .compare_and_set_stream_offset(
+                99_001,
+                0,
+                StreamOffset {
+                    table_id: 88_001,
+                    committed_sequence: 2,
+                    committed_ts: now_micros(),
+                    last_consumed_at: Some(now_micros()),
+                    last_consumed_txn_id: Some(7),
+                },
+            )
+            .await?;
+        assert!(!store.stream_has_data(99_001).await?);
+
+        let err = store
+            .compare_and_set_stream_offset(
+                99_001,
+                0,
+                StreamOffset {
+                    table_id: 88_001,
+                    committed_sequence: 3,
+                    committed_ts: now_micros(),
+                    last_consumed_at: Some(now_micros()),
+                    last_consumed_txn_id: Some(8),
+                },
+            )
+            .await
+            .expect_err("stale expected sequence must conflict");
+        assert!(matches!(err, NovaError::StreamConcurrentConsume { .. }));
+        Ok(())
     }
 }

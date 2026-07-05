@@ -26,6 +26,21 @@ impl SqlParser {
         if upper.starts_with("CREATE STREAM ") {
             return self.parse_stream(sql);
         }
+        if upper.starts_with("DROP STREAM ") {
+            return self.parse_drop_stream(sql);
+        }
+        if upper.starts_with("SHOW STREAMS") {
+            return self.parse_show_streams(sql);
+        }
+        if upper.starts_with("DESCRIBE STREAM ") || upper.starts_with("DESC STREAM ") {
+            return self.parse_describe_stream(sql);
+        }
+        if upper.starts_with("SELECT SYSTEM$STREAM_HAS_DATA") {
+            return self.parse_system_stream_has_data(sql);
+        }
+        if upper.starts_with("SELECT ") && upper.contains(" WITH (COMMIT") {
+            return self.parse_stream_read(sql);
+        }
         if upper.starts_with("CREATE DYNAMIC TABLE")
             || upper.starts_with("CREATE OR REPLACE DYNAMIC TABLE")
         {
@@ -110,6 +125,11 @@ impl SqlParser {
 
     /// Parse: CREATE STREAM <name> ON TABLE <table> [APPEND ONLY]
     fn parse_stream(&self, sql: &str) -> Result<Vec<Statement>> {
+        if sql.to_uppercase().contains("APPEND ONLY") {
+            return Err(NovaError::UnsupportedStreamSyntax {
+                message: "APPEND ONLY streams are not supported".to_string(),
+            });
+        }
         let parts: Vec<&str> = sql.split_whitespace().collect();
         // Expected: CREATE STREAM <name> ON TABLE <table>
         if parts.len() < 6 {
@@ -146,6 +166,139 @@ impl SqlParser {
             )));
         }
         Ok(stmts)
+    }
+
+    /// Parse: DROP STREAM <name>
+    fn parse_drop_stream(&self, sql: &str) -> Result<Vec<Statement>> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts
+            .get(2)
+            .ok_or_else(|| NovaError::SqlParseError {
+                message: "DROP STREAM syntax: DROP STREAM <name>".to_string(),
+            })?
+            .trim_end_matches(';');
+        let fake_sql = format!("DROP TABLE __drop_stream__{}", name);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: SHOW STREAMS [LIKE '<pattern>']
+    fn parse_show_streams(&self, sql: &str) -> Result<Vec<Statement>> {
+        let upper = sql.to_uppercase();
+        let pattern = if let Some(like_pos) = upper.find(" LIKE ") {
+            sql[like_pos + 6..]
+                .trim()
+                .trim_matches(';')
+                .trim()
+                .trim_matches('\'')
+                .to_string()
+        } else {
+            String::new()
+        };
+        let fake_sql = format!(
+            "DROP TABLE __show_streams_hex__{}",
+            Self::hex_payload(&pattern)
+        );
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: DESCRIBE STREAM <name>
+    fn parse_describe_stream(&self, sql: &str) -> Result<Vec<Statement>> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let name = parts
+            .get(2)
+            .ok_or_else(|| NovaError::SqlParseError {
+                message: "DESCRIBE STREAM syntax: DESCRIBE STREAM <name>".to_string(),
+            })?
+            .trim_end_matches(';');
+        let fake_sql = format!("DROP TABLE __describe_stream__{}", name);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: SELECT ... FROM <stream> WITH (COMMIT = FALSE)
+    fn parse_stream_read(&self, sql: &str) -> Result<Vec<Statement>> {
+        let upper = sql.to_uppercase();
+        if !upper.contains("COMMIT = FALSE") && !upper.contains("COMMIT=FALSE") {
+            return Err(NovaError::UnsupportedStreamSyntax {
+                message: "stream SELECT WITH currently supports COMMIT = FALSE only".to_string(),
+            });
+        }
+        let stream_name = Self::extract_select_from_relation(sql).ok_or_else(|| {
+            NovaError::UnsupportedStreamSyntax {
+                message: "stream SELECT syntax: SELECT ... FROM <stream> WITH (COMMIT = FALSE)"
+                    .to_string(),
+            }
+        })?;
+        let fake_sql = format!(
+            "DROP TABLE __stream_read_preview_hex__{}__{}",
+            Self::hex_payload(&stream_name),
+            Self::hex_payload(sql)
+        );
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    /// Parse: SELECT SYSTEM$STREAM_HAS_DATA('<stream>')
+    fn parse_system_stream_has_data(&self, sql: &str) -> Result<Vec<Statement>> {
+        let open = sql
+            .find('(')
+            .ok_or_else(|| NovaError::UnsupportedStreamSyntax {
+                message: "SYSTEM$STREAM_HAS_DATA requires a stream name argument".to_string(),
+            })?;
+        let close = sql
+            .rfind(')')
+            .ok_or_else(|| NovaError::UnsupportedStreamSyntax {
+                message: "SYSTEM$STREAM_HAS_DATA requires a closing ')'".to_string(),
+            })?;
+        if close <= open {
+            return Err(NovaError::UnsupportedStreamSyntax {
+                message: "SYSTEM$STREAM_HAS_DATA requires a stream name argument".to_string(),
+            });
+        }
+        let stream_name = sql[open + 1..close]
+            .trim()
+            .trim_matches(|c: char| c == '\'' || c == '"')
+            .trim_end_matches(';')
+            .to_string();
+        if stream_name.is_empty() {
+            return Err(NovaError::UnsupportedStreamSyntax {
+                message: "SYSTEM$STREAM_HAS_DATA requires a non-empty stream name".to_string(),
+            });
+        }
+        let fake_sql = format!("DROP TABLE __stream_has_data__{}", stream_name);
+        Parser::parse_sql(&GenericDialect {}, &fake_sql).map_err(|e| NovaError::SqlParseError {
+            message: e.to_string(),
+        })
+    }
+
+    fn hex_payload(value: &str) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = String::with_capacity(value.len() * 2);
+        for byte in value.as_bytes() {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+
+    fn extract_select_from_relation(sql: &str) -> Option<String> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let from_pos = parts
+            .iter()
+            .position(|part| part.eq_ignore_ascii_case("FROM"))?;
+        let relation = parts.get(from_pos + 1)?;
+        Some(
+            relation
+                .trim_end_matches(';')
+                .trim_end_matches(',')
+                .to_string(),
+        )
     }
 
     /// Parse: CREATE [OR REPLACE] DYNAMIC TABLE <name>
@@ -489,5 +642,105 @@ mod tests {
         let parser = SqlParser::new();
         let stmts = parser.parse("SHOW DYNAMIC TABLES").unwrap();
         assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn parse_stream_select_commit_false() {
+        use crate::analyzer::{Analyzer, ResolvedStatement};
+        use nova_common::StreamReadMode;
+
+        let parser = SqlParser::new();
+        let analyzer = Analyzer::new("db".to_string(), "public".to_string());
+        let stmt = parser
+            .parse("SELECT * FROM orders_stream WITH (COMMIT = FALSE)")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolved = analyzer.resolve(&stmt).unwrap();
+        match resolved {
+            ResolvedStatement::ReadStream {
+                stream_name,
+                read_mode,
+                ..
+            } => {
+                assert_eq!(stream_name, "orders_stream");
+                assert_eq!(read_mode, StreamReadMode::Preview);
+            }
+            other => panic!("expected ReadStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_system_stream_has_data() {
+        use crate::analyzer::{Analyzer, ResolvedStatement};
+
+        let parser = SqlParser::new();
+        let analyzer = Analyzer::new("db".to_string(), "public".to_string());
+        let stmt = parser
+            .parse("SELECT SYSTEM$STREAM_HAS_DATA('orders_stream')")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let resolved = analyzer.resolve(&stmt).unwrap();
+        match resolved {
+            ResolvedStatement::SystemStreamHasData { stream_name, .. } => {
+                assert_eq!(stream_name, "orders_stream");
+            }
+            other => panic!("expected SystemStreamHasData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_stream_lifecycle_sql() {
+        use crate::analyzer::{Analyzer, ResolvedStatement};
+
+        let parser = SqlParser::new();
+        let analyzer = Analyzer::new("db".to_string(), "public".to_string());
+
+        let drop_stmt = parser
+            .parse("DROP STREAM orders_stream")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        match analyzer.resolve(&drop_stmt).unwrap() {
+            ResolvedStatement::DropStream { name, .. } => assert_eq!(name, "orders_stream"),
+            other => panic!("expected DropStream, got {other:?}"),
+        }
+
+        let show_stmt = parser
+            .parse("SHOW STREAMS LIKE 'orders%'")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        match analyzer.resolve(&show_stmt).unwrap() {
+            ResolvedStatement::ShowStreams { pattern, .. } => {
+                assert_eq!(pattern.as_deref(), Some("orders%"));
+            }
+            other => panic!("expected ShowStreams, got {other:?}"),
+        }
+
+        let desc_stmt = parser
+            .parse("DESCRIBE STREAM orders_stream")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        match analyzer.resolve(&desc_stmt).unwrap() {
+            ResolvedStatement::DescribeStream { name, .. } => assert_eq!(name, "orders_stream"),
+            other => panic!("expected DescribeStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_stream_rejects_append_only() {
+        let parser = SqlParser::new();
+        let err = parser
+            .parse("CREATE STREAM orders_stream ON TABLE orders APPEND ONLY")
+            .expect_err("append-only streams are not supported");
+        assert!(matches!(err, NovaError::UnsupportedStreamSyntax { .. }));
     }
 }
