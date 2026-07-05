@@ -683,7 +683,12 @@ mod tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_security_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_security_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace.clone())?;
 
         store.bootstrap_security().await?;
@@ -771,7 +776,12 @@ mod tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_security_invariants_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_security_invariants_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
         store.bootstrap_security().await?;
         let epoch_after_bootstrap = store.security_epoch().await?;

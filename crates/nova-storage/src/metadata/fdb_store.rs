@@ -1029,7 +1029,12 @@ mod function_tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_function_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_function_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
         let function = sample_function(42);
 
@@ -1070,7 +1075,12 @@ mod function_tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_function_replace_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_function_replace_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
         let mut function = sample_function(126);
 
@@ -1109,7 +1119,12 @@ mod function_tests {
         let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
             return Ok(());
         };
-        let subspace = format!("nova_test_function_drop_{}", now_micros()).into_bytes();
+        let subspace = format!(
+            "nova_test_function_drop_{}_{}",
+            now_micros(),
+            nova_common::generate_id()
+        )
+        .into_bytes();
         let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
         store.bootstrap_security().await?;
         let function = sample_function(84);
