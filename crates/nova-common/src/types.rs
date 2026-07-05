@@ -8,6 +8,7 @@ use std::collections::HashMap;
 pub type DatabaseId = u64;
 pub type SchemaId = u64;
 pub type TableId = u64;
+pub type FunctionId = u64;
 pub type MpId = u64;
 pub type TxnId = u64;
 pub type StreamId = u64;
@@ -34,6 +35,7 @@ pub enum ObjectType {
     Stream,
     Role,
     User,
+    Function,
 }
 
 impl std::fmt::Display for ObjectType {
@@ -43,6 +45,7 @@ impl std::fmt::Display for ObjectType {
             ObjectType::Database => write!(f, "DATABASE"),
             ObjectType::Schema => write!(f, "SCHEMA"),
             ObjectType::Table => write!(f, "TABLE"),
+            ObjectType::Function => write!(f, "FUNCTION"),
             ObjectType::DynamicTable => write!(f, "DYNAMIC TABLE"),
             ObjectType::Stream => write!(f, "STREAM"),
             ObjectType::Role => write!(f, "ROLE"),
@@ -88,6 +91,7 @@ pub enum SecurityPrivilege {
     CreateUser,
     ManageGrants,
     Ownership,
+    CreateFunction,
 }
 
 impl SecurityPrivilege {
@@ -111,6 +115,7 @@ impl std::fmt::Display for SecurityPrivilege {
             SecurityPrivilege::CreateDatabase => write!(f, "CREATE DATABASE"),
             SecurityPrivilege::CreateSchema => write!(f, "CREATE SCHEMA"),
             SecurityPrivilege::CreateTable => write!(f, "CREATE TABLE"),
+            SecurityPrivilege::CreateFunction => write!(f, "CREATE FUNCTION"),
             SecurityPrivilege::CreateDynamicTable => write!(f, "CREATE DYNAMIC TABLE"),
             SecurityPrivilege::CreateStream => write!(f, "CREATE STREAM"),
             SecurityPrivilege::CreateRole => write!(f, "CREATE ROLE"),
@@ -370,6 +375,138 @@ pub struct TableMeta {
     pub properties: HashMap<String, String>,
 }
 
+// ── Functions ──
+
+/// Normalized argument type list used to identify overloaded functions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FunctionSignature {
+    pub arg_types: Vec<String>,
+}
+
+impl FunctionSignature {
+    pub fn new(arg_types: Vec<String>) -> Self {
+        Self {
+            arg_types: arg_types
+                .into_iter()
+                .map(|data_type| normalize_function_type(&data_type))
+                .collect(),
+        }
+    }
+
+    pub fn key(&self) -> String {
+        self.arg_types.join(",")
+    }
+}
+
+/// Argument metadata for scalar SQL functions and future external runtimes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FunctionArg {
+    pub name: String,
+    pub data_type: String,
+    pub default_expr: Option<String>,
+}
+
+impl FunctionArg {
+    pub fn normalized_type(&self) -> String {
+        normalize_function_type(&self.data_type)
+    }
+}
+
+/// Function language identifier. Only SQL is executable in the current phase.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum FunctionLanguage {
+    Sql,
+    Python,
+    JavaScript,
+    Wasm,
+    Remote,
+    Other(String),
+}
+
+impl FunctionLanguage {
+    pub fn from_name(name: &str) -> Self {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "SQL" => Self::Sql,
+            "PYTHON" => Self::Python,
+            "JAVASCRIPT" | "JS" => Self::JavaScript,
+            "WASM" | "WEBASSEMBLY" => Self::Wasm,
+            "REMOTE" => Self::Remote,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for FunctionLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FunctionLanguage::Sql => write!(f, "SQL"),
+            FunctionLanguage::Python => write!(f, "PYTHON"),
+            FunctionLanguage::JavaScript => write!(f, "JAVASCRIPT"),
+            FunctionLanguage::Wasm => write!(f, "WASM"),
+            FunctionLanguage::Remote => write!(f, "REMOTE"),
+            FunctionLanguage::Other(name) => write!(f, "{}", name),
+        }
+    }
+}
+
+/// Function implementation body. External variants are metadata-only until their runtimes exist.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FunctionBody {
+    SqlExpression(String),
+    External {
+        handler: Option<String>,
+        source: String,
+        imports: Vec<String>,
+    },
+}
+
+/// Optimizer-visible function volatility.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FunctionVolatility {
+    #[default]
+    Immutable,
+    Stable,
+    Volatile,
+}
+
+/// Function behavior when one or more arguments are NULL.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum FunctionNullHandling {
+    CalledOnNullInput,
+    #[default]
+    ReturnsNullOnNullInput,
+    Strict,
+}
+
+/// Durable function metadata stored in FoundationDB.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FunctionMeta {
+    pub id: FunctionId,
+    pub db_id: DatabaseId,
+    pub schema_id: SchemaId,
+    pub name: String,
+    pub signature: FunctionSignature,
+    pub args: Vec<FunctionArg>,
+    pub return_type: String,
+    pub language: FunctionLanguage,
+    pub body: FunctionBody,
+    pub volatility: FunctionVolatility,
+    pub null_handling: FunctionNullHandling,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+    pub owner_role_id: RoleId,
+    pub comment: Option<String>,
+    pub properties: HashMap<String, String>,
+}
+
+pub fn normalize_function_type(data_type: &str) -> String {
+    data_type
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase()
+}
+
 // ── Transaction ──
 
 /// Transaction status.
@@ -621,4 +758,70 @@ pub fn now_micros() -> Timestamp {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_object_type_and_privilege_display() {
+        assert_eq!(ObjectType::Function.to_string(), "FUNCTION");
+        assert_eq!(
+            SecurityPrivilege::CreateFunction.to_string(),
+            "CREATE FUNCTION"
+        );
+    }
+
+    #[test]
+    fn function_signature_normalizes_argument_types() {
+        let signature =
+            FunctionSignature::new(vec![" int ".to_string(), "varchar  (  10 )".to_string()]);
+
+        assert_eq!(signature.arg_types, vec!["INT", "VARCHAR ( 10 )"]);
+        assert_eq!(signature.key(), "INT,VARCHAR ( 10 )");
+    }
+
+    #[test]
+    fn function_language_parsing_is_sql_first_and_extensible() {
+        assert_eq!(FunctionLanguage::from_name("sql"), FunctionLanguage::Sql);
+        assert_eq!(
+            FunctionLanguage::from_name("python"),
+            FunctionLanguage::Python
+        );
+        assert_eq!(
+            FunctionLanguage::from_name("lua"),
+            FunctionLanguage::Other("LUA".to_string())
+        );
+    }
+
+    #[test]
+    fn function_metadata_records_owner_role_and_sql_body() {
+        let meta = FunctionMeta {
+            id: 7,
+            db_id: 1,
+            schema_id: 2,
+            name: "add_one".to_string(),
+            signature: FunctionSignature::new(vec!["int".to_string()]),
+            args: vec![FunctionArg {
+                name: "x".to_string(),
+                data_type: "INT".to_string(),
+                default_expr: None,
+            }],
+            return_type: "INT".to_string(),
+            language: FunctionLanguage::Sql,
+            body: FunctionBody::SqlExpression("x + 1".to_string()),
+            volatility: FunctionVolatility::Immutable,
+            null_handling: FunctionNullHandling::ReturnsNullOnNullInput,
+            created_at: 10,
+            updated_at: 11,
+            owner_role_id: ACCOUNTADMIN_ROLE_ID,
+            comment: None,
+            properties: HashMap::new(),
+        };
+
+        assert_eq!(meta.signature.key(), "INT");
+        assert_eq!(meta.owner_role_id, ACCOUNTADMIN_ROLE_ID);
+        assert_eq!(meta.language.to_string(), "SQL");
+    }
 }

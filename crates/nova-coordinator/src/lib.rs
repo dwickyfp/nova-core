@@ -11,6 +11,7 @@ pub mod coordinator_grpc;
 pub mod distributed;
 pub mod dynamic_table_scheduler;
 pub mod executor;
+pub mod function_runtime;
 pub mod grpc_client;
 pub mod ha;
 pub mod monitoring;

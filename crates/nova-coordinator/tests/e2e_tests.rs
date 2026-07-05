@@ -78,6 +78,81 @@ mod tests {
         Ok(last)
     }
 
+    async fn create_test_role(executor: &Executor, name: &str) -> u64 {
+        executor.meta().bootstrap_security().await.unwrap();
+        executor
+            .meta()
+            .create_role(nova_common::RoleMeta {
+                id: 0,
+                name: name.to_string(),
+                owner_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                system: false,
+                created_at: nova_common::now_micros(),
+                created_by_user_id: nova_common::ROOT_USER_ID,
+                comment: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn grant_privilege(
+        executor: &Executor,
+        role_id: u64,
+        object: nova_common::ObjectRef,
+        privilege: nova_common::SecurityPrivilege,
+    ) {
+        executor
+            .meta()
+            .grant_privileges(nova_common::GrantSetMeta {
+                role_id,
+                object,
+                privileges: nova_common::PrivilegeSet::from_privileges(&[privilege]),
+                grant_options: nova_common::PrivilegeSet::empty(),
+                granted_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                updated_at: nova_common::now_micros(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn db_and_public_schema(
+        executor: &Executor,
+        db: &str,
+    ) -> (nova_common::DatabaseMeta, nova_common::SchemaMeta) {
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|database| database.name == db)
+            .unwrap();
+        let existing_schema = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|schema| schema.name == "public");
+        let schema_meta = if let Some(schema) = existing_schema {
+            schema
+        } else {
+            let schema = nova_common::SchemaMeta {
+                id: nova_common::generate_id(),
+                db_id: db_meta.id,
+                name: "public".to_string(),
+                created_at: nova_common::now_micros(),
+            };
+            executor.meta().create_schema(schema.clone()).await.unwrap();
+            schema
+        };
+        (db_meta, schema_meta)
+    }
+
+    fn int_function_signature() -> nova_common::FunctionSignature {
+        nova_common::FunctionSignature::new(vec!["INT".to_string()])
+    }
+
     #[tokio::test]
     async fn test_non_admin_cannot_drop_database() {
         let (executor, _dir) = setup();
@@ -267,6 +342,431 @@ mod tests {
             matches!(err, nova_common::NovaError::PermissionDenied { .. }),
             "expected PermissionDenied, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_function_records_metadata_and_owner() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        executor.meta().bootstrap_security().await.unwrap();
+        let owner_role_id = create_test_role(&executor, "function_owner").await;
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "securedb").await;
+        for (object, privilege) in [
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::CreateFunction,
+            ),
+        ] {
+            grant_privilege(&executor, owner_role_id, object, privilege).await;
+        }
+        let owner = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 101,
+            username: "function_owner_user".to_string(),
+            primary_role_id: owner_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let result = exec_sql_as(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "securedb",
+            &owner,
+        )
+        .await
+        .unwrap();
+
+        match result {
+            nova_coordinator::executor::QueryResult::Success { message } => {
+                assert!(message.contains("Function 'securedb.public.add_one(INT)' created"));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+        let function = executor
+            .meta()
+            .get_function_by_signature(
+                db_meta.id,
+                schema_meta.id,
+                "add_one",
+                &int_function_signature(),
+            )
+            .await
+            .unwrap()
+            .expect("function metadata should be persisted");
+        assert_eq!(function.name, "add_one");
+        assert_eq!(function.return_type, "INT");
+        assert_eq!(function.owner_role_id, owner_role_id);
+        assert_eq!(function.language, nova_common::FunctionLanguage::Sql);
+        assert_eq!(
+            function.body,
+            nova_common::FunctionBody::SqlExpression("x + 1".to_string())
+        );
+        let owner_meta = executor
+            .meta()
+            .get_object_owner(nova_common::ObjectRef::new(
+                nova_common::ObjectType::Function,
+                function.id,
+            ))
+            .await
+            .unwrap()
+            .expect("function should have an object owner record");
+        assert_eq!(owner_meta.owner_role_id, owner_role_id);
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_create_function_without_schema_privilege() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        executor.meta().bootstrap_security().await.unwrap();
+        let analyst_role_id = create_test_role(&executor, "function_analyst").await;
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "securedb").await;
+        for (object, privilege) in [
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+        ] {
+            grant_privilege(&executor, analyst_role_id, object, privilege).await;
+        }
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 102,
+            username: "function_analyst_user".to_string(),
+            primary_role_id: analyst_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "securedb",
+            &analyst,
+        )
+        .await
+        .expect_err("role without CREATE FUNCTION must not create a function");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_or_replace_function_preserves_identity_and_owner() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        executor.meta().bootstrap_security().await.unwrap();
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "securedb").await;
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "securedb",
+        )
+        .await
+        .unwrap();
+        let before = executor
+            .meta()
+            .get_function_by_signature(
+                db_meta.id,
+                schema_meta.id,
+                "add_one",
+                &int_function_signature(),
+            )
+            .await
+            .unwrap()
+            .expect("function should exist before replacement");
+
+        exec_sql(
+            &executor,
+            "CREATE OR REPLACE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 2'",
+            "securedb",
+        )
+        .await
+        .unwrap();
+
+        let after = executor
+            .meta()
+            .get_function_by_signature(
+                db_meta.id,
+                schema_meta.id,
+                "add_one",
+                &int_function_signature(),
+            )
+            .await
+            .unwrap()
+            .expect("function should exist after replacement");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.owner_role_id, before.owner_role_id);
+        assert_eq!(
+            after.body,
+            nova_common::FunctionBody::SqlExpression("x + 2".to_string())
+        );
+        let owner_meta = executor
+            .meta()
+            .get_object_owner(nova_common::ObjectRef::new(
+                nova_common::ObjectType::Function,
+                after.id,
+            ))
+            .await
+            .unwrap()
+            .expect("owner metadata should be preserved");
+        assert_eq!(owner_meta.owner_role_id, nova_common::ACCOUNTADMIN_ROLE_ID);
+    }
+
+    #[tokio::test]
+    async fn test_drop_function_requires_ownership_and_clears_metadata() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        executor.meta().bootstrap_security().await.unwrap();
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "securedb").await;
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "securedb",
+        )
+        .await
+        .unwrap();
+        let function = executor
+            .meta()
+            .get_function_by_signature(
+                db_meta.id,
+                schema_meta.id,
+                "add_one",
+                &int_function_signature(),
+            )
+            .await
+            .unwrap()
+            .expect("function should exist before drop");
+        let analyst_role_id = create_test_role(&executor, "function_drop_analyst").await;
+        for (object, privilege) in [
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+        ] {
+            grant_privilege(&executor, analyst_role_id, object, privilege).await;
+        }
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 103,
+            username: "function_drop_analyst_user".to_string(),
+            primary_role_id: analyst_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "DROP FUNCTION add_one(INT)",
+            "securedb",
+            &analyst,
+        )
+        .await
+        .expect_err("non-owner must not drop a function");
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+
+        exec_sql(&executor, "DROP FUNCTION add_one(INT)", "securedb")
+            .await
+            .unwrap();
+
+        assert!(
+            executor
+                .meta()
+                .get_function_by_signature(
+                    db_meta.id,
+                    schema_meta.id,
+                    "add_one",
+                    &int_function_signature(),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            executor
+                .meta()
+                .get_object_owner(nova_common::ObjectRef::new(
+                    nova_common::ObjectType::Function,
+                    function.id,
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sql_function_can_be_invoked_in_select() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE functiondb", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE numbers (id INT)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "INSERT INTO numbers VALUES (1)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "INSERT INTO numbers VALUES (2)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        let result = exec_sql(
+            &executor,
+            "SELECT add_one(id) AS incremented FROM numbers ORDER BY id",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        match result {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec!["2".to_string()], vec!["3".to_string()]]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_function_usage_privilege_required_for_invocation() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE functiondb", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE numbers (id INT)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "INSERT INTO numbers VALUES (1)", "functiondb")
+            .await
+            .unwrap();
+        exec_sql(
+            &executor,
+            "CREATE FUNCTION add_one(x INT) RETURNS INT LANGUAGE SQL AS 'x + 1'",
+            "functiondb",
+        )
+        .await
+        .unwrap();
+
+        executor.meta().bootstrap_security().await.unwrap();
+        let analyst_role_id = create_test_role(&executor, "function_usage_analyst").await;
+        let (db_meta, schema_meta) = db_and_public_schema(&executor, "functiondb").await;
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|table| table.name == "numbers")
+            .unwrap();
+        for (object, privilege) in [
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Table, table_meta.id),
+                nova_common::SecurityPrivilege::Select,
+            ),
+        ] {
+            grant_privilege(&executor, analyst_role_id, object, privilege).await;
+        }
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 104,
+            username: "function_usage_analyst_user".to_string(),
+            primary_role_id: analyst_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "SELECT add_one(id) AS incremented FROM numbers",
+            "functiondb",
+            &analyst,
+        )
+        .await
+        .expect_err("function invocation must require USAGE on the function object");
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+
+        let function = executor
+            .meta()
+            .get_function_by_signature(
+                db_meta.id,
+                schema_meta.id,
+                "add_one",
+                &int_function_signature(),
+            )
+            .await
+            .unwrap()
+            .expect("function should exist");
+        grant_privilege(
+            &executor,
+            analyst_role_id,
+            nova_common::ObjectRef::new(nova_common::ObjectType::Function, function.id),
+            nova_common::SecurityPrivilege::Usage,
+        )
+        .await;
+
+        let result = exec_sql_as(
+            &executor,
+            "SELECT add_one(id) AS incremented FROM numbers",
+            "functiondb",
+            &analyst,
+        )
+        .await
+        .unwrap();
+        match result {
+            nova_coordinator::executor::QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec!["2".to_string()]]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 
     #[tokio::test]
