@@ -9,15 +9,19 @@ mod tests {
     use nova_coordinator::executor::Executor;
     use nova_coordinator::parser::SqlParser;
     use nova_storage::{FdbMetadataStore, MetadataStore, MpReader, MpWriter};
-    use object_store::local::LocalFileSystem;
     use std::sync::Arc;
     use tempfile::TempDir;
     fn setup() -> (Executor, TempDir) {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let meta = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap())
-            as Arc<dyn MetadataStore>;
+        let meta = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        ) as Arc<dyn MetadataStore>;
         let store =
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&data_dir).unwrap())
                 as Arc<dyn object_store::ObjectStore>;
@@ -45,9 +49,393 @@ mod tests {
             {
                 *raw_sql = Some(sql.to_string());
             }
-            last = executor.execute(resolved).await?;
+            last = executor.execute_as_root_for_internal(resolved).await?;
         }
         Ok(last)
+    }
+
+    async fn exec_sql_as(
+        executor: &Executor,
+        sql: &str,
+        db: &str,
+        security: &nova_common::SecurityContext,
+    ) -> nova_common::Result<nova_coordinator::executor::QueryResult> {
+        let parser = SqlParser::new();
+        let analyzer = Analyzer::new(db.to_string(), "public".to_string());
+        let stmts = parser.parse(sql)?;
+        let mut last = nova_coordinator::executor::QueryResult::Success {
+            message: "noop".to_string(),
+        };
+        for stmt in &stmts {
+            let mut resolved = analyzer.resolve(stmt)?;
+            if let nova_coordinator::analyzer::ResolvedStatement::Select { raw_sql, .. } =
+                &mut resolved
+            {
+                *raw_sql = Some(sql.to_string());
+            }
+            last = executor.execute_with_context(resolved, security).await?;
+        }
+        Ok(last)
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_drop_database() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(&executor, "DROP DATABASE securedb", "securedb", &analyst)
+            .await
+            .expect_err("non-admin user must not be allowed to drop a database");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_drop_schema() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE sentinel (id INT)", "securedb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "DROP TABLE sentinel", "securedb")
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(&executor, "DROP SCHEMA public", "securedb", &analyst)
+            .await
+            .expect_err("non-admin user must not be allowed to drop a schema");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_create_table_by_auto_creating_schema() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "CREATE TABLE sensitive (id INT)",
+            "securedb",
+            &analyst,
+        )
+        .await
+        .expect_err("non-admin user must not auto-create schema while creating a table");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_alter_table() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE sensitive (id INT)", "securedb")
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "ALTER TABLE sensitive ADD COLUMN leaked VARCHAR",
+            "securedb",
+            &analyst,
+        )
+        .await
+        .expect_err("non-admin user must not be allowed to alter a table");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_clone_table_without_source_access() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE sensitive (id INT)", "securedb")
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "CREATE TABLE sensitive_clone CLONE sensitive",
+            "securedb",
+            &analyst,
+        )
+        .await
+        .expect_err("non-admin user must not be allowed to clone a table without source access");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_create_stream_without_table_access() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE sensitive (id INT)", "securedb")
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(
+            &executor,
+            "CREATE STREAM sensitive_stream ON TABLE sensitive",
+            "securedb",
+            &analyst,
+        )
+        .await
+        .expect_err("non-admin user must not be allowed to create a stream without table access");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_stream_records_object_owner() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        exec_sql(&executor, "CREATE TABLE sensitive (id INT)", "securedb")
+            .await
+            .unwrap();
+        executor.meta().bootstrap_security().await.unwrap();
+        let owner_role_id = executor
+            .meta()
+            .create_role(nova_common::RoleMeta {
+                id: 0,
+                name: "stream_owner".to_string(),
+                owner_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                system: false,
+                created_at: nova_common::now_micros(),
+                created_by_user_id: nova_common::ROOT_USER_ID,
+                comment: None,
+            })
+            .await
+            .unwrap();
+
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == "securedb")
+            .unwrap();
+        let schema_meta = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "public")
+            .unwrap();
+        let table_meta = executor
+            .meta()
+            .list_tables(db_meta.id, schema_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "sensitive")
+            .unwrap();
+        for (object, privilege) in [
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::Usage,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Schema, schema_meta.id),
+                nova_common::SecurityPrivilege::CreateStream,
+            ),
+            (
+                nova_common::ObjectRef::new(nova_common::ObjectType::Table, table_meta.id),
+                nova_common::SecurityPrivilege::Select,
+            ),
+        ] {
+            executor
+                .meta()
+                .grant_privileges(nova_common::GrantSetMeta {
+                    role_id: owner_role_id,
+                    object,
+                    privileges: nova_common::PrivilegeSet::from_privileges(&[privilege]),
+                    grant_options: nova_common::PrivilegeSet::empty(),
+                    granted_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                    updated_at: nova_common::now_micros(),
+                })
+                .await
+                .unwrap();
+        }
+        let owner = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 101,
+            username: "stream_owner_user".to_string(),
+            primary_role_id: owner_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let result = exec_sql_as(
+            &executor,
+            "CREATE STREAM sensitive_stream ON TABLE sensitive",
+            "securedb",
+            &owner,
+        )
+        .await
+        .unwrap();
+
+        let stream_id = match result {
+            nova_coordinator::executor::QueryResult::Success { message } => message
+                .split("id=")
+                .nth(1)
+                .and_then(|suffix| suffix.split(')').next())
+                .and_then(|id| id.parse::<u64>().ok())
+                .expect("CREATE STREAM success message should expose stream id"),
+            other => panic!("expected Success, got {other:?}"),
+        };
+        let owner_meta = executor
+            .meta()
+            .get_object_owner(nova_common::ObjectRef::new(
+                nova_common::ObjectType::Stream,
+                stream_id,
+            ))
+            .await
+            .unwrap()
+            .expect("stream should have an object owner record");
+        assert_eq!(owner_meta.owner_role_id, owner_role_id);
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_run_gc() {
+        let (executor, _dir) = setup();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = exec_sql_as(&executor, "GC 0", "securedb", &analyst)
+            .await
+            .expect_err("non-admin user must not be allowed to run GC");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_backup_or_restore() {
+        let (executor, _dir) = setup();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let backup_err = exec_sql_as(&executor, "BACKUP", "securedb", &analyst)
+            .await
+            .expect_err("non-admin user must not be allowed to run BACKUP");
+        assert!(
+            matches!(backup_err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {backup_err:?}"
+        );
+
+        let restore_err = exec_sql_as(&executor, "RESTORE FROM backup1", "securedb", &analyst)
+            .await
+            .expect_err("non-admin user must not be allowed to run RESTORE");
+        assert!(
+            matches!(restore_err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {restore_err:?}"
+        );
     }
 
     #[tokio::test]
@@ -106,7 +494,7 @@ mod tests {
             .await
             .unwrap();
         if let nova_coordinator::executor::QueryResult::Rows { rows, .. } = result {
-            assert!(rows.len() >= 1, "should have at least 1 row with age > 28");
+            assert!(!rows.is_empty(), "should have at least 1 row with age > 28");
         } else {
             panic!("expected Rows");
         }

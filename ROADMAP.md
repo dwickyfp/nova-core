@@ -24,6 +24,7 @@
 | 13 | Dynamic Tables | — | ✅ Complete | CREATE/ALTER/DROP/SHOW DYNAMIC TABLE + scheduler |
 | 14 | Production Deployment | — | ✅ Complete | Docker Rust 1.91, fixed worker gRPC args |
 | 15 | Distributed Cluster Wire-up | — | ✅ Complete | Raft gRPC server mounted, AutoScaler loop wired |
+| 16 | Enterprise Security & Governance | — | 📋 Planned | Snowflake-style RBAC, policies, tags, audit, identity |
 
 ---
 
@@ -280,53 +281,53 @@
 
 ### Milestone 4.1: Coordinator Raft
 
-- [ ] Integrate `openraft` for coordinator consensus
-- [ ] Implement leader election (3 coordinator nodes)
-- [ ] Implement state replication (metadata changes replicated to followers)
-- [ ] Implement leader failover (< 10s)
-- [ ] Integration tests: kill leader, verify new leader takes over
+- [x] Integrate `openraft` for coordinator consensus
+- [x] Implement leader election (3 coordinator nodes)
+- [x] Implement state replication (metadata changes replicated to followers)
+- [x] Implement leader failover (< 10s)
+- [x] Integration tests: kill leader, verify new leader takes over
 
 ### Milestone 4.2: Worker Pool
 
-- [ ] Implement gRPC protocol (protobuf in `nova-common`)
-- [ ] Implement coordinator → worker fragment dispatch
-- [ ] Implement worker → coordinator result streaming
-- [ ] Implement worker registration & heartbeat
-- [ ] Implement worker health monitoring
-- [ ] Integration tests: 1 coordinator + 2 workers, run distributed query
+- [x] Implement gRPC protocol (protobuf in `nova-common`)
+- [x] Implement coordinator → worker fragment dispatch
+- [x] Implement worker → coordinator result streaming
+- [x] Implement worker registration & heartbeat
+- [x] Implement worker health monitoring
+- [x] Integration tests: 1 coordinator + 2 workers, run distributed query
 
 ### Milestone 4.3: Distributed Execution
 
-- [ ] Implement distributed scan (MPs partitioned across workers)
-- [ ] Implement shuffle join (partition by join key across workers)
-- [ ] Implement broadcast join (small table broadcast to all workers)
-- [ ] Implement colocated join (same distribution key → local join, no shuffle)
-- [ ] Implement adaptive join selection (runtime stats → switch strategy)
-- [ ] Integration tests: TPC-H distributed, verify correctness
-- [ ] Benchmark: scale-up (1 worker vs 4 workers vs 8 workers)
+- [x] Implement distributed scan (MPs partitioned across workers)
+- [x] Implement shuffle join (partition by join key across workers)
+- [x] Implement broadcast join (small table broadcast to all workers)
+- [x] Implement colocated join (same distribution key → local join, no shuffle)
+- [x] Implement adaptive join selection (runtime stats → switch strategy)
+- [x] Integration tests: TPC-H distributed, verify correctness
+- [x] Benchmark: scale-up (1 worker vs 4 workers vs 8 workers)
 
 ### Milestone 4.4: Auto-Scaling
 
-- [ ] Implement worker auto-scaling (CPU threshold, queue depth)
-- [ ] Implement auto-suspend (idle workers terminated after N seconds)
-- [ ] Implement auto-resume (provision workers when query arrives)
-- [ ] Implement warehouse concept (virtual compute clusters)
-- [ ] Integration tests: scale up under load, scale down when idle
+- [x] Implement worker auto-scaling (CPU threshold, queue depth)
+- [x] Implement auto-suspend (idle workers terminated after N seconds)
+- [x] Implement auto-resume (provision workers when query arrives)
+- [x] Implement warehouse concept (virtual compute clusters)
+- [x] Integration tests: scale up under load, scale down when idle
 
 ### Milestone 4.5: Distributed TPC-H
 
-- [ ] Run TPC-H 100GB on 4-worker cluster
-- [ ] Compare with single-node performance
-- [ ] Identify and fix distributed execution bottlenecks
-- [ ] Document results
+- [x] Run TPC-H 100GB on 4-worker cluster
+- [x] Compare with single-node performance
+- [x] Identify and fix distributed execution bottlenecks
+- [x] Document results
 
 ### Phase 4 Exit Criteria
 
-- [ ] 3-node coordinator cluster with Raft failover
-- [ ] Workers auto-scale based on load
-- [ ] Distributed JOIN (shuffle, broadcast, colocated)
-- [ ] TPC-H runs correctly on multi-node cluster
-- [ ] Worker failure → query re-scheduled, no data loss
+- [x] 3-node coordinator cluster with Raft failover
+- [x] Workers auto-scale based on load
+- [x] Distributed JOIN (shuffle, broadcast, colocated)
+- [x] TPC-H runs correctly on multi-node cluster
+- [x] Worker failure → query re-scheduled, no data loss
 
 ---
 
@@ -413,6 +414,8 @@
 
 ### Milestone 6.3: RBAC
 
+> Baseline RBAC only. Enterprise-grade Snowflake-style authorization, governance policies, audit, and identity hardening are tracked in Phase 16.
+
 - [ ] Implement users (create, drop, alter, list)
 - [ ] Implement roles (create, drop, grant, revoke)
 - [ ] Implement privileges (SELECT, INSERT, CREATE, DROP, etc.)
@@ -460,6 +463,164 @@
 
 ---
 
+## Phase 16: Enterprise Security & Governance
+
+**Goal:** Snowflake-inspired enterprise authorization, policy enforcement, governance catalog, audit, and identity hardening.
+
+> Design reference: `docs/design/enterprise-rbac-roadmap.md`. Phase 6/9 RBAC is treated as baseline enforcement; this phase is the enterprise-grade security and governance program.
+
+### Milestone 16.1: FDB-backed RBAC Foundation
+
+- [ ] Replace in-memory user/role/grant state with FoundationDB-backed security metadata
+- [ ] Define stable securable object identities: account, database, schema, table, dynamic table, stream, view, role, user, policy, tag, warehouse
+- [ ] Store object ownership as role-owned metadata, not user-owned metadata
+- [ ] Assign every new object to the session primary role as owner
+- [ ] Migrate legacy objects without ownership metadata to `ACCOUNTADMIN` ownership
+- [ ] Implement role-to-user grants and role-to-role hierarchy grants
+- [ ] Implement role inheritance traversal with cycle detection and recursion/depth guards
+- [ ] Add security epoch and bump it on user, role, grant, revoke, ownership, policy, and tag changes
+- [ ] Add authorization cache keyed by security epoch
+- [ ] Add negative tests for missing grants, stale cache, role hierarchy cycles, and dropped roles
+
+### Milestone 16.2: Snowflake-style Session Roles
+
+- [ ] Implement per-session `SecurityContext` passed through parser, analyzer, planner, executor, DataFusion path, and background jobs
+- [ ] Remove unsafe global `current_user` executor state for concurrent MySQL sessions
+- [ ] Implement default role resolution at login: requested role → user default role → `PUBLIC`
+- [ ] Implement `USE ROLE <role>` with validation that the role is granted to the user
+- [ ] Implement `USE SECONDARY ROLES NONE | ALL` and reserve explicit secondary role lists
+- [ ] Implement `current_user()`, `current_role()`, `current_secondary_roles()`, and `is_role_in_session()`
+- [ ] Enforce Snowflake-style rule: `CREATE` authorization and new object ownership use primary role only
+- [ ] Enforce non-CREATE authorization using primary role plus active secondary roles and inherited roles
+- [ ] Add tests for role switching, secondary role activation, inherited privileges, and unauthorized role activation
+
+### Milestone 16.3: Grant Management
+
+- [ ] Implement SQL support for `GRANT <privileges> ON <object> TO ROLE <role>`
+- [ ] Implement SQL support for `REVOKE <privileges> ON <object> FROM ROLE <role>`
+- [ ] Implement `GRANT ROLE <role> TO USER <user>` and `REVOKE ROLE <role> FROM USER <user>`
+- [ ] Implement `GRANT ROLE <child> TO ROLE <parent>` and `REVOKE ROLE <child> FROM ROLE <parent>`
+- [ ] Implement `GRANT OWNERSHIP ON <object> TO ROLE <role>` with transfer semantics
+- [ ] Support `WITH GRANT OPTION` for object privileges where applicable
+- [ ] Implement `MANAGE_GRANTS` account privilege for centralized grant administration
+- [ ] Make `DROP` and destructive `ALTER` require `OWNERSHIP` rather than a generic `DROP` privilege
+- [ ] Implement managed access schemas where only schema owner or `MANAGE_GRANTS` can grant on contained objects
+- [ ] Implement future grants: `GRANT ... ON FUTURE TABLES|VIEWS|STREAMS|DYNAMIC TABLES IN SCHEMA|DATABASE ...`
+- [ ] Implement all-object grants: `GRANT ... ON ALL TABLES|VIEWS|STREAMS|DYNAMIC TABLES IN SCHEMA|DATABASE ...`
+- [ ] Implement `SHOW GRANTS`, `SHOW GRANTS TO ROLE`, `SHOW GRANTS ON <object>`, and grant visibility filtering
+- [ ] Add tests for ownership transfer, managed access schemas, grant option, revoke behavior, and future grant application
+
+### Milestone 16.4: Database Roles
+
+- [ ] Implement account roles and database roles as distinct role scopes
+- [ ] Implement `CREATE DATABASE ROLE <db>.<role>` and `DROP DATABASE ROLE <db>.<role>`
+- [ ] Restrict database role privileges to objects in the same database
+- [ ] Allow database roles to be granted to account roles
+- [ ] Allow database roles to be granted to other database roles in the same database with cycle detection
+- [ ] Prevent database roles from becoming active primary or secondary session roles directly
+- [ ] Make database role grants contribute privileges through the active account role hierarchy
+- [ ] Reserve database role semantics for future secure data sharing
+- [ ] Add tests for cross-database denial, hierarchy inheritance, and session activation denial
+
+### Milestone 16.5: Row Access Policies
+
+- [ ] Implement row access policy metadata as schema-level securable objects
+- [ ] Implement `CREATE ROW ACCESS POLICY <name> AS (...) RETURNS BOOLEAN -> <expr>`
+- [ ] Implement `ALTER ROW ACCESS POLICY`, `DROP ROW ACCESS POLICY`, `SHOW ROW ACCESS POLICIES`, and `DESC ROW ACCESS POLICY`
+- [ ] Implement `ALTER TABLE|VIEW ... ADD ROW ACCESS POLICY <policy> ON (<columns>)`
+- [ ] Implement policy owner execution context for mapping-table lookups
+- [ ] Rewrite DataFusion logical plans to inject policy filters before user predicates where required
+- [ ] Apply row access policies to `SELECT`, and to rows selected by `UPDATE`, `DELETE`, and future `MERGE`
+- [ ] Ensure row access policies do not silently bypass MP pruning correctness; pruning must remain conservative when policy columns are involved
+- [ ] Implement policy reference metadata for tables, views, and dynamic tables
+- [ ] Define Time Travel semantics: data snapshot uses requested timestamp, but policy and mapping tables are evaluated at query time
+- [ ] Apply source table policies when streams read protected tables
+- [ ] Add tests for simple role predicates, mapping-table predicates, nested table/view policies, Time Travel, streams, and denied rows
+
+### Milestone 16.6: Column Masking Policies
+
+- [ ] Implement masking policy metadata as schema-level securable objects
+- [ ] Implement `CREATE MASKING POLICY <name> AS (val <type>) RETURNS <type> -> <expr>`
+- [ ] Implement conditional masking with `USING` columns
+- [ ] Enforce policy input and output type compatibility
+- [ ] Implement `ALTER TABLE|VIEW ... MODIFY COLUMN ... SET|UNSET MASKING POLICY`
+- [ ] Implement `ALTER MASKING POLICY`, `DROP MASKING POLICY`, `SHOW MASKING POLICIES`, and `DESC MASKING POLICY`
+- [ ] Rewrite DataFusion logical plans so masking applies wherever protected columns are referenced: projection, filters, joins, grouping, ordering, aggregates, CTAS, and unload paths
+- [ ] Ensure direct column masking takes precedence over tag-based masking
+- [ ] Redact sensitive policy internals in `EXPLAIN`, errors, and query profiles
+- [ ] Define clone behavior for policy assignments: table clone retains policy mapping; schema/database clone maps to cloned policies when self-contained
+- [ ] Add tests for masked SELECT, masked WHERE/JOIN anti-bypass behavior, conditional masking, CTAS, clone, streams, and explain redaction
+
+### Milestone 16.7: Tags & Classification
+
+- [ ] Implement tag metadata as securable schema-level objects
+- [ ] Implement `CREATE TAG`, `ALTER TAG`, `DROP TAG`, `SHOW TAGS`, and `DESC TAG`
+- [ ] Implement object and column tag assignments via `ALTER ... SET TAG` and `UNSET TAG`
+- [ ] Support allowed tag values and validation
+- [ ] Implement tag reference catalog views for objects and columns
+- [ ] Implement tag-based masking policy bindings
+- [ ] Enforce direct masking policy precedence over tag-based masking policy
+- [ ] Implement `CLASSIFY TABLE` to detect likely PII/PHI/PCI/secrets using sampled values and column metadata without logging raw sensitive samples
+- [ ] Store classification results with confidence score, suggested tags, reviewer, and applied status
+- [ ] Add governance coverage metrics: untagged sensitive columns, protected columns, policy coverage, and stale classification results
+- [ ] Add tests for tag assignment, tag-based masking, precedence, allowed values, classification suggestions, and redacted logs
+
+### Milestone 16.8: Audit, Access History, and Lineage
+
+- [ ] Implement append-only security audit log in FDB or dedicated audit storage for GRANT, REVOKE, OWNERSHIP, policy, tag, login, and denied access events
+- [ ] Implement query access history with query id, timestamp, user, primary role, secondary roles, warehouse, status, and client metadata
+- [ ] Record direct objects accessed by each query
+- [ ] Record base objects accessed through views, dynamic tables, policies, UDFs, and future secure objects
+- [ ] Record column-level access for direct and base objects
+- [ ] Record objects modified by DDL and DML, including column lineage for CTAS, INSERT SELECT, UPDATE, DELETE, and future MERGE
+- [ ] Record policies referenced by each query: row access policies, masking policies, and tag-based policies
+- [ ] Preserve audit records for failed authorization checks without leaking protected object or policy internals to unauthorized users
+- [ ] Add queryable system views: `ACCOUNT_USAGE.ACCESS_HISTORY`, `ACCOUNT_USAGE.QUERY_HISTORY`, `ACCOUNT_USAGE.GRANTS_TO_ROLES`, `ACCOUNT_USAGE.POLICY_REFERENCES`, and `INFORMATION_SCHEMA.POLICY_REFERENCES`
+- [ ] Define retention, truncation, and redaction behavior for large audit records
+- [ ] Add tests for SELECT, JOIN, CTAS, CLONE, UPDATE, DELETE, policy-protected queries, denied queries, and audit redaction
+
+### Milestone 16.9: Enterprise Auth & Network Controls
+
+- [ ] Implement password policies: minimum length, complexity, expiry, reuse prevention, and forced reset
+- [ ] Implement failed-login throttling, account lockout, and admin unlock
+- [ ] Implement login history with success/failure reason, client address, protocol, and user agent where available
+- [ ] Implement session expiry, idle timeout, and explicit session revocation
+- [ ] Add service users for automation with non-interactive authentication controls
+- [ ] Add key-pair or JWT authentication path for service users
+- [ ] Design OIDC/SAML external identity integration without adding dependencies until approved
+- [ ] Design SCIM-compatible provisioning API for users, roles, and external groups
+- [ ] Implement account-level and user-level network policies with allowed and blocked CIDR ranges
+- [ ] Enforce network policies consistently in MySQL protocol and REST/API entry points
+- [ ] Add tests for lockout, password policy, session revocation, service auth, and denied network access
+
+### Milestone 16.10: Security Integration Across Nova Features
+
+- [ ] Make result cache keys include user, active roles, security epoch, policy epoch, and table versions unless a result is proven safely shareable
+- [ ] Invalidate result cache on grants, revokes, ownership transfer, role changes, policy changes, tag changes, and security epoch changes
+- [ ] Enforce row access and masking policies in DataFusion, legacy execution, MySQL protocol, REST/API, worker fragments, and background jobs
+- [ ] Define Time Travel security semantics for RBAC, masking, row policies, and policy mapping tables
+- [ ] Define Clone security semantics for grants, ownership, row policies, masking policies, tags, and future grants
+- [ ] Define Streams security semantics for table policies and CDC visibility
+- [ ] Ensure Dynamic Table refresh runs as `SYSTEM` user with the dynamic table owner role and no accidental admin bypass
+- [ ] Ensure backup/restore preserves users, roles, grants, ownership, policies, tags, security epoch, and audit continuity atomically
+- [ ] Ensure HA coordinator failover and multi-node workers use FDB security source of truth, not stale local security state
+- [ ] Add end-to-end bypass tests across cache, Time Travel, Clone, Streams, Dynamic Tables, distributed execution, and failover
+
+### Phase 16 Exit Criteria
+
+- [ ] All users, roles, grants, ownership, policies, tags, and security epochs are persisted in FoundationDB and shared by all coordinators
+- [ ] Role hierarchy, primary roles, secondary roles, ownership, managed access schemas, grant option, future grants, and database roles are enforced
+- [ ] Row access policies and column masking policies are enforced in the DataFusion path without bypass via filters, joins, aggregates, CTAS, streams, or Time Travel
+- [ ] Tags, tag-based masking, classification results, and governance coverage views are queryable
+- [ ] Access history records direct objects, base objects, columns, modified objects, policies referenced, denied events, and lineage for supported SQL operations
+- [ ] Result cache and authorization caches are security-aware and invalidate on security or policy changes
+- [ ] Enterprise auth controls cover password policy, login history, lockout, session expiry/revocation, service users, and network policies
+- [ ] Backup/restore and HA preserve security metadata and never fall back to local-only security state
+- [ ] Negative bypass tests pass for non-admin DDL/DML, revoked privileges, role switching, stale cache, policy-protected data, clone, streams, dynamic tables, and distributed execution
+- [ ] Documentation explains Snowflake-inspired differences and Nova-specific constraints without claiming full Snowflake compatibility
+
+---
+
 ## Dependency Graph
 
 ```
@@ -469,10 +630,12 @@ Phase 1 (Foundation)
               ├── Phase 4 (Distributed)
               └── Phase 5 (CBO Enhancement)
                     └── Phase 6 (Cache & Polish)
+                          └── Phase 16 (Enterprise Security & Governance)
 ```
 
 - Phase 4 and Phase 5 can run in parallel (different teams/agents)
 - Phase 6 depends on both Phase 4 and Phase 5
+- Phase 16 depends on baseline SQL execution, DataFusion integration, RBAC enforcement, cache invalidation, dynamic tables, HA, and distributed execution being available
 - Each phase has explicit exit criteria — do NOT start next phase until all criteria met
 
 ---
@@ -616,6 +779,8 @@ Phase 1 (Foundation)
 - [x] Test: connect with correct password → success; wrong password → error
 
 #### 9.6: RBAC Enforcement in DDL/DML
+> Baseline DDL/DML enforcement only. Phase 16 replaces this with FDB-backed role ownership, role hierarchy, managed access schemas, policy enforcement, and security-aware cache invalidation.
+
 - [x] Call rbac.check_privilege() before CREATE TABLE / DROP TABLE / INSERT / UPDATE / DELETE
 - [x] Track current user from MySQL session
 - [ ] Test: non-admin user cannot DROP TABLE

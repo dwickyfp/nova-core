@@ -2,7 +2,9 @@
 
 #[cfg(test)]
 mod tests {
-    use nova_common::SchemaMeta;
+    use nova_common::{
+        GrantSetMeta, ObjectRef, ObjectType, PrivilegeSet, RoleMeta, SchemaMeta, SecurityPrivilege,
+    };
     use nova_coordinator::analyzer::{Analyzer, ResolvedStatement};
     use nova_coordinator::executor::{Executor, QueryResult};
     use nova_coordinator::parser::SqlParser;
@@ -14,8 +16,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
-        let meta = Arc::new(FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap())
-            as Arc<dyn MetadataStore>;
+        let meta = Arc::new(
+            FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        ) as Arc<dyn MetadataStore>;
         let store =
             Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&data_dir).unwrap())
                 as Arc<dyn object_store::ObjectStore>;
@@ -33,7 +40,10 @@ mod tests {
         };
         for stmt in &stmts {
             let resolved = analyzer.resolve(stmt).unwrap();
-            last = executor.execute(resolved).await.unwrap();
+            last = executor
+                .execute_as_root_for_internal(resolved)
+                .await
+                .unwrap();
         }
         last
     }
@@ -51,6 +61,63 @@ mod tests {
             };
             let _ = executor.meta().create_schema(schema).await;
         }
+    }
+
+    async fn public_schema_id(executor: &Executor, db: &str) -> u64 {
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|d| d.name == db)
+            .unwrap();
+        executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "public")
+            .unwrap()
+            .id
+    }
+
+    async fn create_test_role(executor: &Executor, name: &str) -> u64 {
+        executor.meta().bootstrap_security().await.unwrap();
+        executor
+            .meta()
+            .create_role(RoleMeta {
+                id: 0,
+                name: name.to_string(),
+                owner_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                system: false,
+                created_at: nova_common::now_micros(),
+                created_by_user_id: nova_common::ROOT_USER_ID,
+                comment: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn grant_privilege(
+        executor: &Executor,
+        role_id: u64,
+        object: ObjectRef,
+        privilege: SecurityPrivilege,
+    ) {
+        executor
+            .meta()
+            .grant_privileges(GrantSetMeta {
+                role_id,
+                object,
+                privileges: PrivilegeSet::from_privileges(&[privilege]),
+                grant_options: PrivilegeSet::empty(),
+                granted_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+                updated_at: nova_common::now_micros(),
+            })
+            .await
+            .unwrap();
     }
 
     // ── parser tests (no executor needed) ───────────────────────
@@ -155,8 +222,12 @@ mod tests {
     #[tokio::test]
     async fn test_fdb_dynamic_table_crud() {
         use nova_common::{DtRefreshMode, DtRefreshStatus, DynamicTableMeta, now_micros};
-        let dir = TempDir::new().unwrap();
-        let meta = FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap();
+        let _dir = TempDir::new().unwrap();
+        let meta = FdbMetadataStore::open_test(
+            "docker:docker@127.0.0.1:4500",
+            format!("test_{}", nova_common::now_micros()).into_bytes(),
+        )
+        .unwrap();
         let dt = DynamicTableMeta {
             id: 1,
             db_id: 1,
@@ -199,11 +270,178 @@ mod tests {
     // ── executor tests ────────────────────────────────────────────
 
     #[tokio::test]
+    async fn test_non_admin_cannot_create_dynamic_table() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = executor
+            .execute_with_context(
+                ResolvedStatement::CreateDynamicTable {
+                    db: "testdb".to_string(),
+                    schema: "public".to_string(),
+                    name: "dt_summary".to_string(),
+                    query_definition: "SELECT * FROM orders".to_string(),
+                    target_lag_seconds: 300,
+                    refresh_mode: nova_common::DtRefreshMode::Full,
+                    initialize_on_create: false,
+                },
+                &analyst,
+            )
+            .await
+            .expect_err("non-admin user must not be allowed to create a dynamic table");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_refresh_dynamic_table() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+
+        executor
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
+                db: "testdb".to_string(),
+                schema: "public".to_string(),
+                name: "dt_summary".to_string(),
+                query_definition: "SELECT 1".to_string(),
+                target_lag_seconds: 300,
+                refresh_mode: nova_common::DtRefreshMode::Full,
+                initialize_on_create: false,
+            })
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = executor
+            .execute_with_context(
+                ResolvedStatement::RefreshDynamicTable {
+                    db: "testdb".to_string(),
+                    schema: "public".to_string(),
+                    name: "dt_summary".to_string(),
+                },
+                &analyst,
+            )
+            .await
+            .expect_err("non-admin user must not be allowed to refresh a dynamic table");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_suspend_dynamic_table() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+
+        executor
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
+                db: "testdb".to_string(),
+                schema: "public".to_string(),
+                name: "dt_summary".to_string(),
+                query_definition: "SELECT 1".to_string(),
+                target_lag_seconds: 300,
+                refresh_mode: nova_common::DtRefreshMode::Full,
+                initialize_on_create: false,
+            })
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = executor
+            .execute_with_context(
+                ResolvedStatement::SuspendDynamicTable {
+                    db: "testdb".to_string(),
+                    schema: "public".to_string(),
+                    name: "dt_summary".to_string(),
+                },
+                &analyst,
+            )
+            .await
+            .expect_err("non-admin user must not be allowed to suspend a dynamic table");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_admin_cannot_drop_dynamic_table() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+
+        executor
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
+                db: "testdb".to_string(),
+                schema: "public".to_string(),
+                name: "dt_summary".to_string(),
+                query_definition: "SELECT * FROM orders".to_string(),
+                target_lag_seconds: 300,
+                refresh_mode: nova_common::DtRefreshMode::Full,
+                initialize_on_create: false,
+            })
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        let err = executor
+            .execute_with_context(
+                ResolvedStatement::DropDynamicTable {
+                    db: "testdb".to_string(),
+                    schema: "public".to_string(),
+                    name: "dt_summary".to_string(),
+                },
+                &analyst,
+            )
+            .await
+            .expect_err("non-admin user must not be allowed to drop a dynamic table");
+
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_create_dynamic_table_via_executor() {
         let (executor, _dir) = setup();
         setup_db(&executor, "testdb").await;
         let result = executor
-            .execute(ResolvedStatement::CreateDynamicTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
                 db: "testdb".to_string(),
                 schema: "public".to_string(),
                 name: "dt_summary".to_string(),
@@ -218,11 +456,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_non_admin_show_dynamic_tables_hides_inaccessible_schema() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+        executor
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
+                db: "testdb".to_string(),
+                schema: "public".to_string(),
+                name: "dt_a".to_string(),
+                query_definition: "SELECT 1".to_string(),
+                target_lag_seconds: 60,
+                refresh_mode: nova_common::DtRefreshMode::Auto,
+                initialize_on_create: false,
+            })
+            .await
+            .unwrap();
+
+        let analyst = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 100,
+            username: "analyst".to_string(),
+            primary_role_id: nova_common::PUBLIC_ROLE_ID,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        match executor
+            .execute_with_context(
+                ResolvedStatement::ShowDynamicTables {
+                    db: "testdb".to_string(),
+                    pattern: None,
+                },
+                &analyst,
+            )
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert!(
+                    rows.is_empty(),
+                    "inaccessible dynamic tables must be hidden"
+                );
+            }
+            other => panic!("Expected Rows, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_table_owner_can_operate_without_schema_operate_grant() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+        let owner_role_id = create_test_role(&executor, "dt_owner").await;
+        let schema_id = public_schema_id(&executor, "testdb").await;
+        grant_privilege(
+            &executor,
+            owner_role_id,
+            ObjectRef::new(ObjectType::Schema, schema_id),
+            SecurityPrivilege::CreateDynamicTable,
+        )
+        .await;
+        let owner = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 200,
+            username: "dt_owner_user".to_string(),
+            primary_role_id: owner_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        executor
+            .execute_with_context(
+                ResolvedStatement::CreateDynamicTable {
+                    db: "testdb".to_string(),
+                    schema: "public".to_string(),
+                    name: "dt_owned".to_string(),
+                    query_definition: "SELECT 1".to_string(),
+                    target_lag_seconds: 300,
+                    refresh_mode: nova_common::DtRefreshMode::Full,
+                    initialize_on_create: false,
+                },
+                &owner,
+            )
+            .await
+            .unwrap();
+
+        let result = executor
+            .execute_with_context(
+                ResolvedStatement::SuspendDynamicTable {
+                    db: "testdb".to_string(),
+                    schema: "public".to_string(),
+                    name: "dt_owned".to_string(),
+                },
+                &owner,
+            )
+            .await
+            .expect("dynamic table owner should be able to operate on the owned object");
+
+        assert!(matches!(result, QueryResult::Success { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_show_dynamic_tables_allows_object_usage_without_schema_usage() {
+        let (executor, _dir) = setup();
+        setup_db(&executor, "testdb").await;
+        executor
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
+                db: "testdb".to_string(),
+                schema: "public".to_string(),
+                name: "dt_visible".to_string(),
+                query_definition: "SELECT 1".to_string(),
+                target_lag_seconds: 60,
+                refresh_mode: nova_common::DtRefreshMode::Auto,
+                initialize_on_create: false,
+            })
+            .await
+            .unwrap();
+        let dt = executor
+            .meta()
+            .list_dynamic_tables(
+                executor
+                    .meta()
+                    .list_databases()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|d| d.name == "testdb")
+                    .unwrap()
+                    .id,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|dt| dt.name == "dt_visible")
+            .unwrap();
+        let viewer_role_id = create_test_role(&executor, "dt_viewer").await;
+        grant_privilege(
+            &executor,
+            viewer_role_id,
+            ObjectRef::new(ObjectType::DynamicTable, dt.id),
+            SecurityPrivilege::Usage,
+        )
+        .await;
+        let viewer = nova_common::SecurityContext {
+            user_id: nova_common::ROOT_USER_ID + 201,
+            username: "dt_viewer_user".to_string(),
+            primary_role_id: viewer_role_id,
+            secondary_role_ids: vec![],
+            secondary_all: true,
+        };
+
+        match executor
+            .execute_with_context(
+                ResolvedStatement::ShowDynamicTables {
+                    db: "testdb".to_string(),
+                    pattern: None,
+                },
+                &viewer,
+            )
+            .await
+            .unwrap()
+        {
+            QueryResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "object-level USAGE should reveal the DT");
+                assert_eq!(rows[0][0], "dt_visible");
+            }
+            other => panic!("Expected Rows, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
     async fn test_show_dynamic_tables() {
         let (executor, _dir) = setup();
         setup_db(&executor, "testdb").await;
         executor
-            .execute(ResolvedStatement::CreateDynamicTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
                 db: "testdb".to_string(),
                 schema: "public".to_string(),
                 name: "dt_a".to_string(),
@@ -234,7 +639,7 @@ mod tests {
             .await
             .unwrap();
         match executor
-            .execute(ResolvedStatement::ShowDynamicTables {
+            .execute_as_root_for_internal(ResolvedStatement::ShowDynamicTables {
                 db: "testdb".to_string(),
                 pattern: None,
             })
@@ -255,7 +660,7 @@ mod tests {
         let (executor, _dir) = setup();
         setup_db(&executor, "testdb").await;
         executor
-            .execute(ResolvedStatement::CreateDynamicTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDynamicTable {
                 db: "testdb".to_string(),
                 schema: "public".to_string(),
                 name: "dt_x".to_string(),
@@ -267,7 +672,7 @@ mod tests {
             .await
             .unwrap();
         let r = executor
-            .execute(ResolvedStatement::SuspendDynamicTable {
+            .execute_as_root_for_internal(ResolvedStatement::SuspendDynamicTable {
                 db: "testdb".to_string(),
                 schema: "public".to_string(),
                 name: "dt_x".to_string(),
@@ -276,7 +681,7 @@ mod tests {
             .unwrap();
         assert!(matches!(r, QueryResult::Success { .. }));
         let r2 = executor
-            .execute(ResolvedStatement::ResumeDynamicTable {
+            .execute_as_root_for_internal(ResolvedStatement::ResumeDynamicTable {
                 db: "testdb".to_string(),
                 schema: "public".to_string(),
                 name: "dt_x".to_string(),

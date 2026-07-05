@@ -103,8 +103,10 @@ impl BackupManager {
         mps: &HashMap<u64, Vec<MicroPartitionMeta>>,
         cutoff_version: u64,
     ) -> Option<BackupManifest> {
-        let backups = self.backups.read().await;
-        let _from = backups.get(from_backup_id)?;
+        {
+            let backups = self.backups.read().await;
+            backups.get(from_backup_id)?;
+        }
 
         let mut next = self.next_id.write().await;
         let backup_id = format!("backup_{:06}", *next);
@@ -279,10 +281,13 @@ mod tests {
         let full = mgr.create_backup(&tables, &mps).await;
 
         // Incremental: only MPs with version > 2
-        let incr = mgr
-            .create_incremental_backup(&full.backup_id, &tables, &mps, 2)
-            .await
-            .unwrap();
+        let incr = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mgr.create_incremental_backup(&full.backup_id, &tables, &mps, 2),
+        )
+        .await
+        .expect("incremental backup must not deadlock")
+        .unwrap();
 
         assert_eq!(incr.total_mps, 1); // only mp 102 (version 3)
         assert_eq!(

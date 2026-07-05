@@ -15,9 +15,6 @@ pub struct Executor {
     reader: MpReader,
     optimizer: NovaOptimizer,
     current_txn: Arc<std::sync::Mutex<Option<TxnId>>>,
-    rbac: crate::rbac::RbacManager,
-    /// Current user (user_id, is_admin). None = dev mode (no RBAC).
-    current_user: Arc<tokio::sync::RwLock<Option<(u64, bool)>>>,
 }
 
 /// Result of executing a SQL statement.
@@ -40,81 +37,260 @@ impl Executor {
             reader,
             optimizer: NovaOptimizer::new(),
             current_txn: Arc::new(std::sync::Mutex::new(None)),
-            rbac: crate::rbac::RbacManager::new(),
-            current_user: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
-    /// Set the current user for RBAC enforcement.
-    /// Call after successful authentication. `(user_id, is_admin)`.
-    pub async fn set_current_user(&self, user_id: u64, is_admin: bool) {
-        *self.current_user.write().await = Some((user_id, is_admin));
+    pub async fn user_for_auth(&self, username: &str) -> Result<Option<UserMeta>> {
+        self.meta.get_user_by_name(username).await
     }
 
-    /// List all database names.
-    pub async fn list_database_names(&self) -> Result<Vec<String>> {
-        let dbs = self.meta.list_databases().await?;
-        Ok(dbs.iter().map(|d| d.name.clone()).collect())
+    pub async fn security_epoch(&self) -> Result<u64> {
+        self.meta.security_epoch().await
     }
 
-    /// List all table names in a database.
-    pub async fn list_table_names(&self, db: &str) -> Result<Vec<String>> {
-        let dbs = self.meta.list_databases().await?;
-        let db_meta =
-            dbs.iter()
-                .find(|d| d.name == db)
-                .ok_or_else(|| NovaError::DatabaseNotFound {
-                    db_name: db.to_string(),
+    pub async fn security_context_for_user(&self, username: &str) -> Result<SecurityContext> {
+        let user =
+            self.meta
+                .get_user_by_name(username)
+                .await?
+                .ok_or_else(|| NovaError::AuthFailed {
+                    reason: format!("user '{}' not found", username),
                 })?;
+        if user.disabled {
+            return Err(NovaError::AuthFailed {
+                reason: format!("user '{}' is disabled", username),
+            });
+        }
+        let roles = self.meta.list_user_roles(user.id).await?;
+        if !roles.contains(&user.default_role_id) {
+            return Err(NovaError::AuthFailed {
+                reason: format!(
+                    "default role '{}' is not granted to user '{}'",
+                    user.default_role_id, user.name
+                ),
+            });
+        }
+        Ok(SecurityContext {
+            user_id: user.id,
+            username: user.name,
+            primary_role_id: user.default_role_id,
+            secondary_role_ids: roles
+                .into_iter()
+                .filter(|role_id| *role_id != user.default_role_id)
+                .collect(),
+            secondary_all: true,
+        })
+    }
+
+    pub async fn role_id_by_name(&self, role: &str) -> Result<Option<RoleId>> {
+        Ok(self.meta.get_role_by_name(role).await?.map(|role| role.id))
+    }
+
+    /// List database names visible to this security context.
+    pub async fn list_database_names(&self, security: &SecurityContext) -> Result<Vec<String>> {
+        let dbs = self.meta.list_databases().await?;
+        let mut visible = Vec::new();
+        for db in dbs {
+            if self
+                .has_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Database, db.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?
+            {
+                visible.push(db.name);
+            }
+        }
+        Ok(visible)
+    }
+
+    /// List table names visible to this security context.
+    pub async fn list_table_names(
+        &self,
+        db: &str,
+        security: &SecurityContext,
+    ) -> Result<Vec<String>> {
+        let db_meta = self.find_database(db).await?;
         let schemas = self.meta.list_schemas(db_meta.id).await?;
         let mut tables = Vec::new();
         for schema in &schemas {
-            let schema_tables = self.meta.list_tables(db_meta.id, schema.id).await?;
-            tables.extend(schema_tables.iter().map(|t| t.name.clone()));
+            if !self
+                .has_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?
+            {
+                continue;
+            }
+            for table in self.meta.list_tables(db_meta.id, schema.id).await? {
+                if self
+                    .has_privilege(
+                        security,
+                        ObjectRef::new(ObjectType::Table, table.id),
+                        SecurityPrivilege::Select,
+                    )
+                    .await?
+                {
+                    tables.push(table.name);
+                }
+            }
         }
         Ok(tables)
     }
 
-    /// Check if current user has the required privilege on a table.
-    /// Returns Ok(()) if allowed, Err if denied.
-    /// Skips check in dev mode (no user set) or for admin users.
-    async fn check_privilege(
+    fn is_accountadmin(security: &SecurityContext) -> bool {
+        security.active_role_ids().contains(&ACCOUNTADMIN_ROLE_ID)
+    }
+
+    async fn has_privilege(
         &self,
-        table_name: &str,
-        privilege: crate::rbac::Privilege,
-    ) -> Result<()> {
-        let user = self.current_user.read().await;
-        match *user {
-            None => Ok(()),               // dev mode: no RBAC
-            Some((_uid, true)) => Ok(()), // admin: full access
-            Some((uid, false)) => {
-                if self.rbac.check_privilege(uid, table_name, privilege).await {
-                    Ok(())
-                } else {
-                    Err(NovaError::Internal {
-                        message: format!(
-                            "access denied: user {} lacks {:?} on {}",
-                            uid, privilege, table_name
-                        ),
-                    })
-                }
+        security: &SecurityContext,
+        object: ObjectRef,
+        privilege: SecurityPrivilege,
+    ) -> Result<bool> {
+        if Self::is_accountadmin(security) {
+            return Ok(true);
+        }
+        let active_roles = security.active_role_ids();
+        if let Some(owner) = self.meta.get_object_owner(object).await?
+            && active_roles.contains(&owner.owner_role_id)
+        {
+            return Ok(true);
+        }
+        for role_id in active_roles {
+            if let Some(grant) = self.meta.get_grant(role_id, object).await?
+                && grant.privileges.contains(privilege)
+            {
+                return Ok(true);
             }
+        }
+        Ok(false)
+    }
+
+    async fn require_privilege(
+        &self,
+        security: &SecurityContext,
+        object: ObjectRef,
+        privilege: SecurityPrivilege,
+    ) -> Result<()> {
+        if self.has_privilege(security, object, privilege).await? {
+            Ok(())
+        } else {
+            Err(NovaError::PermissionDenied {
+                user: security.username.clone(),
+                action: format!(
+                    "{} on {}:{}",
+                    privilege, object.object_type, object.object_id
+                ),
+            })
         }
     }
 
-    /// Execute a resolved statement.
-    pub async fn execute(&self, stmt: ResolvedStatement) -> Result<QueryResult> {
+    async fn find_database(&self, db: &str) -> Result<DatabaseMeta> {
+        self.meta
+            .list_databases()
+            .await?
+            .into_iter()
+            .find(|d| d.name == db)
+            .ok_or_else(|| NovaError::DatabaseNotFound {
+                db_name: db.to_string(),
+            })
+    }
+
+    async fn find_schema_meta(&self, db_id: DatabaseId, schema: &str) -> Result<SchemaMeta> {
+        self.meta
+            .list_schemas(db_id)
+            .await?
+            .into_iter()
+            .find(|s| s.name == schema)
+            .ok_or_else(|| NovaError::SchemaNotFound {
+                schema_name: schema.to_string(),
+            })
+    }
+
+    async fn authorize_table(
+        &self,
+        security: &SecurityContext,
+        db: &str,
+        schema: &str,
+        table: &str,
+        privilege: SecurityPrivilege,
+    ) -> Result<()> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        let table_meta = self.find_table(db, schema, table).await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Database, db_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Schema, schema_meta.id),
+            SecurityPrivilege::Usage,
+        )
+        .await?;
+        self.require_privilege(
+            security,
+            ObjectRef::new(ObjectType::Table, table_meta.id),
+            privilege,
+        )
+        .await
+    }
+
+    /// Internal/test root execution helper. MySQL production paths must use session SecurityContext.
+    pub async fn execute_as_root_for_internal(
+        &self,
+        stmt: ResolvedStatement,
+    ) -> Result<QueryResult> {
+        self.execute_with_context(stmt, &SecurityContext::root())
+            .await
+    }
+
+    /// Execute a resolved statement with per-session security context.
+    pub async fn execute_with_context(
+        &self,
+        stmt: ResolvedStatement,
+        security: &SecurityContext,
+    ) -> Result<QueryResult> {
         match stmt {
-            ResolvedStatement::CreateDatabase { name } => self.exec_create_database(name).await,
+            ResolvedStatement::CreateDatabase { name } => {
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID),
+                    SecurityPrivilege::CreateDatabase,
+                )
+                .await?;
+                self.exec_create_database(security, name).await
+            }
             ResolvedStatement::CreateTable {
                 db,
                 schema,
                 table,
                 columns,
             } => {
-                self.check_privilege(&table, crate::rbac::Privilege::Create)
+                let db_meta = self.find_database(&db).await?;
+                if let Ok(schema_meta) = self.find_schema_meta(db_meta.id, &schema).await {
+                    self.require_privilege(
+                        security,
+                        ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                        SecurityPrivilege::CreateTable,
+                    )
                     .await?;
-                self.exec_create_table(db, schema, table, columns).await
+                } else {
+                    self.require_privilege(
+                        security,
+                        ObjectRef::new(ObjectType::Database, db_meta.id),
+                        SecurityPrivilege::CreateSchema,
+                    )
+                    .await?;
+                }
+                self.exec_create_table(security, db, schema, table, columns)
+                    .await
             }
             ResolvedStatement::Insert {
                 db,
@@ -122,7 +298,7 @@ impl Executor {
                 table,
                 values,
             } => {
-                self.check_privilege(&table, crate::rbac::Privilege::Insert)
+                self.authorize_table(security, &db, &schema, &table, SecurityPrivilege::Insert)
                     .await?;
                 self.exec_insert(db, schema, table, values).await
             }
@@ -130,11 +306,27 @@ impl Executor {
                 db,
                 schema,
                 table,
+                dependencies,
                 projection,
                 filter,
                 at_timestamp,
                 raw_sql,
             } => {
+                let dependencies = if dependencies.is_empty() {
+                    vec![table.clone()]
+                } else {
+                    dependencies
+                };
+                for dependency in &dependencies {
+                    self.authorize_table(
+                        security,
+                        &db,
+                        &schema,
+                        dependency,
+                        SecurityPrivilege::Select,
+                    )
+                    .await?;
+                }
                 self.exec_select(db, schema, table, projection, filter, at_timestamp, raw_sql)
                     .await
             }
@@ -145,7 +337,7 @@ impl Executor {
                 assignments,
                 filter,
             } => {
-                self.check_privilege(&table, crate::rbac::Privilege::Update)
+                self.authorize_table(security, &db, &schema, &table, SecurityPrivilege::Update)
                     .await?;
                 self.exec_update(&db, &schema, &table, assignments, filter)
                     .await
@@ -156,7 +348,7 @@ impl Executor {
                 table,
                 filter,
             } => {
-                self.check_privilege(&table, crate::rbac::Privilege::Delete)
+                self.authorize_table(security, &db, &schema, &table, SecurityPrivilege::Delete)
                     .await?;
                 self.exec_delete(&db, &schema, &table, filter).await
             }
@@ -167,6 +359,22 @@ impl Executor {
                 source_table,
                 at_timestamp,
             } => {
+                self.authorize_table(
+                    security,
+                    &db,
+                    &schema,
+                    &source_table,
+                    SecurityPrivilege::Select,
+                )
+                .await?;
+                let db_meta = self.find_database(&db).await?;
+                let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::CreateTable,
+                )
+                .await?;
                 self.exec_clone(&db, &schema, &clone_table, &source_table, at_timestamp)
                     .await
             }
@@ -177,10 +385,28 @@ impl Executor {
                 table,
                 append_only,
             } => {
-                self.exec_create_stream(&db, &schema, &stream_name, &table, append_only)
+                self.authorize_table(security, &db, &schema, &table, SecurityPrivilege::Select)
+                    .await?;
+                let db_meta = self.find_database(&db).await?;
+                let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::CreateStream,
+                )
+                .await?;
+                self.exec_create_stream(security, &db, &schema, &stream_name, &table, append_only)
                     .await
             }
-            ResolvedStatement::Gc { retention_days } => self.exec_gc(retention_days).await,
+            ResolvedStatement::Gc { retention_days } => {
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID),
+                    SecurityPrivilege::Operate,
+                )
+                .await?;
+                self.exec_gc(retention_days).await
+            }
             ResolvedStatement::Begin => {
                 let txn_id = self.meta.begin_transaction().await?;
                 let mut txn_guard = self.current_txn.lock().unwrap();
@@ -223,22 +449,39 @@ impl Executor {
                     }),
                 }
             }
-            ResolvedStatement::Backup { path } => Ok(QueryResult::Success {
-                message: format!(
-                    "Backup created{}",
-                    path.map(|p| format!(" to {}", p)).unwrap_or_default()
-                ),
-            }),
-            ResolvedStatement::Restore { path } => Ok(QueryResult::Success {
-                message: format!("Restored from {}", path),
-            }),
+            ResolvedStatement::Backup { path } => {
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID),
+                    SecurityPrivilege::Operate,
+                )
+                .await?;
+                Ok(QueryResult::Success {
+                    message: format!(
+                        "Backup created{}",
+                        path.map(|p| format!(" to {}", p)).unwrap_or_default()
+                    ),
+                })
+            }
+            ResolvedStatement::Restore { path } => {
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID),
+                    SecurityPrivilege::Operate,
+                )
+                .await?;
+                Ok(QueryResult::Success {
+                    message: format!("Restored from {}", path),
+                })
+            }
             ResolvedStatement::AlterTable {
                 db,
                 schema,
                 table,
                 action,
             } => {
-                let _table_meta = self.find_table(&db, &schema, &table).await?;
+                self.authorize_table(security, &db, &schema, &table, SecurityPrivilege::Ownership)
+                    .await?;
                 match action {
                     crate::analyzer::AlterAction::AddColumn { name, data_type } => {
                         tracing::info!(
@@ -264,7 +507,7 @@ impl Executor {
                 }
             }
             ResolvedStatement::DropTable { db, schema, table } => {
-                self.check_privilege(&table, crate::rbac::Privilege::Drop)
+                self.authorize_table(security, &db, &schema, &table, SecurityPrivilege::Ownership)
                     .await?;
                 let table_meta = self.find_table(&db, &schema, &table).await?;
                 self.meta.drop_table(table_meta.id).await?;
@@ -279,6 +522,12 @@ impl Executor {
                         db_name: name.clone(),
                     }
                 })?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Database, db_meta.id),
+                    SecurityPrivilege::Ownership,
+                )
+                .await?;
                 self.meta.drop_database(db_meta.id).await?;
                 Ok(QueryResult::Success {
                     message: format!("Database '{}' dropped", name),
@@ -297,6 +546,12 @@ impl Executor {
                         message: format!("schema '{}' not found", schema),
                     }
                 })?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::Ownership,
+                )
+                .await?;
                 self.meta.drop_schema(db_meta.id, schema_meta.id).await?;
                 Ok(QueryResult::Success {
                     message: format!("Schema '{}.{}' dropped", db, schema),
@@ -311,7 +566,16 @@ impl Executor {
                 refresh_mode,
                 initialize_on_create,
             } => {
+                let db_meta = self.find_database(&db).await?;
+                let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, schema_meta.id),
+                    SecurityPrivilege::CreateDynamicTable,
+                )
+                .await?;
                 self.exec_create_dynamic_table(
+                    security,
                     &db,
                     &schema,
                     &name,
@@ -323,24 +587,57 @@ impl Executor {
                 .await
             }
             ResolvedStatement::RefreshDynamicTable { db, schema, name } => {
+                let dt = self.find_dynamic_table(&db, &schema, &name).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::DynamicTable, dt.id),
+                    SecurityPrivilege::Operate,
+                )
+                .await?;
                 self.exec_refresh_dynamic_table(&db, &schema, &name).await
             }
             ResolvedStatement::SuspendDynamicTable { db, schema, name } => {
+                let dt = self.find_dynamic_table(&db, &schema, &name).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::DynamicTable, dt.id),
+                    SecurityPrivilege::Operate,
+                )
+                .await?;
                 self.exec_set_dt_scheduler(&db, &schema, &name, false).await
             }
             ResolvedStatement::ResumeDynamicTable { db, schema, name } => {
+                let dt = self.find_dynamic_table(&db, &schema, &name).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::DynamicTable, dt.id),
+                    SecurityPrivilege::Operate,
+                )
+                .await?;
                 self.exec_set_dt_scheduler(&db, &schema, &name, true).await
             }
             ResolvedStatement::DropDynamicTable { db, schema, name } => {
+                let dt = self.find_dynamic_table(&db, &schema, &name).await?;
+                self.require_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::DynamicTable, dt.id),
+                    SecurityPrivilege::Ownership,
+                )
+                .await?;
                 self.exec_drop_dynamic_table(&db, &schema, &name).await
             }
             ResolvedStatement::ShowDynamicTables { db, pattern } => {
-                self.exec_show_dynamic_tables(&db, pattern.as_deref()).await
+                self.exec_show_dynamic_tables(security, &db, pattern.as_deref())
+                    .await
             }
         }
     }
 
-    async fn exec_create_database(&self, name: String) -> Result<QueryResult> {
+    async fn exec_create_database(
+        &self,
+        security: &SecurityContext,
+        name: String,
+    ) -> Result<QueryResult> {
         let db = DatabaseMeta {
             id: 0,
             name: name.clone(),
@@ -348,6 +645,23 @@ impl Executor {
             owner: 1,
         };
         self.meta.create_database(db).await?;
+        let created = self.find_database(&name).await?;
+        if self
+            .meta
+            .get_role(security.primary_role_id)
+            .await?
+            .is_some()
+        {
+            self.meta
+                .set_object_owner(ObjectOwnerMeta {
+                    object: ObjectRef::new(ObjectType::Database, created.id),
+                    owner_role_id: security.primary_role_id,
+                    created_by_user_id: security.user_id,
+                    created_at: now_micros(),
+                    transferred_at: None,
+                })
+                .await?;
+        }
         Ok(QueryResult::Success {
             message: format!("Database '{}' created", name),
         })
@@ -355,6 +669,7 @@ impl Executor {
 
     async fn exec_create_table(
         &self,
+        security: &SecurityContext,
         db: String,
         schema: String,
         table: String,
@@ -419,6 +734,23 @@ impl Executor {
             properties: Default::default(),
         };
         self.meta.create_table(t).await?;
+        let created = self.find_table(&db, &schema, &table).await?;
+        if self
+            .meta
+            .get_role(security.primary_role_id)
+            .await?
+            .is_some()
+        {
+            self.meta
+                .set_object_owner(ObjectOwnerMeta {
+                    object: ObjectRef::new(ObjectType::Table, created.id),
+                    owner_role_id: security.primary_role_id,
+                    created_by_user_id: security.user_id,
+                    created_at: now_micros(),
+                    transferred_at: None,
+                })
+                .await?;
+        }
 
         Ok(QueryResult::Success {
             message: format!("Table '{}.{}.{}' created", db, schema, table),
@@ -516,6 +848,7 @@ impl Executor {
                 db: db.clone(),
                 schema: schema.clone(),
                 table: table.clone(),
+                dependencies: vec![table.clone()],
                 projection: projection.clone(),
                 filter,
                 at_timestamp,
@@ -991,6 +1324,7 @@ impl Executor {
     /// Stream tracks changes (INSERT/UPDATE/DELETE) via MP version diffs.
     async fn exec_create_stream(
         &self,
+        security: &SecurityContext,
         db: &str,
         schema: &str,
         stream_name: &str,
@@ -998,20 +1332,37 @@ impl Executor {
         append_only: bool,
     ) -> Result<QueryResult> {
         let table_meta = self.find_table(db, schema, table).await?;
+        let stream_id = generate_id();
 
         let stream = StreamMeta {
-            stream_id: 0, // auto-assigned
+            stream_id,
             table_id: table_meta.id,
             name: stream_name.to_string(),
             append_only,
             created_at: now_micros(),
         };
         self.meta.create_stream(stream).await?;
+        if self
+            .meta
+            .get_role(security.primary_role_id)
+            .await?
+            .is_some()
+        {
+            self.meta
+                .set_object_owner(ObjectOwnerMeta {
+                    object: ObjectRef::new(ObjectType::Stream, stream_id),
+                    owner_role_id: security.primary_role_id,
+                    created_by_user_id: security.user_id,
+                    created_at: now_micros(),
+                    transferred_at: None,
+                })
+                .await?;
+        }
 
         Ok(QueryResult::Success {
             message: format!(
-                "Stream '{}' created on table '{}' (append_only={})",
-                stream_name, table, append_only
+                "Stream '{}' created on table '{}' (append_only={}, id={})",
+                stream_name, table, append_only, stream_id
             ),
         })
     }
@@ -1063,6 +1414,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     async fn exec_create_dynamic_table(
         &self,
+        security: &SecurityContext,
         db: &str,
         schema: &str,
         name: &str,
@@ -1127,6 +1479,22 @@ impl Executor {
             scheduler_enabled: true,
         };
         self.meta.create_dynamic_table(dt).await?;
+        if self
+            .meta
+            .get_role(security.primary_role_id)
+            .await?
+            .is_some()
+        {
+            self.meta
+                .set_object_owner(ObjectOwnerMeta {
+                    object: ObjectRef::new(ObjectType::DynamicTable, dt_id),
+                    owner_role_id: security.primary_role_id,
+                    created_by_user_id: security.user_id,
+                    created_at: now_micros(),
+                    transferred_at: None,
+                })
+                .await?;
+        }
 
         // 4. Immediate initial refresh if requested
         if initialize_on_create {
@@ -1454,6 +1822,7 @@ impl Executor {
 
     async fn exec_show_dynamic_tables(
         &self,
+        security: &SecurityContext,
         db: &str,
         pattern: Option<&str>,
     ) -> Result<QueryResult> {
@@ -1467,27 +1836,44 @@ impl Executor {
                 db_name: db.to_string(),
             })?;
         let dts = self.meta.list_dynamic_tables(db_meta.id).await?;
-        let rows: Vec<Vec<String>> = dts
-            .iter()
-            .filter(|d| pattern.map(|p| d.name.contains(p)).unwrap_or(true))
-            .map(|d| {
-                vec![
-                    d.name.clone(),
-                    format!("{}", d.refresh_mode),
-                    d.target_lag_seconds.to_string(),
-                    d.last_refresh_ts
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "never".to_string()),
-                    format!("{}", d.refresh_status),
-                    if d.scheduler_enabled {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
-                    .to_string(),
-                ]
-            })
-            .collect();
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for dt in &dts {
+            if !pattern.map(|p| dt.name.contains(p)).unwrap_or(true) {
+                continue;
+            }
+            let has_schema_usage = self
+                .has_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::Schema, dt.schema_id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?;
+            let has_object_usage = self
+                .has_privilege(
+                    security,
+                    ObjectRef::new(ObjectType::DynamicTable, dt.id),
+                    SecurityPrivilege::Usage,
+                )
+                .await?;
+            if !has_schema_usage && !has_object_usage {
+                continue;
+            }
+            rows.push(vec![
+                dt.name.clone(),
+                format!("{}", dt.refresh_mode),
+                dt.target_lag_seconds.to_string(),
+                dt.last_refresh_ts
+                    .map(|t| t.to_string())
+                    .unwrap_or_else(|| "never".to_string()),
+                format!("{}", dt.refresh_status),
+                if dt.scheduler_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+                .to_string(),
+            ]);
+        }
         Ok(QueryResult::Rows {
             columns: vec![
                 "name".into(),
@@ -1597,6 +1983,24 @@ impl Executor {
             .find(|t| t.name == table)
             .ok_or_else(|| NovaError::TableNotFound {
                 table_name: table.to_string(),
+            })
+    }
+
+    async fn find_dynamic_table(
+        &self,
+        db: &str,
+        schema: &str,
+        name: &str,
+    ) -> Result<DynamicTableMeta> {
+        let db_meta = self.find_database(db).await?;
+        let schema_meta = self.find_schema_meta(db_meta.id, schema).await?;
+        self.meta
+            .list_dynamic_tables(db_meta.id)
+            .await?
+            .into_iter()
+            .find(|dt| dt.schema_id == schema_meta.id && dt.name == name)
+            .ok_or_else(|| NovaError::Internal {
+                message: format!("dynamic table '{}' not found", name),
             })
     }
 
@@ -1896,8 +2300,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
-        let meta: Arc<dyn MetadataStore> =
-            Arc::new(nova_storage::FdbMetadataStore::open("docker:docker@127.0.0.1:4500").unwrap());
+        let meta: Arc<dyn MetadataStore> = Arc::new(
+            nova_storage::FdbMetadataStore::open_test(
+                "docker:docker@127.0.0.1:4500",
+                format!("test_{}", nova_common::now_micros()).into_bytes(),
+            )
+            .unwrap(),
+        );
         let writer = MpWriter::new(store.clone(), "test".to_string());
         let reader = MpReader::new(store);
         let executor = Executor::new(meta, writer, reader);
@@ -1908,7 +2317,7 @@ mod tests {
     async fn test_create_database() {
         let (executor, _dir) = setup();
         let result = executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "my_db".to_string(),
             })
             .await
@@ -1924,14 +2333,14 @@ mod tests {
     async fn test_create_table() {
         let (executor, _dir) = setup();
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "my_db".to_string(),
             })
             .await
             .unwrap();
 
         let result = executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "my_db".to_string(),
                 schema: "public".to_string(),
                 table: "orders".to_string(),
@@ -1963,7 +2372,7 @@ mod tests {
 
         // Create database
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "db".to_string(),
             })
             .await
@@ -1971,7 +2380,7 @@ mod tests {
 
         // Create table
         executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "users".to_string(),
@@ -1993,7 +2402,7 @@ mod tests {
 
         // Insert
         let result = executor
-            .execute(ResolvedStatement::Insert {
+            .execute_as_root_for_internal(ResolvedStatement::Insert {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "users".to_string(),
@@ -2018,10 +2427,11 @@ mod tests {
 
         // Select
         let result = executor
-            .execute(ResolvedStatement::Select {
+            .execute_as_root_for_internal(ResolvedStatement::Select {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "users".to_string(),
+                dependencies: vec!["users".to_string()],
                 projection: vec!["id".to_string(), "name".to_string()],
                 filter: None,
                 at_timestamp: None,
@@ -2050,24 +2460,36 @@ mod tests {
         // CREATE DATABASE
         let stmts = parser.parse("CREATE DATABASE testdb").unwrap();
         let resolved = analyzer.resolve(&stmts[0]).unwrap();
-        executor.execute(resolved).await.unwrap();
+        executor
+            .execute_as_root_for_internal(resolved)
+            .await
+            .unwrap();
 
         // CREATE TABLE
         let stmts = parser
             .parse("CREATE TABLE testdb.public.items (id INT, price FLOAT)")
             .unwrap();
         let resolved = analyzer.resolve(&stmts[0]).unwrap();
-        executor.execute(resolved).await.unwrap();
+        executor
+            .execute_as_root_for_internal(resolved)
+            .await
+            .unwrap();
 
         // INSERT
         let stmts = parser.parse("INSERT INTO items VALUES (1, 9.99)").unwrap();
         let resolved = analyzer.resolve(&stmts[0]).unwrap();
-        executor.execute(resolved).await.unwrap();
+        executor
+            .execute_as_root_for_internal(resolved)
+            .await
+            .unwrap();
 
         // SELECT
         let stmts = parser.parse("SELECT id, price FROM items").unwrap();
         let resolved = analyzer.resolve(&stmts[0]).unwrap();
-        let result = executor.execute(resolved).await.unwrap();
+        let result = executor
+            .execute_as_root_for_internal(resolved)
+            .await
+            .unwrap();
 
         if let QueryResult::Rows { rows, .. } = result {
             assert_eq!(rows.len(), 1);
@@ -2083,14 +2505,14 @@ mod tests {
 
         // Create database + table + insert data
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "db".to_string(),
             })
             .await
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "users".to_string(),
@@ -2111,7 +2533,7 @@ mod tests {
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::Insert {
+            .execute_as_root_for_internal(ResolvedStatement::Insert {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "users".to_string(),
@@ -2131,7 +2553,7 @@ mod tests {
 
         // UPDATE users SET name = 'updated' WHERE id = 1
         let result = executor
-            .execute(ResolvedStatement::Update {
+            .execute_as_root_for_internal(ResolvedStatement::Update {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "users".to_string(),
@@ -2161,14 +2583,14 @@ mod tests {
         let (executor, _dir) = setup();
 
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "db".to_string(),
             })
             .await
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "items".to_string(),
@@ -2182,7 +2604,7 @@ mod tests {
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::Insert {
+            .execute_as_root_for_internal(ResolvedStatement::Insert {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "items".to_string(),
@@ -2197,7 +2619,7 @@ mod tests {
 
         // DELETE FROM items WHERE id = 2
         let result = executor
-            .execute(ResolvedStatement::Delete {
+            .execute_as_root_for_internal(ResolvedStatement::Delete {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "items".to_string(),
@@ -2223,14 +2645,14 @@ mod tests {
         let (executor, _dir) = setup();
 
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "db".to_string(),
             })
             .await
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "source".to_string(),
@@ -2244,7 +2666,7 @@ mod tests {
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::Insert {
+            .execute_as_root_for_internal(ResolvedStatement::Insert {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "source".to_string(),
@@ -2255,7 +2677,7 @@ mod tests {
 
         // CLONE source → clone_table
         let result = executor
-            .execute(ResolvedStatement::CreateClone {
+            .execute_as_root_for_internal(ResolvedStatement::CreateClone {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 clone_table: "clone_table".to_string(),
@@ -2279,14 +2701,14 @@ mod tests {
         let (executor, _dir) = setup();
 
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "db".to_string(),
             })
             .await
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "events".to_string(),
@@ -2300,7 +2722,7 @@ mod tests {
             .unwrap();
 
         let result = executor
-            .execute(ResolvedStatement::CreateStream {
+            .execute_as_root_for_internal(ResolvedStatement::CreateStream {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 stream_name: "events_stream".to_string(),
@@ -2324,14 +2746,14 @@ mod tests {
         let (executor, _dir) = setup();
 
         executor
-            .execute(ResolvedStatement::CreateDatabase {
+            .execute_as_root_for_internal(ResolvedStatement::CreateDatabase {
                 name: "db".to_string(),
             })
             .await
             .unwrap();
 
         executor
-            .execute(ResolvedStatement::CreateTable {
+            .execute_as_root_for_internal(ResolvedStatement::CreateTable {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "history".to_string(),
@@ -2346,7 +2768,7 @@ mod tests {
 
         // Insert data
         executor
-            .execute(ResolvedStatement::Insert {
+            .execute_as_root_for_internal(ResolvedStatement::Insert {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "history".to_string(),
@@ -2357,10 +2779,11 @@ mod tests {
 
         // SELECT with at_timestamp = 0 (before any data) → should return empty
         let result = executor
-            .execute(ResolvedStatement::Select {
+            .execute_as_root_for_internal(ResolvedStatement::Select {
                 db: "db".to_string(),
                 schema: "public".to_string(),
                 table: "history".to_string(),
+                dependencies: vec!["history".to_string()],
                 projection: vec!["id".to_string()],
                 filter: None,
                 at_timestamp: Some(1), // very early timestamp

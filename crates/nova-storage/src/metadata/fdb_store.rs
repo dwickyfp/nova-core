@@ -24,10 +24,33 @@ use foundationdb as fdb;
 use nova_common::{NovaError, Result, *};
 use std::{
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, Once, OnceLock},
 };
 
 use super::MetadataStore;
+
+static FDB_NETWORK: OnceLock<Mutex<Option<Box<fdb::api::NetworkAutoStop>>>> = OnceLock::new();
+static FDB_NETWORK_ATEXIT: Once = Once::new();
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+}
+
+extern "C" fn shutdown_fdb_network() {
+    if let Some(network) = FDB_NETWORK.get()
+        && let Ok(mut guard) = network.lock()
+    {
+        let _ = guard.take();
+    }
+}
+
+fn register_fdb_network_shutdown() {
+    #[cfg(unix)]
+    unsafe {
+        let _ = atexit(shutdown_fdb_network);
+    }
+}
 
 /// FoundationDB metadata store for production deployments.
 pub struct FdbMetadataStore {
@@ -42,8 +65,18 @@ impl FdbMetadataStore {
     }
 
     fn network() -> &'static fdb::api::NetworkAutoStop {
-        static NETWORK: OnceLock<&'static fdb::api::NetworkAutoStop> = OnceLock::new();
-        NETWORK.get_or_init(|| Box::leak(Box::new(unsafe { fdb::boot() })))
+        let slot = FDB_NETWORK.get_or_init(|| Mutex::new(None));
+        let mut guard = slot.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(Box::new(unsafe { fdb::boot() }));
+            FDB_NETWORK_ATEXIT.call_once(register_fdb_network_shutdown);
+        }
+        let network = guard
+            .as_ref()
+            .map(|network| &**network as *const fdb::api::NetworkAutoStop)
+            .expect("FDB network initialized");
+        drop(guard);
+        unsafe { &*network }
     }
 
     /// Connect to a FoundationDB cluster using either a cluster file path or raw cluster contents.
@@ -73,8 +106,8 @@ impl FdbMetadataStore {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_test(cluster_file: &str, subspace: Vec<u8>) -> Result<Self> {
+    #[doc(hidden)]
+    pub fn open_test(cluster_file: &str, subspace: Vec<u8>) -> Result<Self> {
         let network = Self::network();
         let cluster_file = Self::cluster_file_path(cluster_file)?;
         let db = fdb::Database::new(Some(&cluster_file)).map_err(|e| NovaError::Internal {
@@ -419,7 +452,11 @@ impl MetadataStore for FdbMetadataStore {
     //  TABLE OPERATIONS
     // ══════════════════════════════════════════════════════════════
 
-    async fn create_table(&self, table: TableMeta) -> Result<()> {
+    async fn create_table(&self, mut table: TableMeta) -> Result<()> {
+        if table.id == 0 {
+            let key = self.pack(&("next_id", "table"));
+            table.id = self.fdb_atomic_inc(key).await?;
+        }
         let key = self.pack(&("table", table.db_id, table.schema_id, table.id));
         let val = Self::serialize(&table)?;
         self.fdb_set(key, val).await
@@ -522,12 +559,12 @@ impl MetadataStore for FdbMetadataStore {
         let kvs = self.fdb_get_range(start, end).await?;
 
         let mut mps = Vec::new();
-        for (_, _) in &kvs {
+        for (key_bytes, _) in &kvs {
             // Index entries have empty values. Key format: ("nova", "table_mps", table_id, mp_id)
             // Unpack mp_id from key
             let unpacked: (String, TableId, MpId) =
                 self.subspace
-                    .unpack(&kvs[0].0)
+                    .unpack(key_bytes)
                     .map_err(|e| NovaError::Internal {
                         message: format!("FDB tuple unpack failed: {}", e),
                     })?;

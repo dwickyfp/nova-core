@@ -87,6 +87,8 @@ cargo build --release --features nova-cli/fdb-backend
 
 Full design: [`docs/design/architecture.md`](docs/design/architecture.md)
 
+Enterprise RBAC / role ownership roadmap: [`docs/design/enterprise-rbac-roadmap.md`](docs/design/enterprise-rbac-roadmap.md)
+
 ---
 
 ## Tech Stack
