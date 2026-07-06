@@ -95,15 +95,21 @@ impl FdbMetadataStore {
                         .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
                     trx.set(&user_role_key, &encoded);
                     trx.set(&role_user_key, b"");
-                    let current = trx
+                    let current = match trx
                         .get(&epoch_key, false)
                         .await
                         .map_err(fdb::FdbBindingError::from)?
-                        .map(|v| {
-                            let bytes: [u8; 8] = v.as_ref().try_into().unwrap_or([0; 8]);
+                    {
+                        Some(value) => {
+                            let bytes: [u8; 8] = value.as_ref().try_into().map_err(|_| {
+                                fdb::FdbBindingError::CustomError(Box::new(std::io::Error::other(
+                                    "corrupt metadata value 'security_epoch': expected 8 bytes",
+                                )))
+                            })?;
                             u64::from_be_bytes(bytes)
-                        })
-                        .unwrap_or(0);
+                        }
+                        None => 0,
+                    };
                     trx.set(&epoch_key, &(current + 1).to_be_bytes()[..]);
                     Ok::<(), fdb::FdbBindingError>(())
                 }
@@ -134,15 +140,21 @@ impl FdbMetadataStore {
                     }
                     trx.clear(&user_role_key);
                     trx.clear(&role_user_key);
-                    let current = trx
+                    let current = match trx
                         .get(&epoch_key, false)
                         .await
                         .map_err(fdb::FdbBindingError::from)?
-                        .map(|v| {
-                            let bytes: [u8; 8] = v.as_ref().try_into().unwrap_or([0; 8]);
+                    {
+                        Some(value) => {
+                            let bytes: [u8; 8] = value.as_ref().try_into().map_err(|_| {
+                                fdb::FdbBindingError::CustomError(Box::new(std::io::Error::other(
+                                    "corrupt metadata value 'security_epoch': expected 8 bytes",
+                                )))
+                            })?;
                             u64::from_be_bytes(bytes)
-                        })
-                        .unwrap_or(0);
+                        }
+                        None => 0,
+                    };
                     trx.set(&epoch_key, &(current + 1).to_be_bytes()[..]);
                     Ok::<(), fdb::FdbBindingError>(())
                 }
@@ -184,16 +196,17 @@ impl FdbMetadataStore {
                 let parent_child_value = parent_child_value.clone();
                 async move {
                     for key in role_keys {
-                        if trx
+                        let Some(value) = trx
                             .get(&key, false)
                             .await
                             .map_err(fdb::FdbBindingError::from)?
-                            .is_none()
-                        {
+                        else {
                             return Err(fdb::FdbBindingError::CustomError(Box::new(
                                 std::io::Error::new(std::io::ErrorKind::NotFound, "role not found"),
                             )));
-                        }
+                        };
+                        bincode::deserialize::<RoleMeta>(value.as_ref())
+                            .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
                     }
 
                     let mut seen = HashSet::new();
@@ -225,6 +238,8 @@ impl FdbMetadataStore {
                             .await
                             .map_err(fdb::FdbBindingError::from)?;
                         for kv in values {
+                            bincode::deserialize::<RoleGrantMeta>(kv.value())
+                                .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
                             let unpacked: (String, RoleId, RoleId) = subspace
                                 .unpack(kv.key())
                                 .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
@@ -279,16 +294,17 @@ impl FdbMetadataStore {
                 let epoch_key = epoch_key.clone();
                 async move {
                     for key in role_keys {
-                        if trx
+                        let Some(value) = trx
                             .get(&key, false)
                             .await
                             .map_err(fdb::FdbBindingError::from)?
-                            .is_none()
-                        {
+                        else {
                             return Err(fdb::FdbBindingError::CustomError(Box::new(
                                 std::io::Error::new(std::io::ErrorKind::NotFound, "role not found"),
                             )));
-                        }
+                        };
+                        bincode::deserialize::<RoleMeta>(value.as_ref())
+                            .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
                     }
 
                     if trx
@@ -747,7 +763,8 @@ impl SecurityStore for FdbMetadataStore {
     async fn list_role_children(&self, parent_role_id: RoleId) -> Result<Vec<RoleId>> {
         let (start, end) = self.category_range(&("role_child", parent_role_id));
         let mut children = vec![];
-        for (key, _) in self.fdb_get_range(start, end).await? {
+        for (key, value) in self.fdb_get_range(start, end).await? {
+            let _: RoleGrantMeta = Self::deserialize(&value)?;
             let unpacked: (String, RoleId, RoleId) =
                 self.subspace
                     .unpack(&key)
@@ -1127,6 +1144,66 @@ mod tests {
             .await?;
 
         assert!(store.revoke_role_from_role(parent, child).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_rejects_corrupt_role_metadata() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_corrupt_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let parent = store.create_role(role("parent_role")).await?;
+        let child = store.create_role(role("child_role")).await?;
+
+        store
+            .fdb_set(store.pack(&("role", child)), vec![1, 2, 3])
+            .await?;
+
+        assert!(
+            store
+                .grant_role_to_role(parent, child, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
+        assert!(store.revoke_role_from_role(parent, child).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_rejects_corrupt_child_grant_metadata() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_child_corrupt_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let parent = store.create_role(role("parent_role")).await?;
+        let child = store.create_role(role("child_role")).await?;
+        let grandchild = store.create_role(role("grandchild_role")).await?;
+        store
+            .grant_role_to_role(parent, child, ACCOUNTADMIN_ROLE_ID)
+            .await?;
+        store
+            .grant_role_to_role(child, grandchild, ACCOUNTADMIN_ROLE_ID)
+            .await?;
+
+        store
+            .fdb_set(
+                store.pack(&("role_child", child, grandchild)),
+                vec![1, 2, 3],
+            )
+            .await?;
+
+        assert!(store.list_role_children(child).await.is_err());
+        assert!(
+            store
+                .grant_role_to_role(grandchild, parent, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
