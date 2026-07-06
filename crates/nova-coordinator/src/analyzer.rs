@@ -4,7 +4,7 @@ use nova_common::{
     FunctionArg, FunctionBody, FunctionLanguage, FunctionNullHandling, FunctionSignature,
     FunctionVolatility, NovaError, Result, StreamReadMode, Timestamp,
 };
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Action, GrantObjects, Privileges, Statement};
 
 /// Resolved SQL statement ready for execution.
 #[derive(Debug)]
@@ -38,6 +38,29 @@ pub enum ResolvedStatement {
         name: String,
         signature: FunctionSignature,
         if_exists: bool,
+    },
+    GrantFunctionUsage {
+        db: String,
+        schema: String,
+        name: String,
+        signature: FunctionSignature,
+        role: String,
+    },
+    RevokeFunctionUsage {
+        db: String,
+        schema: String,
+        name: String,
+        signature: FunctionSignature,
+        role: String,
+    },
+    ShowGrantsOnFunction {
+        db: String,
+        schema: String,
+        name: String,
+        signature: FunctionSignature,
+    },
+    ShowGrantsToRole {
+        role: String,
     },
     Insert {
         db: String,
@@ -264,6 +287,113 @@ impl Analyzer {
                 message: format!("unsupported object name: {}", name),
             }),
         }
+    }
+
+    fn resolve_function_signature_text(
+        &self,
+        function_text: &str,
+    ) -> Result<(String, String, String, FunctionSignature)> {
+        let open_paren = function_text
+            .rfind('(')
+            .ok_or_else(|| NovaError::SqlAnalysisError {
+                message: format!(
+                    "function signature '{}' is missing argument list",
+                    function_text
+                ),
+            })?;
+        let close_paren = function_text
+            .rfind(')')
+            .ok_or_else(|| NovaError::SqlAnalysisError {
+                message: format!("function signature '{}' is missing ')'", function_text),
+            })?;
+        if close_paren < open_paren {
+            return Err(NovaError::SqlAnalysisError {
+                message: format!("invalid function signature '{}'", function_text),
+            });
+        }
+        let name_text = function_text[..open_paren].trim();
+        if name_text.is_empty() {
+            return Err(NovaError::SqlAnalysisError {
+                message: "function signature is missing a function name".to_string(),
+            });
+        }
+        let name_parts = name_text
+            .split('.')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let (db, schema, name) = match name_parts.as_slice() {
+            [function] => (
+                self.default_db.clone(),
+                self.default_schema.clone(),
+                function.clone(),
+            ),
+            [schema, function] => (self.default_db.clone(), schema.clone(), function.clone()),
+            [db, schema, function] => (db.clone(), schema.clone(), function.clone()),
+            _ => {
+                return Err(NovaError::SqlAnalysisError {
+                    message: format!("unsupported function name: {}", name_text),
+                });
+            }
+        };
+        let arg_text = function_text[open_paren + 1..close_paren].trim();
+        let arg_types = if arg_text.is_empty() {
+            Vec::new()
+        } else {
+            arg_text
+                .split(',')
+                .map(str::trim)
+                .filter(|data_type| !data_type.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        Ok((db, schema, name, FunctionSignature::new(arg_types)))
+    }
+
+    fn require_function_usage_privilege(privileges: &Privileges) -> Result<()> {
+        match privileges {
+            Privileges::Actions(actions) if matches!(actions.as_slice(), [Action::Usage]) => Ok(()),
+            _ => Err(NovaError::SqlAnalysisError {
+                message: "only USAGE can be granted or revoked on FUNCTION".to_string(),
+            }),
+        }
+    }
+
+    fn encoded_function_grant_object(objects: &GrantObjects) -> Result<String> {
+        let GrantObjects::Tables(objects) = objects else {
+            return Err(NovaError::SqlAnalysisError {
+                message: "only FUNCTION grants are supported by this GRANT/REVOKE path".to_string(),
+            });
+        };
+        let object_name = objects.first().ok_or_else(|| NovaError::SqlAnalysisError {
+            message: "FUNCTION grant requires an object".to_string(),
+        })?;
+        if objects.len() != 1 {
+            return Err(NovaError::SqlAnalysisError {
+                message: "FUNCTION grant supports one function at a time".to_string(),
+            });
+        }
+        let ident = object_name
+            .0
+            .first()
+            .ok_or_else(|| NovaError::SqlAnalysisError {
+                message: "FUNCTION grant object is missing".to_string(),
+            })?
+            .value
+            .clone();
+        let Some(encoded) = ident.strip_prefix("__fn_rbac__") else {
+            return Err(NovaError::SqlAnalysisError {
+                message: "only GRANT/REVOKE ... ON FUNCTION is supported".to_string(),
+            });
+        };
+        let (function_text, _) =
+            encoded
+                .split_once("__")
+                .ok_or_else(|| NovaError::SqlAnalysisError {
+                    message: "invalid encoded FUNCTION grant object".to_string(),
+                })?;
+        Ok(function_text.to_string())
     }
 
     fn sql_function_body(body: &sqlparser::ast::CreateFunctionBody) -> FunctionBody {
@@ -564,6 +694,89 @@ impl Analyzer {
                     schema: self.default_schema.clone(),
                     table: table_name,
                     columns: resolved_cols,
+                })
+            }
+            Statement::Grant {
+                privileges,
+                objects,
+                grantees,
+                with_grant_option,
+                granted_by,
+            } => {
+                if *with_grant_option {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "WITH GRANT OPTION is not supported for FUNCTION grants yet"
+                            .to_string(),
+                    });
+                }
+                if granted_by.is_some() {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "GRANTED BY is not supported for FUNCTION grants yet".to_string(),
+                    });
+                }
+                Self::require_function_usage_privilege(privileges)?;
+                let role = grantees
+                    .first()
+                    .ok_or_else(|| NovaError::SqlAnalysisError {
+                        message: "FUNCTION grant requires a target role".to_string(),
+                    })?
+                    .value
+                    .clone();
+                if grantees.len() != 1 {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "FUNCTION grant supports one role at a time".to_string(),
+                    });
+                }
+                let function_text = Self::encoded_function_grant_object(objects)?;
+                let (db, schema, name, signature) =
+                    self.resolve_function_signature_text(&function_text)?;
+                Ok(ResolvedStatement::GrantFunctionUsage {
+                    db,
+                    schema,
+                    name,
+                    signature,
+                    role,
+                })
+            }
+            Statement::Revoke {
+                privileges,
+                objects,
+                grantees,
+                granted_by,
+                cascade,
+            } => {
+                if granted_by.is_some() {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "GRANTED BY is not supported for FUNCTION revokes yet".to_string(),
+                    });
+                }
+                if *cascade {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "CASCADE is not supported for FUNCTION revokes yet".to_string(),
+                    });
+                }
+                Self::require_function_usage_privilege(privileges)?;
+                let role = grantees
+                    .first()
+                    .ok_or_else(|| NovaError::SqlAnalysisError {
+                        message: "FUNCTION revoke requires a target role".to_string(),
+                    })?
+                    .value
+                    .clone();
+                if grantees.len() != 1 {
+                    return Err(NovaError::SqlAnalysisError {
+                        message: "FUNCTION revoke supports one role at a time".to_string(),
+                    });
+                }
+                let function_text = Self::encoded_function_grant_object(objects)?;
+                let (db, schema, name, signature) =
+                    self.resolve_function_signature_text(&function_text)?;
+                Ok(ResolvedStatement::RevokeFunctionUsage {
+                    db,
+                    schema,
+                    name,
+                    signature,
+                    role,
                 })
             }
             Statement::Insert(ins) => {
@@ -938,6 +1151,28 @@ impl Analyzer {
                         db: self.default_db.clone(),
                         pattern,
                     });
+                }
+                // Detect SHOW GRANTS ON FUNCTION: DROP TABLE __show_fn_grants_on__<name(types)>
+                if table_name.starts_with("__show_fn_grants_on__") {
+                    let function_text = table_name
+                        .strip_prefix("__show_fn_grants_on__")
+                        .unwrap_or("");
+                    let (db, schema, name, signature) =
+                        self.resolve_function_signature_text(function_text)?;
+                    return Ok(ResolvedStatement::ShowGrantsOnFunction {
+                        db,
+                        schema,
+                        name,
+                        signature,
+                    });
+                }
+                // Detect SHOW GRANTS TO ROLE: DROP TABLE __show_fn_grants_to__<role>
+                if table_name.starts_with("__show_fn_grants_to__") {
+                    let role = table_name
+                        .strip_prefix("__show_fn_grants_to__")
+                        .unwrap_or("")
+                        .to_string();
+                    return Ok(ResolvedStatement::ShowGrantsToRole { role });
                 }
 
                 // Real DROP TABLE / DROP DATABASE / DROP SCHEMA
