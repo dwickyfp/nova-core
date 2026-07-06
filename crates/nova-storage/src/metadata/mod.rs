@@ -277,6 +277,18 @@ pub trait SecurityStore: Send + Sync {
     ) -> Result<()>;
     async fn revoke_role_from_user(&self, user_id: UserId, role_id: RoleId) -> Result<()>;
     async fn list_user_roles(&self, user_id: UserId) -> Result<Vec<RoleId>>;
+    async fn grant_role_to_role(
+        &self,
+        parent_role_id: RoleId,
+        child_role_id: RoleId,
+        granted_by: RoleId,
+    ) -> Result<()>;
+    async fn revoke_role_from_role(
+        &self,
+        parent_role_id: RoleId,
+        child_role_id: RoleId,
+    ) -> Result<()>;
+    async fn list_role_children(&self, parent_role_id: RoleId) -> Result<Vec<RoleId>>;
     async fn set_object_owner(&self, owner: ObjectOwnerMeta) -> Result<()>;
     async fn get_object_owner(&self, object: ObjectRef) -> Result<Option<ObjectOwnerMeta>>;
     async fn grant_privileges(&self, grant: GrantSetMeta) -> Result<()>;

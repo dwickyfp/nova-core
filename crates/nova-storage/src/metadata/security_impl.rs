@@ -1,3 +1,5 @@
+use std::collections::{HashSet, VecDeque};
+
 use async_trait::async_trait;
 use foundationdb as fdb;
 use nova_common::{
@@ -151,12 +153,158 @@ impl FdbMetadataStore {
             })
     }
 
-    async fn atomic_grant_privileges(&self, grant: GrantSetMeta) -> Result<()> {
-        let object_type = Self::object_type_key(grant.object.object_type);
-        let grant_key = self.pack(&("grant", grant.role_id, object_type, grant.object.object_id));
-        let reverse_key = self.pack(&(
+    async fn atomic_grant_role_to_role(
+        &self,
+        parent_role_id: RoleId,
+        child_role_id: RoleId,
+        granted_by: RoleId,
+    ) -> Result<()> {
+        let role_keys = [
+            self.pack(&("role", parent_role_id)),
+            self.pack(&("role", child_role_id)),
+            self.pack(&("role", granted_by)),
+        ];
+        let parent_child_key = self.pack(&("role_child", parent_role_id, child_role_id));
+        let role_parent_key = self.pack(&("role_parent", child_role_id, parent_role_id));
+        let epoch_key = self.pack(&("security_epoch",));
+        let subspace = self.subspace.clone();
+        let meta = RoleGrantMeta {
+            granted_by_role_id: granted_by,
+            created_at: now_micros(),
+        };
+        let parent_child_value = Self::serialize(&meta)?;
+
+        self.db
+            .run(|trx, _maybe_committed| {
+                let role_keys = role_keys.clone();
+                let parent_child_key = parent_child_key.clone();
+                let role_parent_key = role_parent_key.clone();
+                let epoch_key = epoch_key.clone();
+                let subspace = subspace.clone();
+                let parent_child_value = parent_child_value.clone();
+                async move {
+                    for key in role_keys {
+                        if trx
+                            .get(&key, false)
+                            .await
+                            .map_err(fdb::FdbBindingError::from)?
+                            .is_none()
+                        {
+                            return Err(fdb::FdbBindingError::CustomError(Box::new(
+                                std::io::Error::new(std::io::ErrorKind::NotFound, "role not found"),
+                            )));
+                        }
+                    }
+
+                    let mut seen = HashSet::new();
+                    let mut queue = VecDeque::from([(child_role_id, 0usize)]);
+                    while let Some((role_id, depth)) = queue.pop_front() {
+                        if depth > 64 {
+                            return Err(fdb::FdbBindingError::CustomError(Box::new(
+                                std::io::Error::other("role inheritance depth limit exceeded"),
+                            )));
+                        }
+                        if !seen.insert(role_id) {
+                            continue;
+                        }
+                        if role_id == parent_role_id {
+                            return Err(fdb::FdbBindingError::CustomError(Box::new(
+                                std::io::Error::other("role inheritance cycle detected"),
+                            )));
+                        }
+                        let start = subspace.pack(&("role_child", role_id));
+                        let mut end = start.clone();
+                        while end.last().is_some_and(|byte| *byte == 0xff) {
+                            end.pop();
+                        }
+                        if let Some(last) = end.last_mut() {
+                            *last += 1;
+                        }
+                        let values = trx
+                            .get_range(&fdb::RangeOption::from((start, end)), 1_000_000, false)
+                            .await
+                            .map_err(fdb::FdbBindingError::from)?;
+                        for kv in values {
+                            let unpacked: (String, RoleId, RoleId) = subspace
+                                .unpack(kv.key())
+                                .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
+                            queue.push_back((unpacked.2, depth + 1));
+                        }
+                    }
+
+                    trx.set(&parent_child_key, &parent_child_value);
+                    trx.set(&role_parent_key, b"");
+                    let current = trx
+                        .get(&epoch_key, false)
+                        .await
+                        .map_err(fdb::FdbBindingError::from)?
+                        .map(|v| {
+                            let bytes: [u8; 8] = v.as_ref().try_into().unwrap_or([0; 8]);
+                            u64::from_be_bytes(bytes)
+                        })
+                        .unwrap_or(0);
+                    trx.set(&epoch_key, &(current + 1).to_be_bytes()[..]);
+                    Ok::<(), fdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("FDB atomic role-to-role grant failed: {}", e),
+            })
+    }
+
+    async fn atomic_revoke_role_from_role(
+        &self,
+        parent_role_id: RoleId,
+        child_role_id: RoleId,
+    ) -> Result<()> {
+        let parent_child_key = self.pack(&("role_child", parent_role_id, child_role_id));
+        let role_parent_key = self.pack(&("role_parent", child_role_id, parent_role_id));
+        let epoch_key = self.pack(&("security_epoch",));
+        self.db
+            .run(|trx, _maybe_committed| {
+                let parent_child_key = parent_child_key.clone();
+                let role_parent_key = role_parent_key.clone();
+                let epoch_key = epoch_key.clone();
+                async move {
+                    trx.clear(&parent_child_key);
+                    trx.clear(&role_parent_key);
+                    let current = trx
+                        .get(&epoch_key, false)
+                        .await
+                        .map_err(fdb::FdbBindingError::from)?
+                        .map(|v| {
+                            let bytes: [u8; 8] = v.as_ref().try_into().unwrap_or([0; 8]);
+                            u64::from_be_bytes(bytes)
+                        })
+                        .unwrap_or(0);
+                    trx.set(&epoch_key, &(current + 1).to_be_bytes()[..]);
+                    Ok::<(), fdb::FdbBindingError>(())
+                }
+            })
+            .await
+            .map_err(|e| NovaError::Internal {
+                message: format!("FDB atomic role-to-role revoke failed: {}", e),
+            })
+    }
+
+    async fn atomic_grant_privileges(
+        &self,
+        grant: GrantSetMeta,
+        object_generation: u64,
+        current_object_created_at: Option<u64>,
+    ) -> Result<()> {
+        let grant_key = self.grant_key(grant.role_id, grant.object, object_generation);
+        let reverse_key = self.grant_by_object_key(grant.role_id, grant.object, object_generation);
+        let legacy_grant_key = self.pack(&(
+            "grant",
+            grant.role_id,
+            Self::object_type_key(grant.object.object_type),
+            grant.object.object_id,
+        ));
+        let legacy_reverse_key = self.pack(&(
             "grant_by_object",
-            object_type,
+            Self::object_type_key(grant.object.object_type),
             grant.object.object_id,
             grant.role_id,
         ));
@@ -533,6 +681,45 @@ impl SecurityStore for FdbMetadataStore {
         Ok(roles)
     }
 
+    async fn grant_role_to_role(
+        &self,
+        parent_role_id: RoleId,
+        child_role_id: RoleId,
+        granted_by: RoleId,
+    ) -> Result<()> {
+        if parent_role_id == child_role_id {
+            return Err(NovaError::Internal {
+                message: "role cannot inherit itself".to_string(),
+            });
+        }
+        self.atomic_grant_role_to_role(parent_role_id, child_role_id, granted_by)
+            .await
+    }
+
+    async fn revoke_role_from_role(
+        &self,
+        parent_role_id: RoleId,
+        child_role_id: RoleId,
+    ) -> Result<()> {
+        self.atomic_revoke_role_from_role(parent_role_id, child_role_id)
+            .await
+    }
+
+    async fn list_role_children(&self, parent_role_id: RoleId) -> Result<Vec<RoleId>> {
+        let (start, end) = self.category_range(&("role_child", parent_role_id));
+        let mut children = vec![];
+        for (key, _) in self.fdb_get_range(start, end).await? {
+            let unpacked: (String, RoleId, RoleId) =
+                self.subspace
+                    .unpack(&key)
+                    .map_err(|e| NovaError::Internal {
+                        message: format!("FDB tuple unpack failed: {}", e),
+                    })?;
+            children.push(unpacked.2);
+        }
+        Ok(children)
+    }
+
     async fn set_object_owner(&self, owner: ObjectOwnerMeta) -> Result<()> {
         if self.get_role(owner.owner_role_id).await?.is_none() {
             return Err(NovaError::Internal {
@@ -768,6 +955,70 @@ mod tests {
                 .contains(SecurityPrivilege::Select)
         );
         assert!(reopened.security_epoch().await? > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_persists_and_rejects_cycles() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_inheritance_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace.clone())?;
+        store.bootstrap_security().await?;
+
+        let parent = store.create_role(role("parent_role")).await?;
+        let child = store.create_role(role("child_role")).await?;
+        let epoch_before = store.security_epoch().await?;
+
+        store
+            .grant_role_to_role(parent, child, ACCOUNTADMIN_ROLE_ID)
+            .await?;
+        assert_eq!(store.list_role_children(parent).await?, vec![child]);
+        assert!(store.security_epoch().await? > epoch_before);
+
+        assert!(
+            store
+                .grant_role_to_role(child, parent, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .grant_role_to_role(parent, parent, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
+
+        let reopened = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        assert_eq!(reopened.list_role_children(parent).await?, vec![child]);
+        reopened.revoke_role_from_role(parent, child).await?;
+        assert!(reopened.list_role_children(parent).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_rejects_missing_roles() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_missing_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let parent = store.create_role(role("parent_role")).await?;
+
+        assert!(
+            store
+                .grant_role_to_role(parent, parent + 10_000, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .grant_role_to_role(parent + 20_000, parent, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
