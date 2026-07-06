@@ -9,6 +9,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use nova_common::*;
 use nova_storage::{CdcPayloadReader, CdcPayloadWriter, MetadataStore, MpReader, MpWriter};
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 /// SQL execution engine. Wires resolved statements to storage layer.
@@ -178,8 +179,33 @@ impl Executor {
         Ok(tables)
     }
 
-    fn is_accountadmin(security: &SecurityContext) -> bool {
-        security.active_role_ids().contains(&ACCOUNTADMIN_ROLE_ID)
+    async fn active_role_closure(&self, security: &SecurityContext) -> Result<HashSet<RoleId>> {
+        let mut roles = HashSet::new();
+        let mut queue = VecDeque::new();
+        for role_id in security.active_role_ids() {
+            queue.push_back((role_id, 0usize));
+        }
+        while let Some((role_id, depth)) = queue.pop_front() {
+            if depth > 64 {
+                return Err(NovaError::PermissionDenied {
+                    user: security.username.clone(),
+                    action: "role inheritance depth limit exceeded".to_string(),
+                });
+            }
+            if !roles.insert(role_id) {
+                continue;
+            }
+            if self.meta.get_role(role_id).await?.is_none() {
+                return Err(NovaError::PermissionDenied {
+                    user: security.username.clone(),
+                    action: format!("use missing role {}", role_id),
+                });
+            }
+            for child_id in self.meta.list_role_children(role_id).await? {
+                queue.push_back((child_id, depth + 1));
+            }
+        }
+        Ok(roles)
     }
 
     async fn has_privilege(
@@ -188,10 +214,10 @@ impl Executor {
         object: ObjectRef,
         privilege: SecurityPrivilege,
     ) -> Result<bool> {
-        if Self::is_accountadmin(security) {
+        let active_roles = self.active_role_closure(security).await?;
+        if active_roles.contains(&ACCOUNTADMIN_ROLE_ID) {
             return Ok(true);
         }
-        let active_roles = security.active_role_ids();
         if let Some(owner) = self.meta.get_object_owner(object).await?
             && active_roles.contains(&owner.owner_role_id)
         {
