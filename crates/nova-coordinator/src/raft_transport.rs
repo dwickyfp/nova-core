@@ -773,11 +773,16 @@ impl NovaRaftNode {
             + Sync
             + 'static,
     {
-        let config = Arc::new(
-            Config::default()
-                .validate()
-                .expect("invalid openraft config"),
-        );
+        let config = Arc::new(Config::default().validate().map_err(|error| {
+            openraft::error::Fatal::StorageError(StorageError::from_io_error(
+                ErrorSubject::Store,
+                ErrorVerb::Read,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid openraft config: {error}"),
+                ),
+            ))
+        })?);
         let sm = InMemoryStateMachine::new(store);
         let network = NovaRaftNetworkFactory { addrs: peers };
         let raft = openraft::Raft::new(node_id, config, network, log_store, sm).await?;
@@ -832,5 +837,19 @@ impl NovaRaftNode {
     /// Expose inner Raft handle (e.g. for metrics/shutdown).
     pub fn raft(&self) -> &openraft::Raft<NovaTypeConfig> {
         &self.raft
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn start_with_log_store_does_not_panic_on_openraft_config_validation() {
+        let source = include_str!("raft_transport.rs");
+        let panic_call = ["expect", "(\"invalid openraft config\")"].concat();
+
+        assert!(
+            !source.contains(&panic_call),
+            "Raft config validation must return a typed startup error instead of panicking"
+        );
     }
 }

@@ -75,7 +75,7 @@ impl TableProvider for NovaTableProvider {
             self.schema.clone(),
             projection.cloned(),
             self.reader.clone(),
-        )))
+        )?))
     }
 
     /// Return table statistics for DataFusion's CBO.

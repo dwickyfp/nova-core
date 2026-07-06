@@ -7,6 +7,7 @@ pub struct MySqlError;
 
 impl MySqlError {
     // Connection errors
+    pub const ER_HANDSHAKE_ERROR: u16 = 1043;
     pub const ER_ACCESS_DENIED_ERROR: u16 = 1045;
     pub const ER_BAD_DB_ERROR: u16 = 1049;
     pub const ER_DBACCESS_DENIED_ERROR: u16 = 1044;
@@ -37,6 +38,7 @@ impl MySqlError {
     // Get error message for error code
     pub fn message(code: u16) -> &'static str {
         match code {
+            Self::ER_HANDSHAKE_ERROR => "Bad handshake",
             Self::ER_ACCESS_DENIED_ERROR => "Access denied for user",
             Self::ER_BAD_DB_ERROR => "Unknown database",
             Self::ER_DBACCESS_DENIED_ERROR => "Access denied for database",
@@ -64,6 +66,7 @@ impl MySqlError {
     // Get SQL state for error code
     pub fn sql_state(code: u16) -> &'static str {
         match code {
+            Self::ER_HANDSHAKE_ERROR => "08S01",
             Self::ER_ACCESS_DENIED_ERROR => "28000",
             Self::ER_BAD_DB_ERROR => "42000",
             Self::ER_DBACCESS_DENIED_ERROR => "42000",

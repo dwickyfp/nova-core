@@ -92,12 +92,7 @@ impl QueryEngine for NovaEngine {
             || sql_upper.starts_with("CREATE")
             || sql_upper.starts_with("DROP");
 
-        let security_epoch = self
-            .scheduler
-            .executor()
-            .security_epoch()
-            .await
-            .unwrap_or(0);
+        let security_epoch = self.scheduler.executor().security_epoch().await?;
         let cache_sql = security_cache_sql(sql, security, security_epoch);
 
         // Parse all statements before cache lookup so stream reads and stream status
@@ -155,10 +150,8 @@ impl QueryEngine for NovaEngine {
         // Invalidate cache on writes — table version changes make cached results stale.
         // ponytail: clear entire cache on any write. Upgrade to per-table invalidation
         // when table version tracking from metadata is wired.
-        if is_write && is_select {
-            // Mixed statement (rare) — don't invalidate
-        } else if is_write {
-            tracing::debug!("Write operation, cache entries may be stale for next SELECT");
+        if is_write {
+            self.result_cache.clear().await;
         }
 
         Ok(last_result)

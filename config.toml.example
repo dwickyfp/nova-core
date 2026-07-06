@@ -1,37 +1,22 @@
-# nova-core configuration
-# Copy to config.toml and adjust values.
+# nova-core local development configuration.
+# Copy to config.toml and replace placeholder credentials before use.
 
-[coordinator]
-mysql_port = 4406
-http_port = 8080
-grpc_port = 50050
-raft_port = 50060
-
-[worker]
-grpc_port = 50051
-batch_size = 8192
-memory_limit_bytes = 8589934592  # 8GB
-cache_ssd_path = "/data/cache"
+[server]
+host = "127.0.0.1"
+port = 3306
 
 [storage]
-bucket = "nova"
-endpoint = "http://localhost:9000"
-access_key = "minioadmin"
-secret_key = "minioadmin"
-region = "us-east-1"
+s3_endpoint = "http://localhost:9000"
+s3_bucket = "nova"
+s3_access_key = "<minio-access-key>"
+s3_secret_key = "<minio-secret-key>"
+s3_region = "us-east-1"
 
 [metadata]
-fdb_cluster_file = "/etc/fdb/fdb.cluster"
-retention_days = 7
-
-[cache]
-result_cache_memory_bytes = 2147483648    # 2GB
-result_cache_ssd_bytes = 53687091200      # 50GB
-mp_cache_memory_bytes = 4294967296        # 4GB
-mp_cache_ssd_bytes = 107374182400         # 100GB
-meta_cache_memory_bytes = 536870912       # 512MB
+fdb_cluster_file = "docker:docker@127.0.0.1:4500"
 
 [auth]
 enabled = false
+allow_insecure = true
 default_username = "root"
 default_password_hash = ""

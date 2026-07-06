@@ -89,6 +89,23 @@ Full design: [`docs/design/architecture.md`](docs/design/architecture.md)
 
 Enterprise RBAC / role ownership roadmap: [`docs/design/enterprise-rbac-roadmap.md`](docs/design/enterprise-rbac-roadmap.md)
 
+## Engineering Rules
+
+Nova Core is governed by [`docs/guide/engineering-rules.md`](docs/guide/engineering-rules.md). Read it before making non-trivial changes.
+
+The short version:
+
+- Nova Core is an OLAP engine, not an OLTP row-store or UI/backend service.
+- Parquet micro-partitions are immutable; UPDATE/DELETE use copy-on-write.
+- FoundationDB is the authoritative metadata store.
+- Workers are stateless for durable data.
+- Query correctness follows MVCC/snapshot metadata.
+- Metadata-driven pruning should happen before expensive object-store reads when possible.
+- Caches must never return stale or unauthorized results.
+- Unit tests are the primary evidence for clean-code and correctness changes.
+
+Rust style details live in [`docs/guide/coding-standards.md`](docs/guide/coding-standards.md); architecture details live in [`docs/design/architecture.md`](docs/design/architecture.md).
+
 ---
 
 ## Tech Stack

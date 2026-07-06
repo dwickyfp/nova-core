@@ -155,7 +155,8 @@ mod tests {
     #[tokio::test]
     async fn test_result_cache_basic() {
         let cache = ResultCache::new(100);
-        let versions = HashMap::new();
+        let mut versions = HashMap::new();
+        versions.insert(1u64, 1u64);
 
         cache
             .put(
@@ -176,7 +177,8 @@ mod tests {
     #[tokio::test]
     async fn test_result_cache_normalized_hit() {
         let cache = ResultCache::new(100);
-        let versions = HashMap::new();
+        let mut versions = HashMap::new();
+        versions.insert(1u64, 1u64);
 
         // Store with extra whitespace
         cache
@@ -253,7 +255,8 @@ mod tests {
     #[tokio::test]
     async fn test_result_cache_stats() {
         let cache = ResultCache::new(100);
-        let versions = HashMap::new();
+        let mut versions = HashMap::new();
+        versions.insert(1u64, 1u64);
 
         cache
             .put("SELECT 1", versions.clone(), vec!["a".to_string()], vec![])

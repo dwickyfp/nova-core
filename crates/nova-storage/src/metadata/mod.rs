@@ -136,6 +136,13 @@ pub trait MetadataStore: Send + Sync + SecurityStore {
     /// Mark an MP as superseded by a new MP (for UPDATE/DELETE COW).
     async fn mark_superseded(&self, old_mp_id: MpId, new_mp_id: MpId) -> Result<()>;
 
+    /// Atomically replace the active MP set for a table with a new committed set.
+    async fn replace_active_mps(
+        &self,
+        table_id: TableId,
+        new_mps: Vec<MicroPartitionMeta>,
+    ) -> Result<()>;
+
     /// Delete expired micro-partitions (for GC).
     async fn delete_mp(&self, mp_id: MpId) -> Result<()>;
 
@@ -228,6 +235,25 @@ pub trait MetadataStore: Send + Sync + SecurityStore {
 
     /// Update dynamic table metadata (e.g. after refresh).
     async fn update_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()>;
+
+    /// Atomically transition a dynamic table into refresh-running state.
+    async fn begin_dynamic_table_refresh(&self, dt: DynamicTableMeta) -> Result<DynamicTableMeta>;
+
+    /// Atomically finish a running dynamic table refresh.
+    async fn finish_dynamic_table_refresh(
+        &self,
+        dt: DynamicTableMeta,
+        previous_last_refresh_ts: Option<Timestamp>,
+    ) -> Result<()>;
+
+    /// Atomically publish refresh micro-partitions and finish a dynamic table refresh.
+    async fn finish_dynamic_table_refresh_with_mps(
+        &self,
+        dt: DynamicTableMeta,
+        previous_last_refresh_ts: Option<Timestamp>,
+        new_mps: Vec<MicroPartitionMeta>,
+        replace_active_set: bool,
+    ) -> Result<()>;
 
     /// Drop a dynamic table by ID.
     async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()>;

@@ -34,6 +34,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /var/lib/nova && chown 65532:65532 /var/lib/nova
+
 COPY --from=builder /build/target/debug/nova /usr/local/bin/nova
+
+WORKDIR /var/lib/nova
+USER 65532:65532
 
 ENTRYPOINT ["nova"]

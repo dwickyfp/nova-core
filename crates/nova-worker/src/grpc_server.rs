@@ -11,7 +11,7 @@ use futures::Stream;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
-use nova_common::{Compression, MicroPartitionMeta};
+use nova_common::{Compression, MicroPartitionMeta, TableMeta};
 use nova_storage::MetadataStore;
 
 use crate::executor::Executor;
@@ -118,6 +118,7 @@ impl WorkerService for WorkerGrpcServer {
             tables = req.tables.len(),
             "Executing fragment"
         );
+        validate_fragment_request(&req)?;
 
         // For each table snapshot in the request, find metadata + MPs and execute SQL.
         // ponytail: for now, execute against the first table. Multi-table JOIN support
@@ -152,7 +153,7 @@ impl WorkerService for WorkerGrpcServer {
                     yield FragmentResult {
                         batch: Vec::new(),
                         done: true,
-                        error: e,
+                        error: format!("fragment {} failed: {e}", req.fragment_id),
                     };
                 }
             }
@@ -170,6 +171,58 @@ impl WorkerService for WorkerGrpcServer {
         self.state.registered.store(false, Ordering::SeqCst);
         Ok(Response::new(DeregisterResponse { success: true }))
     }
+}
+
+fn validate_fragment_request(req: &FragmentRequest) -> Result<(), Status> {
+    if req.sql.trim().is_empty() {
+        return Err(Status::invalid_argument("fragment SQL must not be empty"));
+    }
+    if req.tables.is_empty() {
+        return Err(Status::invalid_argument(
+            "fragment request must include at least one table snapshot",
+        ));
+    }
+    if req.batch_size == 0 {
+        return Err(Status::invalid_argument(
+            "fragment batch_size must be greater than zero",
+        ));
+    }
+
+    for (table_index, table) in req.tables.iter().enumerate() {
+        if table.table_name.trim().is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "table snapshot {table_index} must include table_name"
+            )));
+        }
+        for (mp_index, mp) in table.mps.iter().enumerate() {
+            if mp.s3_path.trim().is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "table '{}' micro-partition {mp_index} must include s3_path",
+                    table.table_name
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn register_table_snapshot(
+    ctx: &datafusion::prelude::SessionContext,
+    meta: &TableMeta,
+    mps: Vec<MicroPartitionMeta>,
+    reader: Arc<nova_storage::MpReader>,
+    fragment_id: u64,
+) -> Result<(), String> {
+    let provider = crate::NovaTableProvider::new(meta.clone(), mps, reader);
+    ctx.register_table(&meta.name, Arc::new(provider))
+        .map_err(|e| {
+            format!(
+                "register table '{}' for fragment {}: {e}",
+                meta.name, fragment_id
+            )
+        })?;
+    Ok(())
 }
 
 /// Execute a fragment: resolve tables from metadata, run SQL via DataFusion.
@@ -219,12 +272,13 @@ async fn execute_fragment_inner(
                             .map(|mp| snapshot_mp_to_meta(meta.id, mp))
                             .collect()
                     };
-                    let provider = crate::NovaTableProvider::new(
-                        meta.clone(),
+                    register_table_snapshot(
+                        &ctx,
+                        meta,
                         mps,
                         state.executor.reader_clone(),
-                    );
-                    let _ = ctx.register_table(&meta.name, Arc::new(provider));
+                        req.fragment_id,
+                    )?;
                     found = true;
                     break;
                 }
@@ -269,5 +323,102 @@ fn snapshot_mp_to_meta(table_id: u64, mp: &MicroPartitionInfo) -> MicroPartition
         supersedes: None,
         superseded_by: None,
         active: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nova_common::{ColumnDef, NovaType};
+    use std::collections::HashMap;
+    use tonic::Code;
+
+    fn test_table_meta() -> TableMeta {
+        TableMeta {
+            id: 1,
+            db_id: 1,
+            schema_id: 1,
+            name: "orders".to_string(),
+            columns: vec![ColumnDef {
+                id: 1,
+                name: "id".to_string(),
+                data_type: NovaType::Int64,
+                nullable: false,
+                default_value: None,
+                comment: None,
+            }],
+            created_at: 0,
+            owner: 0,
+            comment: None,
+            version: 0,
+            properties: HashMap::new(),
+        }
+    }
+
+    fn valid_request() -> FragmentRequest {
+        FragmentRequest {
+            fragment_id: 42,
+            sql: "SELECT * FROM orders".to_string(),
+            tables: vec![TableSnapshot {
+                table_name: "orders".to_string(),
+                schema: Vec::new(),
+                mps: vec![MicroPartitionInfo {
+                    mp_id: 7,
+                    s3_path: "tables/1/mp-7.parquet".to_string(),
+                    row_count: 3,
+                    byte_size: 128,
+                }],
+            }],
+            batch_size: 8192,
+        }
+    }
+
+    #[test]
+    fn validate_fragment_request_rejects_empty_sql() {
+        let mut req = valid_request();
+        req.sql = "  ".to_string();
+
+        let err = validate_fragment_request(&req).expect_err("empty SQL should fail");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("SQL"));
+    }
+
+    #[test]
+    fn validate_fragment_request_rejects_missing_tables() {
+        let mut req = valid_request();
+        req.tables.clear();
+
+        let err = validate_fragment_request(&req).expect_err("missing tables should fail");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("table snapshot"));
+    }
+
+    #[test]
+    fn validate_fragment_request_rejects_empty_mp_path() {
+        let mut req = valid_request();
+        req.tables[0].mps[0].s3_path.clear();
+
+        let err = validate_fragment_request(&req).expect_err("empty MP path should fail");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("s3_path"));
+    }
+
+    #[test]
+    fn register_table_snapshot_returns_datafusion_registration_errors() {
+        let ctx = datafusion::prelude::SessionContext::new();
+        let meta = test_table_meta();
+        let reader = Arc::new(nova_storage::MpReader::new(Arc::new(
+            object_store::local::LocalFileSystem::new(),
+        )));
+        register_table_snapshot(&ctx, &meta, Vec::new(), reader.clone(), 42)
+            .expect("first registration should succeed");
+
+        let err = register_table_snapshot(&ctx, &meta, Vec::new(), reader, 42)
+            .expect_err("duplicate table registration should surface DataFusion errors");
+
+        assert!(
+            err.contains("register table 'orders' for fragment 42"),
+            "unexpected error: {err}"
+        );
     }
 }

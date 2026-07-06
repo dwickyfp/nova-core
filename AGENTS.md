@@ -51,6 +51,24 @@ nova-core is a **Rust-native analytical query engine** built on Apache Arrow + D
 4. **Metadata-Driven Pruning** — Before reading Parquet files, check column min/max stats in FoundationDB metadata. Skip MPs that cannot match query predicates.
 5. **MVCC Everywhere** — Every micro-partition has a commit timestamp. Queries see a consistent snapshot. This enables Time Travel, Clone, Streams, and result cache auto-invalidation.
 
+### Engineering Rules Constitution (MANDATORY)
+
+Before changing code, agents MUST read and follow [`docs/guide/engineering-rules.md`](docs/guide/engineering-rules.md). That file is the canonical engineering constitution for Nova Core.
+
+Rules are broader than style. They define Nova Core as a Rust-native, Snowflake-style OLAP database engine and govern architecture, clean code, tests, security, metadata, storage, query execution, distributed behavior, and documentation.
+
+Minimum audit gates for every code change:
+
+1. Preserve immutable Parquet micro-partitions and copy-on-write semantics.
+2. Keep FoundationDB as authoritative metadata.
+3. Keep workers stateless for durable data.
+4. Preserve MVCC/snapshot correctness.
+5. Prevent stale or unauthorized cache results.
+6. Prefer typed errors over stringly typed propagation.
+7. Avoid production `unwrap()`/`expect()` on fallible paths.
+8. Add or run relevant unit tests; unit test result is primary evidence.
+9. Run or document blockers for `cargo fmt --all -- --check`, `cargo test --all`, and `cargo clippy --all -- -D warnings`.
+
 ---
 
 ## Project Structure
@@ -79,28 +97,7 @@ nova-core/
 
 ## Development Phase (CURRENT STATUS)
 
-**We are in Phase 1: Foundation.**
-
-See [ROADMAP.md](ROADMAP.md) for what's done, what's next, and what's blocked.
-
-### Phase 1 Scope (DO NOT implement features from later phases)
-
-✅ DO:
-- Set up cargo workspace
-- Implement FoundationDB metadata schema + CRUD
-- Implement micro-partition writer (Arrow → Parquet → S3)
-- Implement micro-partition reader (S3 → Parquet → Arrow)
-- Basic SQL: CREATE TABLE, INSERT, SELECT (no optimizer yet)
-- MySQL protocol server (basic)
-- Unit tests + integration tests
-
-❌ DON'T:
-- Implement Time Travel, Clone, Streams (Phase 3)
-- Implement distributed execution (Phase 4)
-- Implement advanced CBO (Phase 5)
-- Implement query result cache (Phase 6)
-- Build UI or API endpoints (that's Nova frontend, not nova-core)
-- Add dependencies not listed in the tech stack
+**Current status is tracked in [`ROADMAP.md`](ROADMAP.md).** Always check the phase/status table there before deciding whether a change belongs in scope.
 
 ---
 

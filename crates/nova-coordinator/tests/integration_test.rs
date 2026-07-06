@@ -287,7 +287,8 @@ async fn test_cache_eviction_fifo() {
     let cache = QueryResultCache::new(2); // Max 2 entries
     let columns = vec!["id".to_string()];
     let rows = vec![vec!["1".to_string()]];
-    let versions = HashMap::new();
+    let mut versions = HashMap::new();
+    versions.insert(1u64, 1u64);
 
     // Fill cache
     cache
@@ -346,7 +347,8 @@ async fn test_concurrent_cache_access() {
     let cache = Arc::new(QueryResultCache::new(100));
     let columns = vec!["id".to_string()];
     let rows = vec![vec!["1".to_string()]];
-    let versions = HashMap::new();
+    let mut versions = HashMap::new();
+    versions.insert(1u64, 1u64);
 
     // Spawn multiple tasks accessing cache
     let mut handles = vec![];

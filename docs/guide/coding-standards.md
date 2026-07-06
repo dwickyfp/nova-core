@@ -1,6 +1,6 @@
 # Coding Standards — nova-core
 
-> Rust conventions, patterns, and quality gates for nova-core.
+> Rust style, naming, and quality gates for nova-core. The canonical engineering constitution is [`engineering-rules.md`](engineering-rules.md); architecture and domain rules there override generic style preferences here.
 
 ---
 

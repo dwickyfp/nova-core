@@ -10,8 +10,7 @@ use tokio::sync::Mutex;
 use nova_common::{NovaError, Result};
 
 use crate::mysql_protocol::auth::{AuthPlugin, verify_mysql_native_password};
-use crate::mysql_protocol::capabilities::ClientCapabilities;
-use crate::mysql_protocol::codec::PacketCodec;
+use crate::mysql_protocol::codec::{Packet, PacketCodec};
 use crate::mysql_protocol::commands::{
     ColumnDef, Command, CommandResult, build_column_count_packet, build_column_def_packet,
     build_eof_packet, build_error_packet, build_ok_packet, build_row_packet, handle_init_db,
@@ -20,7 +19,9 @@ use crate::mysql_protocol::commands::{
 };
 use crate::mysql_protocol::connection::Session;
 use crate::mysql_protocol::errors::MySqlError;
-use crate::mysql_protocol::packets::{build_handshake_packet, parse_handshake_response};
+use crate::mysql_protocol::packets::{
+    HandshakeResponse, build_handshake_packet, parse_handshake_response,
+};
 use crate::mysql_protocol::query_engine::QueryEngine;
 use crate::mysql_protocol::types::ColumnType;
 
@@ -83,6 +84,27 @@ pub fn parse_role_command(sql: &str) -> Option<RoleCommand<'_>> {
     None
 }
 
+fn verify_fdb_mysql_native_user(
+    user: &nova_common::UserMeta,
+    configured_user: Option<&crate::auth::UserInfo>,
+    scramble: &[u8],
+    auth_response: &[u8],
+) -> bool {
+    if user.disabled {
+        return false;
+    }
+    let native_hash = if !user.mysql_native_hash.is_empty() {
+        &user.mysql_native_hash
+    } else if let Some(configured_user) = configured_user.filter(|configured| {
+        configured.username == user.name && !configured.mysql_native_hash.is_empty()
+    }) {
+        &configured_user.mysql_native_hash
+    } else {
+        return false;
+    };
+    verify_mysql_native_password(scramble, native_hash, auth_response)
+}
+
 impl MySqlServer {
     /// Bind to address and create server.
     /// If auth is provided, MySQL handshake password verification is enforced.
@@ -141,7 +163,24 @@ impl MySqlServer {
     }
 }
 
+fn parse_handshake_response_for_auth(
+    payload: &[u8],
+) -> std::result::Result<HandshakeResponse, Packet> {
+    parse_handshake_response(payload).map_err(|err| {
+        tracing::warn!(error = %err, "Failed to parse handshake response");
+        build_error_packet(
+            MySqlError::ER_HANDSHAKE_ERROR,
+            MySqlError::message(MySqlError::ER_HANDSHAKE_ERROR),
+        )
+    })
+}
+
 /// Handle a single client connection
+async fn remove_session(sessions: &Arc<Mutex<Vec<u32>>>, connection_id: u32) {
+    let mut sessions_guard = sessions.lock().await;
+    sessions_guard.retain(|&id| id != connection_id);
+}
+
 async fn handle_connection(
     stream: TcpStream,
     connection_id: u32,
@@ -161,20 +200,13 @@ async fn handle_connection(
 
     // Read handshake response from client
     let response_packet = codec.read_packet().await?;
-    let handshake_response =
-        parse_handshake_response(&response_packet.payload).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to parse handshake response, using defaults");
-            crate::mysql_protocol::packets::HandshakeResponse {
-                capabilities: ClientCapabilities::default_server_capabilities(),
-                max_packet_size: 16777216,
-                charset: 45,
-                username: "root".to_string(),
-                auth_response: Vec::new(),
-                database: None,
-                auth_plugin: None,
-                connect_attrs: Vec::new(),
-            }
-        });
+    let handshake_response = match parse_handshake_response_for_auth(&response_packet.payload) {
+        Ok(response) => response,
+        Err(err) => {
+            codec.write_packet(&err.payload).await?;
+            return Ok(());
+        }
+    };
 
     // Create session
     let mut session = Session::new(
@@ -212,6 +244,7 @@ async fn handle_connection(
                     &format!("Access denied for user '{}'@'{}'", username, "unknown"),
                 );
                 codec.write_packet(&err.payload).await?;
+                remove_session(&sessions, connection_id).await;
                 return Ok(());
             }
             _ => {
@@ -223,13 +256,15 @@ async fn handle_connection(
                     ),
                 );
                 codec.write_packet(&err.payload).await?;
+                remove_session(&sessions, connection_id).await;
                 return Ok(());
             }
         };
 
-        if !user.mysql_native_hash.is_empty()
-            && !verify_mysql_native_password(&scramble, &user.mysql_native_hash, auth_response)
-        {
+        let configured_user = auth
+            .as_ref()
+            .and_then(|auth_manager| auth_manager.get_user_info(username));
+        if !verify_fdb_mysql_native_user(&user, configured_user, &scramble, auth_response) {
             let err = build_error_packet(
                 MySqlError::ER_ACCESS_DENIED_ERROR,
                 &format!(
@@ -238,6 +273,7 @@ async fn handle_connection(
                 ),
             );
             codec.write_packet(&err.payload).await?;
+            remove_session(&sessions, connection_id).await;
             return Ok(());
         }
 
@@ -246,6 +282,7 @@ async fn handle_connection(
             Err(e) => {
                 let err = build_error_packet(MySqlError::ER_ACCESS_DENIED_ERROR, &e.to_string());
                 codec.write_packet(&err.payload).await?;
+                remove_session(&sessions, connection_id).await;
                 return Ok(());
             }
         }
@@ -652,10 +689,7 @@ async fn handle_connection(
     }
 
     // Remove session from tracking list
-    {
-        let mut sessions_guard = sessions.lock().await;
-        sessions_guard.retain(|&id| id != connection_id);
-    }
+    remove_session(&sessions, connection_id).await;
 
     session.close();
     tracing::info!(connection_id = connection_id, "Connection closed");
@@ -666,6 +700,89 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_malformed_handshake_response_returns_error_packet() {
+        let result = parse_handshake_response_for_auth(&[]);
+        let err_packet = match result {
+            Ok(_) => panic!("malformed handshake must return an error packet"),
+            Err(packet) => packet,
+        };
+
+        assert_eq!(err_packet.payload[0], 0xff);
+        let code = u16::from_le_bytes([err_packet.payload[1], err_packet.payload[2]]);
+        assert_eq!(code, MySqlError::ER_HANDSHAKE_ERROR);
+    }
+
+    #[test]
+    fn fdb_mysql_auth_rejects_empty_hash_when_auth_is_enabled() {
+        let user = nova_common::UserMeta {
+            id: nova_common::ROOT_USER_ID,
+            name: "root".to_string(),
+            password_hash: String::new(),
+            mysql_native_hash: Vec::new(),
+            default_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+            disabled: false,
+            created_at: nova_common::now_micros(),
+            created_by_user_id: nova_common::ROOT_USER_ID,
+            created_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+            comment: None,
+        };
+
+        assert!(!verify_fdb_mysql_native_user(&user, None, b"scramble", b""));
+    }
+
+    #[test]
+    fn fdb_mysql_auth_accepts_configured_hash_when_fdb_hash_is_empty() {
+        let scramble = b"01234567890123456789";
+        let password = "secret";
+        let user = nova_common::UserMeta {
+            id: nova_common::ROOT_USER_ID,
+            name: "root".to_string(),
+            password_hash: String::new(),
+            mysql_native_hash: Vec::new(),
+            default_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+            disabled: false,
+            created_at: nova_common::now_micros(),
+            created_by_user_id: nova_common::ROOT_USER_ID,
+            created_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+            comment: None,
+        };
+        let auth = crate::auth::AuthManager::with_default_user("root", password);
+        let response =
+            crate::mysql_protocol::auth::ClientAuth::mysql_native_password(password, scramble);
+
+        assert!(verify_fdb_mysql_native_user(
+            &user,
+            auth.get_user_info("root"),
+            scramble,
+            &response
+        ));
+    }
+
+    #[test]
+    fn fdb_mysql_auth_accepts_valid_native_password_response() {
+        let scramble = b"01234567890123456789";
+        let password = "secret";
+        let user = nova_common::UserMeta {
+            id: nova_common::ROOT_USER_ID,
+            name: "root".to_string(),
+            password_hash: String::new(),
+            mysql_native_hash: crate::mysql_protocol::auth::hash_password_mysql_native(password),
+            default_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+            disabled: false,
+            created_at: nova_common::now_micros(),
+            created_by_user_id: nova_common::ROOT_USER_ID,
+            created_by_role_id: nova_common::ACCOUNTADMIN_ROLE_ID,
+            comment: None,
+        };
+        let response =
+            crate::mysql_protocol::auth::ClientAuth::mysql_native_password(password, scramble);
+
+        assert!(verify_fdb_mysql_native_user(
+            &user, None, scramble, &response
+        ));
+    }
 
     #[test]
     fn test_config_default() {

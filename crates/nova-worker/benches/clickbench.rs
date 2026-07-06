@@ -96,7 +96,8 @@ fn bench_scan(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("scan", label), |b| {
             b.iter(|| {
                 let reader = Arc::new(MpReader::new(store.clone()));
-                let exec = MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader);
+                let exec =
+                    MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader).unwrap();
                 let ctx = Arc::new(TaskContext::default());
                 rt.block_on(async {
                     let mut rows = 0usize;

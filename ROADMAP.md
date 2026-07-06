@@ -25,6 +25,8 @@
 | 14 | Production Deployment | — | ✅ Complete | Docker Rust 1.91, fixed worker gRPC args |
 | 15 | Distributed Cluster Wire-up | — | ✅ Complete | Raft gRPC server mounted, AutoScaler loop wired |
 | 16 | Enterprise Security & Governance | — | 📋 Planned | Snowflake-style RBAC, policies, tags, audit, identity |
+| 17 | Enterprise Task Orchestration | — | 📋 Planned | Snowflake-style TASK, scheduler, stream triggers, DAGs, RBAC, audit |
+| 18 | Snowflake MERGE INTO | — | 📋 Planned | Snowflake-compatible MERGE subset, deterministic duplicate handling, RBAC, TASK integration |
 
 ---
 
@@ -623,6 +625,192 @@
 
 ---
 
+## Phase 17: Enterprise Task Orchestration
+
+**Goal:** Implement Snowflake-inspired `TASK` orchestration for scheduled SQL, stream-triggered ELT, and enterprise workflow DAGs with HA scheduling, transactional stream consumption, RBAC, audit, and observability.
+
+> Planning reference: `GUIDE_TASK_PLANNING.md`. This phase builds on Phase 3 Streams, Phase 10 multi-node execution, Phase 11 HA coordinator, Phase 13 Dynamic Tables, and Phase 16 enterprise security. It must preserve immutable micro-partitions, MVCC stream offsets, stateless workers, and FDB as the source of truth.
+
+### Milestone 17.1: Task Catalog and FoundationDB Metadata
+
+- [ ] Define `TaskMeta`, `TaskVersionMeta`, `TaskRunMeta`, `TaskGraphRunMeta`, `TaskDependencyMeta`, `TaskLeaseMeta`, and `TaskScheduleMeta` in `nova-common`
+- [ ] Add FoundationDB tuple-key layout for task definitions, task name lookup, task graph edges, task versions, run history, scheduler leases, stream trigger indexes, and audit references
+- [ ] Persist task owner role, optional `EXECUTE AS USER`, warehouse/serverless config, schedule config, `WHEN` expression text, SQL body, session parameters, timeout, retry, failure suspension, and comments
+- [ ] Store task definitions as versioned immutable snapshots so running tasks keep their original version while later DDL creates a new version
+- [ ] Add atomic create/replace/drop/alter metadata operations with duplicate-name checks, graph validation, stream trigger index maintenance, and run-history retention boundaries
+- [ ] Add tests for key ordering, duplicate tasks, task version snapshots, dependency edges, stream trigger indexes, lease conflicts, rollback behavior, and metadata migration safety
+
+### Milestone 17.2: SQL Surface for TASK DDL, DCL, and Introspection
+
+- [ ] Implement `CREATE TASK`, `CREATE OR REPLACE TASK`, `CREATE TASK IF NOT EXISTS`, and `CREATE OR ALTER TASK` with interval schedules, cron schedules, `WHEN`, `AFTER`, `FINALIZE`, timeout, retry, overlap policy, session parameters, and comments
+- [ ] Implement `ALTER TASK ... RESUME|SUSPEND`, `SET`, `UNSET`, `MODIFY AS`, `MODIFY WHEN`, `REMOVE WHEN`, `ADD AFTER`, `REMOVE AFTER`, `SET FINALIZE`, and `UNSET FINALIZE`
+- [ ] Implement `DROP TASK`, `SHOW TASKS`, `DESC TASK`, and `EXECUTE TASK` for manual runs
+- [ ] Implement task graph helper functions: `SYSTEM$TASK_DEPENDENTS_ENABLE`, `TASK_DEPENDENTS`, `SYSTEM$TASK_RUNTIME_INFO`, `SYSTEM$SET_RETURN_VALUE`, and `SYSTEM$GET_PREDECESSOR_RETURN_VALUE`
+- [ ] Validate Snowflake-style restrictions: child tasks cannot define schedules, finalizer tasks cannot define schedules or children, graph members must share schema and owner role, root must be suspended before graph mutation, and task rename is not supported
+- [ ] Add parser, analyzer, executor, MySQL protocol, and integration tests for valid DDL, invalid combinations, graph changes, manual execution, introspection visibility, and error messages
+
+### Milestone 17.3: Scheduler Core, Cron, and HA Leases
+
+- [ ] Implement a coordinator-owned `TaskScheduler` that scans due resumed root and standalone tasks, evaluates trigger conditions, and dispatches run records without storing execution state on workers
+- [ ] Support interval schedules with resume-time base interval semantics and cron schedules using five-field Snowflake-style expressions plus explicit timezone
+- [ ] Store `next_scheduled_time`, base interval time, skipped-run decisions, queued time, query start time, completion time, and scheduled source (`SCHEDULE`, `TRIGGER`, `EXECUTE_TASK`, `MANUAL RETRY`, `AUTOMATIC RETRY`)
+- [ ] Implement HA-safe scheduler leases in FoundationDB so only the elected coordinator or lease holder schedules a given task/graph run
+- [ ] Enforce no-overlap behavior for standalone scheduled tasks, and graph overlap policies: `NO_OVERLAP`, `ALLOW_CHILD_OVERLAP`, and `ALLOW_ALL_OVERLAP`
+- [ ] Add backpressure controls for max queued runs, max concurrent task runs per warehouse, max account-level task concurrency, and bounded scheduler scan work
+- [ ] Add deterministic unit tests for interval calculation, cron next-time calculation, daylight-saving edge cases, overlap skipping, lease conflicts, coordinator failover, and backpressure
+
+### Milestone 17.4: Stream-triggered Tasks and `SYSTEM$STREAM_HAS_DATA`
+
+- [ ] Implement metadata-only `SYSTEM$STREAM_HAS_DATA('<stream_name>')` using stream offset versus current source object version without scanning micro-partition data
+- [ ] Design the function to avoid false negatives when stream change data exists while allowing documented false positives for net-zero changes and selective view streams
+- [ ] Add stream trigger indexes so table commits can mark dependent tasks due without broad catalog scans
+- [ ] Support pure triggered tasks with no `SCHEDULE` and scheduled tasks that use `WHEN SYSTEM$STREAM_HAS_DATA(...)` as a skip condition
+- [ ] Enforce transactional stream consumption: offsets advance only when a committed DML/CTAS/COPY-like transaction consumes the stream; failed task runs must not advance offsets
+- [ ] Support multiple streams on the same table for independent consumers and document that a single stream should not be consumed by multiple tasks unless shared-offset behavior is intentional
+- [ ] Add stale-stream protection hooks, health-check behavior for idle triggered tasks, and explicit false-positive consumption guidance
+- [ ] Add tests for insert/update/delete CDC, empty streams, false-positive offset advancement, failed task rollback, multiple consumers, triggered task batching, and stream staleness prevention
+
+### Milestone 17.5: Task Graph Execution, Retry, and Finalizers
+
+- [ ] Implement graph run groups with root task version snapshots, child scheduling after predecessor success, skipped child semantics, and finalizer execution after graph completion or failure
+- [ ] Support parallel child execution when multiple child tasks share a predecessor and enforce predecessor completion before multi-parent child execution
+- [ ] Implement manual retry from the latest failed task and automatic retry via `TASK_AUTO_RETRY_ATTEMPTS`
+- [ ] Implement `SUSPEND_TASK_AFTER_NUM_FAILURES` for standalone tasks and root task graphs with consecutive failure tracking that excludes skipped/cancelled/indeterminate system failures
+- [ ] Implement task run timeout and graph timeout semantics, with child timeout overriding root timeout for that child
+- [ ] Persist predecessor return values and task runtime context for use in downstream `WHEN` conditions and task bodies
+- [ ] Add tests for DAG ordering, parallel branches, multi-parent joins, skipped children, finalizer success/failure, automatic retry, manual retry, timeout, and failure auto-suspension
+
+### Milestone 17.6: Enterprise RBAC, Ownership, and Execution Identity
+
+- [ ] Add task securable object type and privileges: `CREATE TASK` on schema, `OWNERSHIP`, `OPERATE`, `MONITOR`, `USAGE` on task, `EXECUTE TASK` on account, and `EXECUTE MANAGED TASK` for serverless task execution
+- [ ] Run tasks by default as a system service using the task owner role, not the interactive user that resumed the task
+- [ ] Support `EXECUTE AS USER <user>` with strict impersonation checks: owner role must have `IMPERSONATE` on the user and the user must be granted the owner role
+- [ ] Re-check owner role privileges at resume and before each run, including warehouse usage for user-managed tasks and privileges required by the SQL body
+- [ ] Enforce deny-by-default behavior for missing task, missing owner role, revoked warehouse access, revoked stream/table access, revoked account task execution privileges, and stale security epoch
+- [ ] Record security context in run history: system user or execute-as user, owner role, active secondary-role policy, security epoch, warehouse, client/source, and authorization failures
+- [ ] Add negative tests for unauthorized create, unauthorized resume/suspend, revoked owner role privileges, denied stream read, denied target DML, execute-as impersonation denial, and background-job bypass attempts
+
+### Milestone 17.7: Observability, History, Audit, and Cost Controls
+
+- [ ] Implement `INFORMATION_SCHEMA.TASK_HISTORY`, task graph history, and account usage views for task runs, graph runs, serverless task usage, task versions, and dependency metadata
+- [ ] Emit Prometheus metrics for scheduled runs, triggered runs, skipped runs, failed runs, queue latency, execution latency, retry counts, scheduler lease conflicts, stream trigger lag, and task concurrency
+- [ ] Add structured `tracing` spans for scheduler decisions, `WHEN` evaluation, dispatch, query execution, stream offset advancement, graph transitions, and RBAC decisions
+- [ ] Add append-only audit events for create, alter, drop, resume, suspend, execute, retry, auto-suspend, denied access, execute-as usage, and task-owned object access
+- [ ] Track cost attribution for user-managed warehouse tasks and serverless task estimates using execution duration, queued time, warehouse size, and run source
+- [ ] Add retention and redaction rules for task SQL text, errors, configs, comments, session parameters, and metadata so secrets are never logged or exposed to unauthorized roles
+- [ ] Add tests for history filters, visibility rules, audit redaction, metrics labels, task graph run grouping, serverless usage records, and failed authorization observability
+
+### Milestone 17.8: Enterprise Hardening and Compatibility Boundaries
+
+- [ ] Define idempotency guidance for task authors and ensure scheduler-generated run ids prevent duplicate graph runs during coordinator failover
+- [ ] Ensure task execution uses stateless workers and can be rescheduled safely after worker crash without committing partial stream offset advancement
+- [ ] Integrate result-cache and authorization-cache invalidation with task-owned DDL/DML, stream consumption, security epoch changes, and task version changes
+- [ ] Define backup/restore behavior for task metadata, graph dependencies, run history retention, leases, trigger indexes, and security/audit continuity
+- [ ] Document Nova-specific compatibility boundaries: no external notification integrations in the initial implementation, no arbitrary OS cron, no worker-local state, and no claim of complete Snowflake compatibility
+- [ ] Add chaos and recovery tests for coordinator failover, worker crash, FDB transaction conflicts, duplicate trigger events, clock skew, large task graphs, and high-frequency streams
+
+### Phase 17 Exit Criteria
+
+- [ ] `CREATE/ALTER/DROP/SHOW/DESC/EXECUTE TASK` works through the MySQL protocol with interval schedules, cron schedules, `WHEN`, `AFTER`, finalizers, retry, timeout, and graph metadata
+- [ ] Scheduler is HA-safe through FoundationDB leases and does not duplicate scheduled graph runs across coordinator failover
+- [ ] `SYSTEM$STREAM_HAS_DATA` is metadata-only, avoids false negatives, supports documented false positives, and integrates with transactional stream consumption
+- [ ] Stream-triggered tasks process committed CDC data without advancing stream offsets on failed task runs
+- [ ] Task graph execution supports parallel children, multi-parent joins, skipped children, finalizers, automatic retry, manual retry, and failure auto-suspension
+- [ ] RBAC denies unauthorized task creation, operation, execution, stream access, target DML, warehouse usage, and execute-as impersonation by default
+- [ ] Task run history, graph history, metrics, tracing, audit, and cost attribution are queryable and redacted according to security policy
+- [ ] Backup/restore, cache invalidation, worker crash recovery, coordinator failover, and FDB transaction conflicts preserve task correctness
+- [ ] Documentation in `GUIDE_TASK_PLANNING.md` explains technology choices, metadata layout, execution flow, RBAC, test strategy, and Nova-specific Snowflake compatibility boundaries
+
+---
+
+## Phase 18: Snowflake MERGE INTO
+
+**Goal:** Implement a Snowflake-compatible Phase 18 subset of `MERGE INTO` for conditional insert, update, and delete workflows with deterministic duplicate handling, copy-on-write micro-partition updates, enterprise RBAC, auditability, and safe execution from interactive SQL and TASK runs.
+
+> Planning reference: `GUIDE_MERGE_INTO_PLANNING.md`. This phase builds on Phase 3 MVCC/COW DML, Phase 8 DataFusion SQL completeness, Phase 9 cache invalidation, Phase 16 enterprise security, and Phase 17 task orchestration. It must preserve immutable micro-partitions, FoundationDB atomic metadata commits, stateless workers, and deny-by-default authorization.
+
+### Milestone 18.1: Snowflake Semantics and Compatibility Boundaries
+
+- [ ] Document supported syntax: `MERGE INTO <target> USING <source> ON <join_expr> { matchedClause | notMatchedClause } ...`
+- [ ] Support `WHEN MATCHED [AND predicate] THEN UPDATE SET ...`, `WHEN MATCHED [AND predicate] THEN UPDATE ALL BY NAME`, and `WHEN MATCHED [AND predicate] THEN DELETE`
+- [ ] Support `WHEN NOT MATCHED [AND predicate] THEN INSERT [(columns)] VALUES (...)` and `WHEN NOT MATCHED [AND predicate] THEN INSERT ALL BY NAME`
+- [ ] Enforce clause reachability: a catch-all `WHEN MATCHED` or `WHEN NOT MATCHED` clause without `AND` must be last for that clause type
+- [ ] Implement Snowflake-style duplicate source behavior for target rows, including deterministic delete-only cases, exactly-one-update cases, and default errors for ambiguous update/delete conflicts
+- [ ] Implement a Phase 18 parameter surface for `ERROR_ON_NONDETERMINISTIC_MERGE`, defaulting to `TRUE`, with at least session-scoped `FALSE` support for nondeterministic compatibility mode; account/user resolution can plug into the Phase 16 parameter model when available
+- [ ] Document unsupported initial scope explicitly: no `WHEN NOT MATCHED BY SOURCE`, no `RETURNING`, no multi-target merge, no worker-local state, and no claim of complete Snowflake compatibility
+
+### Milestone 18.2: Parser, Analyzer, and Resolved AST
+
+- [ ] Evaluate sqlparser-rs native `MERGE` AST support and add a Nova pre-parser only if required for Snowflake-specific `ALL BY NAME` gaps
+- [ ] Add `ResolvedStatement::Merge` with target relation, source relation or subquery, join expression, ordered clauses, action expressions, and all-by-name flags
+- [ ] Resolve target/source aliases, column references, expression types, and source-only versus target/source expression restrictions for insert/update actions
+- [ ] Validate duplicate target column assignments, generated/read-only column constraints when applicable, `ALL BY NAME` column count/name equality, and clause ordering before execution
+- [ ] Preserve original SQL text and normalized clause metadata for task version snapshots, audit, query history, and error reporting
+- [ ] Add parser/analyzer tests for valid mixed MERGE, aliasing, subquery source, unreachable clauses, invalid column references, invalid all-by-name inputs, and multiple statement handling
+
+### Milestone 18.3: Logical Planning and Execution Strategy
+
+- [ ] Build a logical MERGE plan that joins target and source once, classifies matched and not-matched rows, evaluates clauses in order, and records one intended action per target row/source row pair
+- [ ] Ensure unmatched source duplicate rows are all inserted when no target row matches, matching Snowflake deterministic insert behavior
+- [ ] Detect ambiguous matched actions before committing changes when `ERROR_ON_NONDETERMINISTIC_MERGE=TRUE`
+- [ ] Provide a guarded nondeterministic mode for `ERROR_ON_NONDETERMINISTIC_MERGE=FALSE` with explicit tracing/audit that the selected source row/action is undefined
+- [ ] Use DataFusion for source evaluation, join evaluation, predicate evaluation, projection, and expression computation while preserving Nova's MVCC snapshot and metadata pruning rules
+- [ ] Return Snowflake-style row count summaries for inserted, updated, and deleted rows through executor, scheduler, MySQL protocol, and task run history
+- [ ] Add tests for simple update, insert-only, delete-only, mixed clauses, duplicate source conflicts, deterministic duplicate delete, deterministic single update, and all duplicate inserts
+
+### Milestone 18.4: Copy-on-Write Storage, MVCC, and FDB Atomicity
+
+- [ ] Reuse UPDATE/DELETE copy-on-write micro-partition rewriting for matched updates/deletes and INSERT micro-partition writing for not-matched inserts
+- [ ] Commit all MERGE effects atomically in FoundationDB: new MP metadata, superseded MP metadata, table version increments, transaction records, stream change metadata, and audit references
+- [ ] Preserve statement-level snapshot semantics so source duplicate inserts do not see rows inserted earlier in the same MERGE statement
+- [ ] Ensure failed MERGE statements roll back new metadata visibility and do not advance source stream offsets, task offsets, result-cache versions, or audit success records
+- [ ] Add conflict detection for concurrent MERGE/UPDATE/DELETE on the same target table or affected MPs, with deterministic retry/idempotency behavior for FDB transaction retries
+- [ ] Invalidate result cache using table version changes; rely on security epoch changes, not ordinary MERGE DML, for authorization cache invalidation
+- [ ] Add tests for COW visibility, time travel before/after MERGE, clone isolation, stream CDC output, FDB conflict retry, rollback on error, and cache invalidation
+
+### Milestone 18.5: Enterprise RBAC, Governance, and Audit
+
+- [ ] Require `SELECT` on every source table/view/stream referenced by the source relation or subquery
+- [ ] Require target privileges statically for every action clause present after validation: `INSERT` for insert clauses, `UPDATE` for update clauses, and `DELETE` for delete clauses; authorization must not depend on row contents or whether a clause happens to match at runtime
+- [ ] Enforce row access policies and masking policies for source rows and target rows selected by MERGE without bypass through join predicates, clause predicates, or all-by-name expansion, and define whether policy-hidden target rows are denied or treated as not matched before implementation
+- [ ] Deny by default when user, active role, target object, source object, privilege, policy, or security epoch resolution is missing or stale
+- [ ] Record query access history and lineage for source objects read, target table modified, columns read, columns updated, rows inserted/updated/deleted, policies referenced, and denied authorization attempts
+- [ ] Redact SQL text, expression values, and policy internals in errors, audit, and task run history according to Phase 16 security rules
+- [ ] Add negative tests for missing source SELECT, missing target INSERT/UPDATE/DELETE, revoked privileges after planning, policy-protected rows, masked join/update expressions, MySQL protocol execution, and background task bypass attempts
+
+### Milestone 18.6: TASK Integration and Stream-Triggered MERGE Workflows
+
+- [ ] Allow task SQL bodies to contain MERGE statements and persist the MERGE SQL in immutable task version snapshots
+- [ ] Execute MERGE tasks with the Phase 17 task security context: system service user plus task owner role by default, or validated `EXECUTE AS USER` when configured
+- [ ] Re-check owner role privileges before each task run, including source SELECT, stream access, target DML privileges, warehouse usage, and account-level task execution privileges
+- [ ] Integrate MERGE with stream-triggered tasks so `SYSTEM$STREAM_HAS_DATA` can trigger CDC upsert workflows without scanning MP data unnecessarily
+- [ ] Advance source stream offsets only when the task transaction commits successfully; failed MERGE task runs must leave source stream offsets unchanged for retry
+- [ ] Store MERGE row counts, nondeterminism errors, authorization failures, table versions, source stream offsets consumed, and target table versions in task run history
+- [ ] Add tests for scheduled MERGE task, stream-triggered MERGE task, failed MERGE retry without offset advancement, revoked owner role DML privilege, execute-as impersonation denial, and coordinator failover during a queued MERGE task
+
+### Milestone 18.7: Observability, Benchmarks, and Hardening
+
+- [ ] Emit tracing spans for parse/analyze/plan, source evaluation, join classification, duplicate detection, COW rewrite, FDB commit, cache invalidation, RBAC decisions, and task execution context
+- [ ] Add metrics for MERGE rows scanned, matched, inserted, updated, deleted, duplicate-conflict errors, rewritten MPs, write amplification, commit latency, and task-trigger latency
+- [ ] Add benchmark scenarios for small upserts, large CDC batches, high-duplicate source data, all-by-name merges, selective joins with MP pruning, and task-driven stream consumption
+- [ ] Define performance guardrails for MP rewrite amplification, memory usage during join/action classification, and backpressure for very large source relations
+- [ ] Add compatibility tests comparing documented Snowflake examples to Nova expected results where behavior is in scope
+- [ ] Document operational guidance: source de-duplication with `GROUP BY`, idempotent task MERGE design, lock/conflict behavior, and unsupported Snowflake features
+
+### Phase 18 Exit Criteria
+
+- [ ] `MERGE INTO` works through parser, analyzer, executor, scheduler, MySQL protocol, and task execution paths
+- [ ] Matched UPDATE/DELETE, not-matched INSERT, multiple ordered clauses, `ALL BY NAME`, source subqueries, aliases, and row-count output are covered by tests
+- [ ] Duplicate source behavior matches Snowflake-compatible deterministic rules and defaults to error for nondeterministic update/delete conflicts
+- [ ] MERGE preserves immutable MP copy-on-write, MVCC time travel, clone isolation, stream CDC correctness, result-cache invalidation, and FDB atomicity
+- [ ] RBAC and governance deny unauthorized interactive and background MERGE execution by default, with negative bypass tests
+- [ ] TASK integration supports scheduled and stream-triggered MERGE workflows without advancing source stream offsets on failed runs
+- [ ] Interactive and task `MERGE ... USING <stream>` advance source stream offsets only after the same transaction commits successfully
+- [ ] Concurrent MERGE/UPDATE/DELETE on the same target table or affected MPs has tested conflict, retry, and idempotency behavior
+- [ ] Documentation in `GUIDE_MERGE_INTO_PLANNING.md` explains references, implementation steps, RBAC, task integration, tests, and Nova-specific compatibility boundaries
+
+---
+
 ## Dependency Graph
 
 ```
@@ -633,11 +821,17 @@ Phase 1 (Foundation)
               └── Phase 5 (CBO Enhancement)
                     └── Phase 6 (Cache & Polish)
                           └── Phase 16 (Enterprise Security & Governance)
+                                └── Phase 17 (Enterprise Task Orchestration)
+                                      └── Phase 18 (Snowflake MERGE INTO)
 ```
+
+This graph is condensed; the bullets below call out additional completed-phase capabilities such as Phase 8 SQL completeness, Phase 9 cache invalidation, Phase 10 distributed execution, Phase 11 HA, and Phase 13 Dynamic Tables where relevant.
 
 - Phase 4 and Phase 5 can run in parallel (different teams/agents)
 - Phase 6 depends on both Phase 4 and Phase 5
 - Phase 16 depends on baseline SQL execution, DataFusion integration, RBAC enforcement, cache invalidation, dynamic tables, HA, and distributed execution being available
+- Phase 17 depends on Streams, Dynamic Tables scheduler patterns, HA coordinator leadership, distributed execution, and Phase 16 enterprise RBAC/security context being available
+- Phase 18 depends on COW UPDATE/DELETE/INSERT, MVCC/streams, DataFusion SQL execution, result-cache invalidation, Phase 16 enterprise RBAC, and Phase 17 task execution context being available
 - Each phase has explicit exit criteria — do NOT start next phase until all criteria met
 
 ---
@@ -653,6 +847,11 @@ Phase 1 (Foundation)
 | Time Travel query | < 1.5x of current query | Overhead < 50% |
 | Zero-Copy Clone | < 1 second | Any table size |
 | Stream latency | < 1 second | INSERT to stream visible |
+| Task scheduled-run jitter | < 5 seconds p95 | Due time to queued run under normal load |
+| Task stream-trigger latency | < 5 seconds p95 | Source commit to task queued for triggered tasks |
+| Task HA duplicate prevention | 0 duplicate graph runs | Coordinator failover and FDB lease conflict tests |
+| MERGE CDC batch | Deterministic correctness first | Insert/update/delete counts match expected results |
+| MERGE COW amplification | Measured and bounded | Rewritten MPs and latency reported per benchmark |
 | Repeated query (cache hit) | < 10ms | 600x faster than cold |
 | Coordinator failover | < 10 seconds | RTO |
 | Worker auto-scale | < 60 seconds | Spin up new worker |

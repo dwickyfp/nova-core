@@ -5,8 +5,7 @@
 // Integrates with DataFusion's push-based execution pipeline.
 
 use arrow::datatypes::SchemaRef;
-#[allow(unused_imports)]
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::common::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
 use datafusion::physical_expr::EquivalenceProperties;
@@ -30,8 +29,12 @@ pub struct MicroPartitionScanExec {
     mp_list: Vec<MicroPartitionMeta>,
     /// Output schema (after projection).
     schema: SchemaRef,
-    /// Column indices to read (None = all columns).
+    /// Requested logical column order (None = all columns).
     projection: Option<Vec<usize>>,
+    /// Sorted unique physical columns to read from Parquet.
+    read_projection: Option<Vec<usize>>,
+    /// True when DataFusion requested a zero-column projection such as COUNT(*).
+    empty_projection: bool,
     /// MP reader (handles S3 + Parquet deserialization).
     reader: Arc<MpReader>,
     /// Plan properties (cached).
@@ -45,23 +48,40 @@ impl MicroPartitionScanExec {
         schema: SchemaRef,
         projection: Option<Vec<usize>>,
         reader: Arc<MpReader>,
-    ) -> Self {
+    ) -> DFResult<Self> {
         let n_partitions = mp_list.len().max(1);
-        // Compute projected schema if projection is provided
+        let field_count = schema.fields().len();
+        if let Some(indices) = &projection {
+            for &index in indices {
+                if index >= field_count {
+                    return Err(DataFusionError::Plan(format!(
+                        "projection index {index} out of bounds for schema with {field_count} fields"
+                    )));
+                }
+            }
+        }
+
+        // Compute projected schema if projection is provided.
+        let empty_projection = matches!(&projection, Some(indices) if indices.is_empty());
         let output_schema = match &projection {
-            Some(indices) if !indices.is_empty() => {
+            Some(indices) => {
                 let projected_fields: Vec<_> = indices
                     .iter()
-                    .filter_map(|&i| schema.fields().get(i).cloned())
+                    .map(|&index| schema.fields()[index].clone())
                     .collect();
                 Arc::new(arrow::datatypes::Schema::new(projected_fields))
             }
-            _ => schema.clone(),
+            None => schema.clone(),
         };
-        // For COUNT(*), DataFusion passes Some([]) — use full schema for scan,
-        // but don't apply projection in MpReader (pass None to read all columns)
+        // For COUNT(*), DataFusion passes Some([]). Read all columns to preserve
+        // row counts, then emit zero-column batches with the same row counts.
         let read_projection = match &projection {
-            Some(indices) if !indices.is_empty() => projection.clone(),
+            Some(indices) if !indices.is_empty() => {
+                let mut physical_indices = indices.clone();
+                physical_indices.sort_unstable();
+                physical_indices.dedup();
+                Some(physical_indices)
+            }
             _ => None,
         };
         let properties = PlanProperties::new(
@@ -70,13 +90,15 @@ impl MicroPartitionScanExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
-        Self {
+        Ok(Self {
             mp_list,
             schema: output_schema,
-            projection: read_projection,
+            projection,
+            read_projection,
+            empty_projection,
             reader,
             properties,
-        }
+        })
     }
 }
 
@@ -136,6 +158,14 @@ impl ExecutionPlan for MicroPartitionScanExec {
         partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<datafusion::physical_plan::SendableRecordBatchStream> {
+        if self.mp_list.is_empty() && partition == 0 {
+            let stream = futures::stream::empty::<DFResult<RecordBatch>>();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                stream,
+            )));
+        }
+
         if partition >= self.mp_list.len() {
             return Err(DataFusionError::Internal(format!(
                 "partition {} out of range ({} MPs)",
@@ -146,33 +176,48 @@ impl ExecutionPlan for MicroPartitionScanExec {
 
         let mp = self.mp_list[partition].clone();
         let reader = self.reader.clone();
-        let projection = self.projection.clone();
-
-        let fut = async move {
+        let logical_projection = self.projection.clone();
+        let read_projection = self.read_projection.clone();
+        let output_schema = self.schema.clone();
+        let empty_projection = self.empty_projection;
+        let stream = async_stream::try_stream! {
             let batches = reader
-                .read(&mp, projection.as_deref())
+                .read(&mp, read_projection.as_deref())
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            // MpReader already applies projection, so batches are already projected.
-            // No need to re-project here.
-            Ok::<_, DataFusionError>(batches)
+            // MpReader uses Parquet ProjectionMask roots, which behave like a
+            // physical column mask. Rebuild logical projection order here.
+            for batch in batches {
+                if empty_projection {
+                    yield RecordBatch::try_new_with_options(
+                        output_schema.clone(),
+                        Vec::new(),
+                        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                    )
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                } else if let Some(indices) = &logical_projection {
+                    let read_indices = read_projection.as_deref().ok_or_else(|| {
+                        DataFusionError::Internal("missing read projection".to_string())
+                    })?;
+                    let columns = indices
+                        .iter()
+                        .map(|index| {
+                            let column_pos = read_indices.binary_search(index).map_err(|_| {
+                                DataFusionError::Internal(format!(
+                                    "projection index {index} missing from read projection"
+                                ))
+                            })?;
+                            Ok(batch.column(column_pos).clone())
+                        })
+                        .collect::<DFResult<Vec<_>>>()?;
+                    yield RecordBatch::try_new(output_schema.clone(), columns)
+                        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                } else {
+                    yield batch;
+                }
+            }
         };
-
-        // std::thread::spawn with fresh Runtime avoids "nested runtime" error
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let result = rt.block_on(fut);
-            let _ = tx.send(result);
-        });
-
-        let batches = rx
-            .recv()
-            .map_err(|_| DataFusionError::Internal("read task panicked".into()))?
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let stream = futures::stream::iter(batches.into_iter().map(Ok));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema.clone(),
@@ -228,7 +273,8 @@ mod tests {
         let reader = Arc::new(MpReader::new(store));
         let schema = test_schema();
 
-        let exec = MicroPartitionScanExec::new(mps, schema.clone(), None, reader);
+        let exec = MicroPartitionScanExec::new(mps, schema.clone(), None, reader)
+            .expect("valid scan exec");
 
         assert_eq!(exec.schema(), schema);
         assert_eq!(exec.properties().eq_properties.schema(), &schema);
@@ -252,15 +298,10 @@ mod tests {
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(_dir.path()).unwrap());
         let reader = Arc::new(MpReader::new(store));
+        let schema = test_schema();
 
-        // Project only columns 0 and 2 (id, amount)
-        let projected_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("amount", DataType::Float64, false),
-        ]));
-
-        let exec =
-            MicroPartitionScanExec::new(mps, projected_schema.clone(), Some(vec![0, 1]), reader);
+        let exec = MicroPartitionScanExec::new(mps, schema, Some(vec![0, 2]), reader)
+            .expect("valid projection");
 
         let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
         let mut stream = exec.execute(0, ctx).unwrap();
@@ -272,7 +313,143 @@ mod tests {
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.schema().field(0).name(), "id");
-        assert_eq!(batch.schema().field(1).name(), "name");
+        assert_eq!(batch.schema().field(1).name(), "amount");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_exec_preserves_projection_order() {
+        let (mps, _dir) = write_test_mp().await;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(_dir.path()).unwrap());
+        let reader = Arc::new(MpReader::new(store));
+
+        let exec = MicroPartitionScanExec::new(mps, test_schema(), Some(vec![2, 0]), reader)
+            .expect("valid projection");
+
+        assert_eq!(exec.schema().field(0).name(), "amount");
+        assert_eq!(exec.schema().field(1).name(), "id");
+
+        let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+
+        let batch = futures::StreamExt::next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.num_columns(), 2);
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.schema().field(0).name(), "amount");
+        assert_eq!(batch.schema().field(1).name(), "id");
+
+        let amounts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(amounts.value(0), 100.0);
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(amounts.value(2), 300.0);
+        assert_eq!(ids.value(2), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_exec_preserves_duplicate_projection_columns() {
+        let (mps, _dir) = write_test_mp().await;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(_dir.path()).unwrap());
+        let reader = Arc::new(MpReader::new(store));
+
+        let exec = MicroPartitionScanExec::new(mps, test_schema(), Some(vec![2, 2, 0]), reader)
+            .expect("valid duplicate projection");
+
+        let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+        let mut stream = exec.execute(0, ctx).unwrap();
+        let batch = futures::StreamExt::next(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.schema().field(0).name(), "amount");
+        assert_eq!(batch.schema().field(1).name(), "amount");
+        assert_eq!(batch.schema().field(2).name(), "id");
+
+        let first_amount = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let second_amount = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let ids = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(first_amount.value(1), 200.0);
+        assert_eq!(second_amount.value(1), 200.0);
+        assert_eq!(ids.value(1), 2);
+    }
+
+    #[test]
+    fn test_scan_exec_rejects_projection_out_of_bounds() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+        let reader = Arc::new(MpReader::new(store));
+        let err = MicroPartitionScanExec::new(Vec::new(), test_schema(), Some(vec![0, 3]), reader)
+            .expect_err("projection index beyond schema should fail");
+
+        assert!(
+            err.to_string().contains("projection index 3 out of bounds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_exec_empty_mps_returns_empty_stream() {
+        let store: Arc<dyn object_store::ObjectStore> = Arc::new(LocalFileSystem::new());
+        let reader = Arc::new(MpReader::new(store));
+        let exec = MicroPartitionScanExec::new(Vec::new(), test_schema(), None, reader)
+            .expect("empty MP list should create deterministic scan");
+
+        assert_eq!(exec.properties().partitioning.partition_count(), 1);
+
+        let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+        let mut stream = exec.execute(0, ctx).expect("empty scan should stream");
+
+        assert!(futures::StreamExt::next(&mut stream).await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_exec_empty_projection_preserves_rows_with_zero_columns() {
+        let (mps, _dir) = write_test_mp().await;
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(_dir.path()).unwrap());
+        let reader = Arc::new(MpReader::new(store));
+        let exec = MicroPartitionScanExec::new(mps, test_schema(), Some(vec![]), reader)
+            .expect("COUNT(*) empty projection should be valid");
+
+        assert_eq!(exec.schema().fields().len(), 0);
+
+        let ctx = Arc::new(datafusion::execution::context::TaskContext::default());
+        let mut stream = exec
+            .execute(0, ctx)
+            .expect("empty projection should stream");
+        let batch = futures::StreamExt::next(&mut stream)
+            .await
+            .expect("scan should produce one batch")
+            .expect("scan batch should be successful");
+
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 0);
+        assert!(futures::StreamExt::next(&mut stream).await.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -283,7 +460,7 @@ mod tests {
         let reader = Arc::new(MpReader::new(store));
         let schema = test_schema();
 
-        let exec = MicroPartitionScanExec::new(mps, schema, None, reader);
+        let exec = MicroPartitionScanExec::new(mps, schema, None, reader).expect("valid scan exec");
 
         // 1 MP = 1 partition
         let n_partitions = exec.properties().partitioning.partition_count();
@@ -309,7 +486,8 @@ mod tests {
         let reader = Arc::new(MpReader::new(store));
 
         // Verify: 5 MPs = 5 partitions
-        let exec = MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader.clone());
+        let exec = MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader.clone())
+            .expect("valid scan exec");
         assert_eq!(exec.properties().partitioning.partition_count(), 5);
 
         // Execute all 5 partitions in parallel and collect results
@@ -317,7 +495,8 @@ mod tests {
         let mut handles = Vec::new();
         for part in 0..5 {
             let exec_clone =
-                MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader.clone());
+                MicroPartitionScanExec::new(mps.clone(), schema.clone(), None, reader.clone())
+                    .expect("valid scan exec");
             let ctx_clone = ctx.clone();
             handles.push(tokio::task::spawn(async move {
                 let mut stream = exec_clone.execute(part, ctx_clone).unwrap();

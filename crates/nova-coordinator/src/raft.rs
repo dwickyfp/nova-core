@@ -65,6 +65,20 @@ impl<M: nova_storage::MetadataStore> CoordinatorStateMachine<M> {
     pub async fn apply(&self, req: &RaftRequest) -> RaftResponse {
         match req {
             RaftRequest::CreateDatabase { name } => {
+                if self
+                    .store
+                    .list_databases()
+                    .await
+                    .map(|dbs| dbs.into_iter().any(|db| db.name.eq_ignore_ascii_case(name)))
+                    .unwrap_or(false)
+                {
+                    return RaftResponse {
+                        success: true,
+                        message: format!("database {} already exists", name),
+                        assigned_id: None,
+                    };
+                }
+
                 let db = nova_common::DatabaseMeta {
                     id: 0,
                     name: name.clone(),

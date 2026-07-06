@@ -92,6 +92,10 @@ impl QueryResultCache {
     pub async fn get(&self, key: u64) -> Option<(Vec<String>, Vec<Vec<String>>)> {
         let cache = self.cache.read().await;
         if let Some(result) = cache.get(&key) {
+            if result.table_versions.is_empty() {
+                self.stats.write().await.misses += 1;
+                return None;
+            }
             self.stats.write().await.hits += 1;
             return Some((result.columns.clone(), result.rows.clone()));
         }
@@ -107,6 +111,10 @@ impl QueryResultCache {
         rows: Vec<Vec<String>>,
         table_versions: HashMap<u64, u64>,
     ) {
+        if table_versions.is_empty() {
+            return;
+        }
+
         let mut cache = self.cache.write().await;
         if cache.len() >= self.max_entries {
             // Evict oldest entry (FIFO)
@@ -301,6 +309,29 @@ mod tests {
     #[tokio::test]
     async fn test_l1_result_cache_basic() {
         let cache = QueryResultCache::new(100);
+        let mut versions = HashMap::new();
+        versions.insert(1u64, 1u64);
+        let key = QueryResultCache::key("SELECT * FROM t", &versions);
+
+        cache
+            .put(
+                key,
+                vec!["id".to_string()],
+                vec![vec!["1".to_string()]],
+                versions,
+            )
+            .await;
+
+        let result = cache.get(key).await;
+        assert!(result.is_some());
+        let (cols, rows) = result.unwrap();
+        assert_eq!(cols, vec!["id"]);
+        assert_eq!(rows, vec![vec!["1"]]);
+    }
+
+    #[tokio::test]
+    async fn test_l1_result_cache_rejects_empty_table_versions() {
+        let cache = QueryResultCache::new(100);
         let key = QueryResultCache::key("SELECT * FROM t", &HashMap::new());
 
         cache
@@ -312,11 +343,10 @@ mod tests {
             )
             .await;
 
-        let result = cache.get(key).await;
-        assert!(result.is_some());
-        let (cols, rows) = result.unwrap();
-        assert_eq!(cols, vec!["id"]);
-        assert_eq!(rows, vec![vec!["1"]]);
+        assert!(cache.get(key).await.is_none());
+        let stats = cache.stats().await;
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
     }
 
     #[tokio::test]
@@ -334,8 +364,10 @@ mod tests {
     async fn test_l1_result_cache_hit_rate() {
         let cache = QueryResultCache::new(100);
         let key = 1u64;
+        let mut versions = HashMap::new();
+        versions.insert(1u64, 1u64);
         cache
-            .put(key, vec!["a".to_string()], vec![], HashMap::new())
+            .put(key, vec!["a".to_string()], vec![], versions)
             .await;
 
         cache.get(key).await; // hit
@@ -351,9 +383,11 @@ mod tests {
     #[tokio::test]
     async fn test_l1_result_cache_eviction() {
         let cache = QueryResultCache::new(2);
-        cache.put(1, vec![], vec![], HashMap::new()).await;
-        cache.put(2, vec![], vec![], HashMap::new()).await;
-        cache.put(3, vec![], vec![], HashMap::new()).await; // evicts key 1
+        let mut versions = HashMap::new();
+        versions.insert(1u64, 1u64);
+        cache.put(1, vec![], vec![], versions.clone()).await;
+        cache.put(2, vec![], vec![], versions.clone()).await;
+        cache.put(3, vec![], vec![], versions).await; // evicts key 1
 
         let stats = cache.stats().await;
         assert!(stats.evictions >= 1);

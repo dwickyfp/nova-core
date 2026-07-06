@@ -1,5 +1,6 @@
 //! nova — CLI entry point for nova-core coordinator.
 
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use figment::providers::Format;
 use nova_coordinator::auth::AuthManager;
@@ -10,6 +11,10 @@ use nova_coordinator::mysql_protocol::MySqlServer;
 use nova_coordinator::mysql_protocol::nova_engine::NovaEngine;
 use nova_storage::{FdbMetadataStore, MetadataStore, MpReader, MpWriter};
 use object_store::ObjectStore;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Parser)]
@@ -82,7 +87,7 @@ fn default_region() -> String {
     "us-east-1".to_string()
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize)]
 struct AuthConfig {
     #[serde(default = "default_auth_enabled")]
     enabled: bool,
@@ -90,6 +95,8 @@ struct AuthConfig {
     default_username: String,
     #[serde(default)]
     default_password_hash: String,
+    #[serde(default)]
+    allow_insecure: bool,
 }
 
 fn default_auth_enabled() -> bool {
@@ -100,10 +107,169 @@ fn default_username() -> String {
     "root".to_string()
 }
 
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_auth_enabled(),
+            default_username: default_username(),
+            default_password_hash: String::new(),
+            allow_insecure: false,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct MetadataConfig {
     #[allow(dead_code)]
     fdb_cluster_file: Option<String>,
+}
+
+fn parse_config_str(config: &str) -> anyhow::Result<Config> {
+    figment::Figment::new()
+        .merge(figment::providers::Toml::string(config))
+        .extract()
+        .context("invalid Nova config")
+}
+
+fn apply_env_overrides(
+    config: &mut Config,
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> anyhow::Result<()> {
+    for (key, value) in vars {
+        match key.as_str() {
+            "NOVA_SERVER_HOST" => config.server.host = value,
+            "NOVA_SERVER_PORT" => {
+                config.server.port = parse_env(&key, &value)?;
+            }
+            "NOVA_STORAGE_S3_ENDPOINT" => config.storage.s3_endpoint = value,
+            "NOVA_STORAGE_S3_BUCKET" => config.storage.s3_bucket = value,
+            "NOVA_STORAGE_S3_ACCESS_KEY" => config.storage.s3_access_key = value,
+            "NOVA_STORAGE_S3_SECRET_KEY" => config.storage.s3_secret_key = value,
+            "NOVA_STORAGE_S3_REGION" => config.storage.s3_region = value,
+            "NOVA_METADATA_FDB_CLUSTER_FILE" => config.metadata.fdb_cluster_file = Some(value),
+            "NOVA_AUTH_ENABLED" => {
+                config.auth.enabled = parse_env(&key, &value)?;
+            }
+            "NOVA_AUTH_DEFAULT_USERNAME" => config.auth.default_username = value,
+            "NOVA_AUTH_DEFAULT_PASSWORD_HASH" => config.auth.default_password_hash = value,
+            "NOVA_AUTH_ALLOW_INSECURE" => {
+                config.auth.allow_insecure = parse_env(&key, &value)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_env<T>(key: &str, value: &str) -> anyhow::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {key}={value:?}: {error}"))
+}
+
+fn validate_config(config: &Config) -> anyhow::Result<()> {
+    if !config.auth.enabled && is_wildcard_host(&config.server.host) && !config.auth.allow_insecure
+    {
+        bail!(
+            "refusing auth.enabled=false on wildcard host {}; set auth.allow_insecure=true for explicit dev mode",
+            config.server.host
+        );
+    }
+
+    if !config.auth.allow_insecure && uses_non_loopback_http(&config.storage.s3_endpoint) {
+        bail!(
+            "storage.s3_endpoint uses HTTP for non-loopback host {}; set auth.allow_insecure=true for explicit dev mode",
+            config.storage.s3_endpoint
+        );
+    }
+
+    Ok(())
+}
+
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::")
+}
+
+fn uses_non_loopback_http(endpoint: &str) -> bool {
+    let Some(rest) = endpoint
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .and_then(|_| endpoint.get(7..))
+    else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or(bracketed)
+    } else {
+        authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host)
+            .split(':')
+            .next()
+            .unwrap_or(authority)
+    };
+
+    !is_loopback_host(host)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip_addr| ip_addr.is_loopback())
+}
+
+fn load_config(path: impl AsRef<Path>) -> anyhow::Result<Config> {
+    let path = path.as_ref();
+    if !path.exists() {
+        bail!("config file not found: {}", path.display());
+    }
+
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    let mut config = parse_config_str(&contents)?;
+    apply_env_overrides(&mut config, std::env::vars())?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+fn object_store_from_config(config: &StorageConfig) -> anyhow::Result<Arc<dyn ObjectStore>> {
+    let store = object_store::aws::AmazonS3Builder::new()
+        .with_endpoint(&config.s3_endpoint)
+        .with_access_key_id(&config.s3_access_key)
+        .with_secret_access_key(&config.s3_secret_key)
+        .with_bucket_name(&config.s3_bucket)
+        .with_region(&config.s3_region)
+        .with_allow_http(true)
+        .build()?;
+    Ok(Arc::new(store))
+}
+
+fn raft_cluster_file_path(cluster_file: &str) -> anyhow::Result<String> {
+    if Path::new(cluster_file).exists() || !cluster_file.contains('@') {
+        return Ok(cluster_file.to_string());
+    }
+    let mut hasher = DefaultHasher::new();
+    cluster_file.hash(&mut hasher);
+    let hash = hasher.finish();
+    let path = std::env::temp_dir().join(format!("nova-core-fdb-{hash:016x}.cluster"));
+    std::fs::write(&path, cluster_file)
+        .with_context(|| format!("FDB cluster file write failed: {}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn raft_grpc_addr(host: &str, mysql_port: u16) -> anyhow::Result<SocketAddr> {
+    let port = mysql_port
+        .checked_add(10_000)
+        .with_context(|| format!("Raft gRPC port overflow for MySQL port {mysql_port}"))?;
+    format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid Raft gRPC address: {host}:{port}"))
 }
 
 #[tokio::main]
@@ -112,7 +278,8 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("nova=info".parse()?),
         )
-        .init();
+        .try_init()
+        .map_err(|error| anyhow::anyhow!("failed to initialize tracing subscriber: {error}"))?;
 
     let cli = Cli::parse();
 
@@ -124,10 +291,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             tracing::info!(config = %config, "Starting Nova coordinator");
 
-            let cfg: Config = figment::Figment::new()
-                .merge(figment::providers::Toml::file(config.clone()))
-                .merge(figment::providers::Env::prefixed("NOVA_"))
-                .extract()?;
+            let cfg = load_config(&config)?;
 
             let cluster_file = cfg
                 .metadata
@@ -138,17 +302,8 @@ async fn main() -> anyhow::Result<()> {
             let fdb_store = Arc::new(FdbMetadataStore::open(cluster_file)?);
             let meta: Arc<dyn MetadataStore> = fdb_store.clone();
 
-            // Setup MinIO object store
-            let store = object_store::aws::AmazonS3Builder::new()
-                .with_endpoint(&cfg.storage.s3_endpoint)
-                .with_access_key_id(&cfg.storage.s3_access_key)
-                .with_secret_access_key(&cfg.storage.s3_secret_key)
-                .with_bucket_name(&cfg.storage.s3_bucket)
-                .with_region(&cfg.storage.s3_region)
-                .with_allow_http(true)
-                .build()?;
-
-            let store: Arc<dyn ObjectStore> = Arc::new(store);
+            // Setup configured object store
+            let store = object_store_from_config(&cfg.storage)?;
 
             let writer = MpWriter::new(store.clone(), cfg.storage.s3_bucket);
             let reader = MpReader::new(store);
@@ -166,7 +321,8 @@ async fn main() -> anyhow::Result<()> {
             };
             tracing::info!(
                 enabled = cfg.auth.enabled,
-                "Auth manager initialized (default user: root)"
+                default_username = %cfg.auth.default_username,
+                "Auth manager initialized"
             );
 
             let _health = HealthChecker::new("nova-coordinator-1");
@@ -196,11 +352,12 @@ async fn main() -> anyhow::Result<()> {
                         })
                         .collect()
                 };
+                let raft_cluster_file = raft_cluster_file_path(cluster_file)?;
                 let raft_node = nova_coordinator::raft_transport::NovaRaftNode::start_durable(
                     node_id,
                     peers,
                     fdb_store.clone(),
-                    cluster_file,
+                    &raft_cluster_file,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("raft start failed: {e:?}"))?;
@@ -208,19 +365,18 @@ async fn main() -> anyhow::Result<()> {
                     raft_node.initialize_single().await.ok();
                 }
                 // Start Raft gRPC server on port cfg.server.port + 10000
-                let raft_grpc_addr: std::net::SocketAddr =
-                    format!("{}:{}", cfg.server.host, cfg.server.port as u32 + 10000)
-                        .parse()
-                        .unwrap_or_else(|_| "0.0.0.0:13306".parse().unwrap());
+                let raft_grpc_addr = raft_grpc_addr(&cfg.server.host, cfg.server.port)?;
                 let raft_svc = raft_node.grpc_server();
                 tokio::spawn(async move {
                     use nova_coordinator::raft_transport::raft_service_server::RaftServiceServer;
                     tracing::info!(addr = %raft_grpc_addr, "Raft gRPC server listening");
-                    tonic::transport::Server::builder()
+                    if let Err(error) = tonic::transport::Server::builder()
                         .add_service(RaftServiceServer::new(raft_svc))
                         .serve(raft_grpc_addr)
                         .await
-                        .expect("Raft gRPC server error");
+                    {
+                        tracing::error!(%error, "Raft gRPC server stopped");
+                    }
                 });
                 tracing::info!(node_id, "Raft node started");
                 std::mem::forget(raft_node);
@@ -228,14 +384,16 @@ async fn main() -> anyhow::Result<()> {
 
             // Worker registry gRPC service (worker -> coordinator)
             {
-                let coordinator_grpc_addr: std::net::SocketAddr = "0.0.0.0:50060".parse().unwrap();
+                let coordinator_grpc_addr: SocketAddr = "0.0.0.0:50060"
+                    .parse()
+                    .context("invalid coordinator gRPC registry address")?;
                 let coordinator_svc =
                     nova_coordinator::coordinator_grpc::CoordinatorGrpcServer::new(
                         worker_pool.clone(),
                     );
                 tokio::spawn(async move {
                     tracing::info!(addr = %coordinator_grpc_addr, "Coordinator gRPC registry listening");
-                    tonic::transport::Server::builder()
+                    if let Err(error) = tonic::transport::Server::builder()
                         .add_service(
                             nova_coordinator::coordinator_grpc::CoordinatorServiceServer::new(
                                 coordinator_svc,
@@ -243,7 +401,9 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .serve(coordinator_grpc_addr)
                         .await
-                        .expect("Coordinator gRPC registry error");
+                    {
+                        tracing::error!(%error, "Coordinator gRPC registry stopped");
+                    }
                 });
             }
 
@@ -287,13 +447,17 @@ async fn main() -> anyhow::Result<()> {
                 );
             let http_addr_clone = http_addr.clone();
             tokio::spawn(async move {
-                let listener = tokio::net::TcpListener::bind(&http_addr_clone)
-                    .await
-                    .expect("failed to bind HTTP port");
-                tracing::info!(addr = %http_addr_clone, "HTTP server listening (/health, /metrics)");
-                axum::serve(listener, health_router)
-                    .await
-                    .expect("HTTP server error");
+                match tokio::net::TcpListener::bind(&http_addr_clone).await {
+                    Ok(listener) => {
+                        tracing::info!(addr = %http_addr_clone, "HTTP server listening (/health, /metrics)");
+                        if let Err(error) = axum::serve(listener, health_router).await {
+                            tracing::error!(%error, "HTTP server stopped");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, addr = %http_addr_clone, "failed to bind HTTP server")
+                    }
+                }
             });
             let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
             let server = MySqlServer::bind(&addr, engine, auth).await?;
@@ -315,10 +479,7 @@ async fn main() -> anyhow::Result<()> {
                 "Starting Nova worker — gRPC server + coordinator registration"
             );
 
-            let cfg: Config = figment::Figment::new()
-                .merge(figment::providers::Toml::file(config.clone()))
-                .merge(figment::providers::Env::prefixed("NOVA_"))
-                .extract()?;
+            let cfg = load_config(&config)?;
             let cluster_file = cfg
                 .metadata
                 .fdb_cluster_file
@@ -327,12 +488,8 @@ async fn main() -> anyhow::Result<()> {
             let meta: Arc<dyn nova_storage::MetadataStore> =
                 Arc::new(FdbMetadataStore::open(cluster_file)?);
 
-            // Setup object store (local for dev)
-            let data_dir = "./data/nova-worker-data";
-            std::fs::create_dir_all(data_dir)?;
-            let store: Arc<dyn object_store::ObjectStore> = Arc::new(
-                object_store::local::LocalFileSystem::new_with_prefix(data_dir)?,
-            );
+            // Setup configured object store; workers stay stateless and read coordinator-written MPs.
+            let store = object_store_from_config(&cfg.storage)?;
 
             let reader = nova_storage::MpReader::new(store);
             let executor = nova_worker::Executor::new(reader);
@@ -438,4 +595,293 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_auth(host: &str, auth: &str) -> String {
+        format!(
+            r#"
+[server]
+host = "{host}"
+port = 3306
+
+[storage]
+s3_endpoint = "http://localhost:9000"
+s3_bucket = "nova"
+s3_access_key = "placeholder-access-key"
+s3_secret_key = "placeholder-secret-key"
+s3_region = "us-east-1"
+
+[metadata]
+fdb_cluster_file = "docker:docker@127.0.0.1:4500"
+
+{auth}
+"#
+        )
+    }
+
+    #[test]
+    fn config_example_matches_cli_schema() {
+        let cfg = parse_config_str(include_str!("../../../config.toml.example")).unwrap();
+
+        assert_eq!(cfg.storage.s3_bucket, "nova");
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn missing_auth_section_uses_root_dev_default() {
+        let cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+
+        assert!(!cfg.auth.enabled);
+        assert_eq!(cfg.auth.default_username, "root");
+        assert!(!cfg.auth.allow_insecure);
+    }
+
+    #[test]
+    fn docker_config_declares_insecure_dev_mode_explicitly() {
+        let cfg = parse_config_str(include_str!("../../../docker/config-fdb.toml")).unwrap();
+
+        assert!(!cfg.auth.enabled);
+        assert!(cfg.auth.allow_insecure);
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn validation_rejects_auth_disabled_on_wildcard_host_without_override() {
+        let cfg = parse_config_str(&config_with_auth(
+            "0.0.0.0",
+            r#"[auth]
+enabled = false
+"#,
+        ))
+        .unwrap();
+
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("auth.enabled=false"));
+        assert!(err.contains("auth.allow_insecure=true"));
+    }
+
+    #[test]
+    fn validation_rejects_non_loopback_http_storage_without_override() {
+        let mut cfg = parse_config_str(&config_with_auth(
+            "127.0.0.1",
+            r#"[auth]
+enabled = false
+"#,
+        ))
+        .unwrap();
+        cfg.storage.s3_endpoint = "http://minio:9000".to_string();
+
+        let err = validate_config(&cfg).unwrap_err().to_string();
+        assert!(err.contains("storage.s3_endpoint"));
+        assert!(err.contains("auth.allow_insecure=true"));
+    }
+
+    #[test]
+    fn validation_allows_enabled_auth_without_unused_default_password() {
+        let cfg = parse_config_str(&config_with_auth(
+            "127.0.0.1",
+            r#"[auth]
+enabled = true
+default_username = "root"
+default_password_hash = ""
+"#,
+        ))
+        .unwrap();
+
+        validate_config(&cfg).unwrap();
+    }
+
+    #[test]
+    fn missing_config_file_reports_path() {
+        let path = std::env::temp_dir().join("nova-cli-missing-config-for-test.toml");
+
+        let err = match load_config(&path) {
+            Ok(_) => panic!("missing config unexpectedly loaded"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(err.contains("config file not found"));
+        assert!(err.contains("nova-cli-missing-config-for-test.toml"));
+    }
+
+    #[test]
+    fn explicit_env_overrides_replace_docker_secret_placeholders() {
+        let mut cfg = parse_config_str(&config_with_auth(
+            "127.0.0.1",
+            r#"[auth]
+enabled = false
+"#,
+        ))
+        .unwrap();
+
+        apply_env_overrides(
+            &mut cfg,
+            vec![
+                (
+                    "NOVA_STORAGE_S3_ACCESS_KEY".to_string(),
+                    "dev-access-key".to_string(),
+                ),
+                (
+                    "NOVA_STORAGE_S3_SECRET_KEY".to_string(),
+                    "dev-secret-key".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(cfg.storage.s3_access_key, "dev-access-key");
+        assert_eq!(cfg.storage.s3_secret_key, "dev-secret-key");
+    }
+
+    #[test]
+    fn raft_grpc_addr_is_derived_without_silent_fallback() {
+        let addr = raft_grpc_addr("127.0.0.1", 3306).unwrap();
+        assert_eq!(addr.to_string(), "127.0.0.1:13306");
+
+        let err = raft_grpc_addr("127.0.0.1", 60000).unwrap_err().to_string();
+        assert!(err.contains("Raft gRPC port overflow"));
+    }
+
+    #[test]
+    fn review_fix_raw_fdb_cluster_contents_are_written_to_cluster_file_for_raft() {
+        let raw_cluster = "docker:docker@nova-fdb:4500";
+
+        let path = raft_cluster_file_path(raw_cluster).unwrap();
+
+        assert_ne!(path, raw_cluster);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw_cluster);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn review_fix_existing_fdb_cluster_file_path_is_reused_for_raft() {
+        let path = std::env::temp_dir().join(format!(
+            "nova-cli-existing-cluster-{}-{}.cluster",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "docker:docker@127.0.0.1:4500").unwrap();
+
+        let resolved = raft_cluster_file_path(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(resolved, path.to_string_lossy());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn review_fix_configured_object_store_accepts_docker_storage_config() {
+        let mut cfg = parse_config_str(include_str!("../../../docker/config-fdb.toml")).unwrap();
+        apply_env_overrides(
+            &mut cfg,
+            vec![
+                (
+                    "NOVA_STORAGE_S3_ACCESS_KEY".to_string(),
+                    "dev-access-key".to_string(),
+                ),
+                (
+                    "NOVA_STORAGE_S3_SECRET_KEY".to_string(),
+                    "dev-secret-key".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let _store = object_store_from_config(&cfg.storage).unwrap();
+    }
+
+    #[test]
+    fn review_fix_docker_workers_do_not_mount_persistent_data_volumes() {
+        let compose = include_str!("../../../docker/docker-compose.yml");
+
+        assert!(!compose.contains("worker1_cache"));
+        assert!(!compose.contains("worker2_cache"));
+        assert!(!compose.contains("nova-worker-data"));
+    }
+
+    #[test]
+    fn review_fix_invalid_server_port_env_returns_clear_error() {
+        let mut cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+
+        let err = apply_env_overrides(
+            &mut cfg,
+            vec![("NOVA_SERVER_PORT".to_string(), "not-a-port".to_string())],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("NOVA_SERVER_PORT"));
+        assert!(err.contains("not-a-port"));
+    }
+
+    #[test]
+    fn review_fix_invalid_auth_enabled_env_returns_clear_error() {
+        let mut cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+
+        let err = apply_env_overrides(
+            &mut cfg,
+            vec![("NOVA_AUTH_ENABLED".to_string(), "maybe".to_string())],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("NOVA_AUTH_ENABLED"));
+        assert!(err.contains("maybe"));
+    }
+
+    #[test]
+    fn review_fix_invalid_auth_allow_insecure_env_returns_clear_error() {
+        let mut cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+
+        let err = apply_env_overrides(
+            &mut cfg,
+            vec![("NOVA_AUTH_ALLOW_INSECURE".to_string(), "maybe".to_string())],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("NOVA_AUTH_ALLOW_INSECURE"));
+        assert!(err.contains("maybe"));
+    }
+
+    #[test]
+    fn review_fix_validation_rejects_uppercase_http_non_loopback_storage() {
+        let mut cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+        cfg.storage.s3_endpoint = "HTTP://minio:9000".to_string();
+
+        let err = validate_config(&cfg).unwrap_err().to_string();
+
+        assert!(err.contains("storage.s3_endpoint"));
+        assert!(err.contains("auth.allow_insecure=true"));
+    }
+
+    #[test]
+    fn review_fix_validation_rejects_127_prefix_hostname_storage() {
+        let mut cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+        cfg.storage.s3_endpoint = "http://127.evil.example:9000".to_string();
+
+        let err = validate_config(&cfg).unwrap_err().to_string();
+
+        assert!(err.contains("storage.s3_endpoint"));
+        assert!(err.contains("auth.allow_insecure=true"));
+    }
+
+    #[test]
+    fn review_fix_validation_allows_loopback_http_storage() {
+        let mut cfg = parse_config_str(&config_with_auth("127.0.0.1", "")).unwrap();
+        cfg.storage.s3_endpoint = "HTTP://LOCALHOST:9000".to_string();
+        validate_config(&cfg).unwrap();
+
+        cfg.storage.s3_endpoint = "http://127.12.34.56:9000".to_string();
+        validate_config(&cfg).unwrap();
+
+        cfg.storage.s3_endpoint = "http://[::1]:9000".to_string();
+        validate_config(&cfg).unwrap();
+    }
 }

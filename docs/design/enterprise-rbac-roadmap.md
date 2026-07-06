@@ -906,17 +906,17 @@ Goal: every securable object has stable unique ID.
 
 Checklist:
 
-- [ ] Add atomic ID allocation for database/schema/table/dynamic_table/user/role.
-- [ ] Add name indexes where missing.
-- [ ] Prevent duplicate names in same scope.
-- [ ] Reopen tests prove IDs persist.
-- [ ] Existing ID `0` behavior no longer creates collisions.
+- [x] Add atomic ID allocation for database/schema/table/dynamic_table/user/role.
+- [x] Add name indexes where missing.
+- [x] Prevent duplicate names in same scope.
+- [x] Reopen tests prove IDs persist.
+- [x] Existing ID `0` behavior no longer creates collisions.
 
 Acceptance tests:
 
-- [ ] Create two databases; IDs differ and survive reopen.
-- [ ] Create two tables in same schema; IDs differ and survive reopen.
-- [ ] Duplicate table name fails.
+- [x] Create two databases; IDs differ and survive reopen.
+- [x] Create two tables in same schema; IDs differ and survive reopen.
+- [x] Duplicate table name fails.
 
 ### Phase 1 — FDB-backed security metadata
 
@@ -977,8 +977,8 @@ Acceptance tests:
 
 - [x] Two concurrent sessions with different roles cannot leak privileges.
 - [x] `USE ROLE` affects only current session.
-- [ ] Login fails for disabled user.
-- [ ] Login fails if default role is not granted.
+- [x] Login fails for disabled user.
+- [x] Login fails if default role is not granted.
 
 ### Phase 3 — Core authorization enforcement
 
@@ -997,10 +997,10 @@ Checklist:
 
 Acceptance tests:
 
-- [ ] User without `SELECT` cannot read table.
-- [ ] User with `SELECT` but without parent `USAGE` cannot read table.
-- [ ] Owner can operate on owned table.
-- [ ] Non-owner cannot drop table without ownership.
+- [x] User without `SELECT` cannot read table.
+- [x] User with `SELECT` but without parent `USAGE` cannot read table.
+- [x] Owner can operate on owned table.
+- [x] Non-owner cannot drop table without ownership.
 - [x] JOIN fails if any referenced table lacks `SELECT`.
 - [x] SHOW only returns visible objects.
 

@@ -162,15 +162,38 @@ pub fn parse_handshake_response(payload: &[u8]) -> Result<HandshakeResponse> {
         // Length-encoded string
         let (len, len_size) = crate::mysql_protocol::codec::decode_lenenc_int(&payload[pos..])?;
         pos += len_size;
-        let data = payload[pos..pos + len as usize].to_vec();
-        pos += len as usize;
+        let end = pos
+            .checked_add(len as usize)
+            .ok_or_else(|| NovaError::Internal {
+                message: "auth response length overflow".to_string(),
+            })?;
+        if end > payload.len() {
+            return Err(NovaError::Internal {
+                message: "auth response truncated".to_string(),
+            });
+        }
+        let data = payload[pos..end].to_vec();
+        pos = end;
         data
     } else if capabilities.supports_secure_connection() {
         // Length-prefixed (1 byte length)
+        if pos >= payload.len() {
+            return Err(NovaError::Internal {
+                message: "auth response length missing".to_string(),
+            });
+        }
         let len = payload[pos] as usize;
         pos += 1;
-        let data = payload[pos..pos + len].to_vec();
-        pos += len;
+        let end = pos.checked_add(len).ok_or_else(|| NovaError::Internal {
+            message: "auth response length overflow".to_string(),
+        })?;
+        if end > payload.len() {
+            return Err(NovaError::Internal {
+                message: "auth response truncated".to_string(),
+            });
+        }
+        let data = payload[pos..end].to_vec();
+        pos = end;
         data
     } else {
         // Null-terminated
@@ -219,9 +242,18 @@ pub fn parse_handshake_response(payload: &[u8]) -> Result<HandshakeResponse> {
             crate::mysql_protocol::codec::decode_lenenc_int(&payload[pos..])
     {
         pos += len_size;
-        let attrs_end = pos + attrs_len as usize;
+        let attrs_end = pos
+            .checked_add(attrs_len as usize)
+            .ok_or_else(|| NovaError::Internal {
+                message: "connect attributes length overflow".to_string(),
+            })?;
+        if attrs_end > payload.len() {
+            return Err(NovaError::Internal {
+                message: "connect attributes truncated".to_string(),
+            });
+        }
 
-        while pos < attrs_end && pos < payload.len() {
+        while pos < attrs_end {
             // Key
             if let Ok((key, key_size)) =
                 crate::mysql_protocol::codec::decode_lenenc_string(&payload[pos..])
@@ -283,6 +315,16 @@ pub fn build_auth_more_data(data: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    fn base_handshake_response_payload(capabilities: ClientCapabilities) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&capabilities.raw().to_le_bytes());
+        payload.extend_from_slice(&16_777_216u32.to_le_bytes());
+        payload.push(45);
+        payload.extend_from_slice(&[0u8; 23]);
+        payload.extend_from_slice(b"root\0");
+        payload
+    }
+
     #[test]
     fn test_build_handshake_packet() {
         let scramble = vec![1u8; 20];
@@ -303,6 +345,33 @@ mod tests {
         let packet = build_auth_switch_request("caching_sha2_password", &scramble);
 
         assert_eq!(packet[0], 0xfe); // Auth switch marker
+    }
+
+    #[test]
+    fn test_parse_handshake_response_rejects_truncated_secure_auth_response() {
+        let caps = ClientCapabilities::from_raw(
+            ClientCapabilities::PROTOCOL_41 | ClientCapabilities::SECURE_CONNECTION,
+        );
+        let mut payload = base_handshake_response_payload(caps);
+        payload.push(5);
+        payload.extend_from_slice(&[1, 2]);
+
+        assert!(parse_handshake_response(&payload).is_err());
+    }
+
+    #[test]
+    fn test_parse_handshake_response_rejects_truncated_connect_attrs() {
+        let caps = ClientCapabilities::from_raw(
+            ClientCapabilities::PROTOCOL_41
+                | ClientCapabilities::SECURE_CONNECTION
+                | ClientCapabilities::CONNECT_ATTRS,
+        );
+        let mut payload = base_handshake_response_payload(caps);
+        payload.push(0); // empty auth response
+        payload.push(4); // declared connect-attrs length
+        payload.push(1); // truncated key length without key/value bytes
+
+        assert!(parse_handshake_response(&payload).is_err());
     }
 
     #[test]
