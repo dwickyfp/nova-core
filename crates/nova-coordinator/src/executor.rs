@@ -233,12 +233,12 @@ impl Executor {
         Ok(false)
     }
 
-    async fn has_primary_role_privilege(
-        &self,
-        security: &SecurityContext,
-        object: ObjectRef,
-        privilege: SecurityPrivilege,
-    ) -> Result<bool> {
+    async fn require_primary_role_exists(&self, security: &SecurityContext) -> Result<()> {
+        if security.primary_role_id == ACCOUNTADMIN_ROLE_ID
+            && self.meta.get_role(ACCOUNTADMIN_ROLE_ID).await?.is_none()
+        {
+            self.meta.bootstrap_security().await?;
+        }
         if self
             .meta
             .get_role(security.primary_role_id)
@@ -250,6 +250,33 @@ impl Executor {
                 action: format!("use missing role {}", security.primary_role_id),
             });
         }
+        Ok(())
+    }
+
+    async fn set_primary_role_owner(
+        &self,
+        security: &SecurityContext,
+        object: ObjectRef,
+    ) -> Result<()> {
+        self.require_primary_role_exists(security).await?;
+        self.meta
+            .set_object_owner(ObjectOwnerMeta {
+                object,
+                owner_role_id: security.primary_role_id,
+                created_by_user_id: security.user_id,
+                created_at: now_micros(),
+                transferred_at: None,
+            })
+            .await
+    }
+
+    async fn has_primary_role_privilege(
+        &self,
+        security: &SecurityContext,
+        object: ObjectRef,
+        privilege: SecurityPrivilege,
+    ) -> Result<bool> {
+        self.require_primary_role_exists(security).await?;
         if security.primary_role_id == ACCOUNTADMIN_ROLE_ID {
             return Ok(true);
         }
@@ -1059,22 +1086,8 @@ impl Executor {
         };
         self.meta.create_database(db).await?;
         let created = self.find_database(&name).await?;
-        if self
-            .meta
-            .get_role(security.primary_role_id)
-            .await?
-            .is_some()
-        {
-            self.meta
-                .set_object_owner(ObjectOwnerMeta {
-                    object: ObjectRef::new(ObjectType::Database, created.id),
-                    owner_role_id: security.primary_role_id,
-                    created_by_user_id: security.user_id,
-                    created_at: now_micros(),
-                    transferred_at: None,
-                })
-                .await?;
-        }
+        self.set_primary_role_owner(security, ObjectRef::new(ObjectType::Database, created.id))
+            .await?;
         Ok(QueryResult::Success {
             message: format!("Database '{}' created", name),
         })
@@ -1110,14 +1123,21 @@ impl Executor {
             };
             self.meta.create_schema(s).await?;
             // Re-fetch to get auto-assigned ID
-            self.meta
+            let created_schema = self
+                .meta
                 .list_schemas(db_meta.id)
                 .await?
                 .into_iter()
                 .find(|s| s.name == schema)
                 .ok_or_else(|| NovaError::SchemaNotFound {
                     schema_name: schema.clone(),
-                })?
+                })?;
+            self.set_primary_role_owner(
+                security,
+                ObjectRef::new(ObjectType::Schema, created_schema.id),
+            )
+            .await?;
+            created_schema
         };
 
         // Create table
@@ -1148,22 +1168,8 @@ impl Executor {
         };
         self.meta.create_table(t).await?;
         let created = self.find_table(&db, &schema, &table).await?;
-        if self
-            .meta
-            .get_role(security.primary_role_id)
-            .await?
-            .is_some()
-        {
-            self.meta
-                .set_object_owner(ObjectOwnerMeta {
-                    object: ObjectRef::new(ObjectType::Table, created.id),
-                    owner_role_id: security.primary_role_id,
-                    created_by_user_id: security.user_id,
-                    created_at: now_micros(),
-                    transferred_at: None,
-                })
-                .await?;
-        }
+        self.set_primary_role_owner(security, ObjectRef::new(ObjectType::Table, created.id))
+            .await?;
 
         Ok(QueryResult::Success {
             message: format!("Table '{}.{}.{}' created", db, schema, table),
@@ -2721,6 +2727,8 @@ impl Executor {
 
         // Re-fetch to get the assigned table ID
         let created = self.find_table(db, schema, clone_table).await?;
+        self.set_primary_role_owner(security, ObjectRef::new(ObjectType::Table, created.id))
+            .await?;
 
         // Link source MPs to clone (zero-copy: same S3 paths)
         for mp in &source_mps {
@@ -2807,22 +2815,8 @@ impl Executor {
                 },
             )
             .await?;
-        if self
-            .meta
-            .get_role(security.primary_role_id)
-            .await?
-            .is_some()
-        {
-            self.meta
-                .set_object_owner(ObjectOwnerMeta {
-                    object: ObjectRef::new(ObjectType::Stream, stream_id),
-                    owner_role_id: security.primary_role_id,
-                    created_by_user_id: security.user_id,
-                    created_at: now_micros(),
-                    transferred_at: None,
-                })
-                .await?;
-        }
+        self.set_primary_role_owner(security, ObjectRef::new(ObjectType::Stream, stream_id))
+            .await?;
 
         Ok(QueryResult::Success {
             message: format!(
@@ -3079,23 +3073,22 @@ impl Executor {
             created_at: now_micros(),
             scheduler_enabled: true,
         };
-        self.meta.create_dynamic_table(dt).await?;
-        if self
-            .meta
-            .get_role(security.primary_role_id)
-            .await?
-            .is_some()
-        {
-            self.meta
-                .set_object_owner(ObjectOwnerMeta {
-                    object: ObjectRef::new(ObjectType::DynamicTable, dt_id),
-                    owner_role_id: security.primary_role_id,
-                    created_by_user_id: security.user_id,
-                    created_at: now_micros(),
-                    transferred_at: None,
-                })
-                .await?;
+        if let Err(err) = self.meta.create_dynamic_table(dt.clone()).await {
+            let _ = self.meta.drop_table(output_table_id).await;
+            return Err(err);
         }
+        let dt_id = self
+            .meta
+            .list_dynamic_tables(db_meta.id)
+            .await?
+            .into_iter()
+            .find(|dt| dt.schema_id == schema_meta.id && dt.name == name)
+            .ok_or_else(|| NovaError::Internal {
+                message: format!("dynamic table '{}' was not created", name),
+            })?
+            .id;
+        self.set_primary_role_owner(security, ObjectRef::new(ObjectType::DynamicTable, dt_id))
+            .await?;
 
         // 4. Immediate initial refresh if requested
         if initialize_on_create {

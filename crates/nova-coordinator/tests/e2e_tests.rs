@@ -255,6 +255,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task2b_create_table_implicit_schema_records_primary_role_owner() {
+        let (executor, _dir) = setup();
+
+        exec_sql(&executor, "CREATE DATABASE securedb", "securedb")
+            .await
+            .unwrap();
+        let db_meta = executor
+            .meta()
+            .list_databases()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|db| db.name == "securedb")
+            .unwrap();
+        let role_id = create_role(&executor, "implicit_schema_owner_role").await;
+        grant(
+            &executor,
+            role_id,
+            nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+            nova_common::SecurityPrivilege::Usage,
+        )
+        .await;
+        grant(
+            &executor,
+            role_id,
+            nova_common::ObjectRef::new(nova_common::ObjectType::Database, db_meta.id),
+            nova_common::SecurityPrivilege::CreateSchema,
+        )
+        .await;
+        let owner = context_for(role_id, "implicit_schema_owner_user");
+
+        exec_sql_as(
+            &executor,
+            "CREATE TABLE missing_schema.owned_table (id INT)",
+            "securedb",
+            &owner,
+        )
+        .await
+        .expect("primary role with CREATE SCHEMA should create missing schema and table");
+
+        let schema_meta = executor
+            .meta()
+            .list_schemas(db_meta.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|schema| schema.name == "missing_schema")
+            .unwrap();
+        let owner_meta = executor
+            .meta()
+            .get_object_owner(nova_common::ObjectRef::new(
+                nova_common::ObjectType::Schema,
+                schema_meta.id,
+            ))
+            .await
+            .unwrap()
+            .expect("implicit schema should record an object owner");
+        assert_eq!(owner_meta.owner_role_id, role_id);
+        assert_eq!(owner_meta.created_by_user_id, owner.user_id);
+    }
+
+    #[tokio::test]
+    async fn task2b_create_database_fails_when_primary_role_is_missing() {
+        let (executor, _dir) = setup();
+        executor.meta().bootstrap_security().await.unwrap();
+        let missing_role = nova_common::ACCOUNTADMIN_ROLE_ID + 9_999_999;
+        let security = context_for(missing_role, "missing_primary_role_user");
+
+        let err = exec_sql_as(&executor, "CREATE DATABASE orphaned", "orphaned", &security)
+            .await
+            .expect_err("missing primary role must fail before creating ownerless objects");
+        assert!(
+            matches!(err, nova_common::NovaError::PermissionDenied { .. }),
+            "expected PermissionDenied, got {err:?}"
+        );
+        assert!(
+            executor
+                .meta()
+                .list_databases()
+                .await
+                .unwrap()
+                .into_iter()
+                .all(|db| db.name != "orphaned")
+        );
+    }
+
+    #[tokio::test]
     async fn test_non_admin_cannot_alter_table() {
         let (executor, _dir) = setup();
 
