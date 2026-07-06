@@ -359,21 +359,14 @@ impl FdbMetadataStore {
             })
     }
 
-    async fn atomic_grant_privileges(
-        &self,
-        grant: GrantSetMeta,
-        object_generation: u64,
-        current_object_created_at: Option<u64>,
-    ) -> Result<()> {
-        let grant_key = self.grant_key(grant.role_id, grant.object, object_generation);
-        let reverse_key = self.grant_by_object_key(grant.role_id, grant.object, object_generation);
-        let legacy_grant_key = self.pack(&(
+    async fn atomic_grant_privileges(&self, grant: GrantSetMeta) -> Result<()> {
+        let grant_key = self.pack(&(
             "grant",
             grant.role_id,
             Self::object_type_key(grant.object.object_type),
             grant.object.object_id,
         ));
-        let legacy_reverse_key = self.pack(&(
+        let reverse_key = self.pack(&(
             "grant_by_object",
             Self::object_type_key(grant.object.object_type),
             grant.object.object_id,

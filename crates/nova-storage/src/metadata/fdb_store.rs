@@ -812,6 +812,27 @@ impl MetadataStore for FdbMetadataStore {
         Ok(visible)
     }
 
+    async fn replace_active_mps(
+        &self,
+        table_id: TableId,
+        new_mps: Vec<MicroPartitionMeta>,
+    ) -> Result<()> {
+        let active_mps = self.get_active_mps(table_id).await?;
+        let mut writes = Vec::with_capacity(active_mps.len() + new_mps.len());
+        for mut mp in active_mps {
+            mp.active = false;
+            writes.push((self.pack(&("mp", mp.mp_id)), Self::serialize(&mp)?));
+        }
+        for mut mp in new_mps {
+            mp.table_id = table_id;
+            let mp_key = self.pack(&("mp", mp.mp_id));
+            let idx_key = self.pack(&("table_mps", table_id, mp.mp_id));
+            writes.push((mp_key, Self::serialize(&mp)?));
+            writes.push((idx_key, Vec::new()));
+        }
+        self.fdb_write_batch(writes, vec![], true).await.map(|_| ())
+    }
+
     async fn mark_superseded(&self, old_mp_id: MpId, new_mp_id: MpId) -> Result<()> {
         let old_mp = self.get_mp(old_mp_id).await?.ok_or(NovaError::MpNotFound {
             table_id: 0,
@@ -1383,6 +1404,43 @@ impl MetadataStore for FdbMetadataStore {
 
     async fn update_dynamic_table(&self, dt: DynamicTableMeta) -> Result<()> {
         self.create_dynamic_table(dt).await
+    }
+
+    async fn begin_dynamic_table_refresh(
+        &self,
+        mut dt: DynamicTableMeta,
+    ) -> Result<DynamicTableMeta> {
+        dt.refresh_status = DtRefreshStatus::Running;
+        self.update_dynamic_table(dt.clone()).await?;
+        Ok(dt)
+    }
+
+    async fn finish_dynamic_table_refresh(
+        &self,
+        mut dt: DynamicTableMeta,
+        _previous_last_refresh_ts: Option<Timestamp>,
+    ) -> Result<()> {
+        dt.refresh_status = DtRefreshStatus::Success;
+        dt.last_refresh_ts = Some(now_micros());
+        self.update_dynamic_table(dt).await
+    }
+
+    async fn finish_dynamic_table_refresh_with_mps(
+        &self,
+        dt: DynamicTableMeta,
+        previous_last_refresh_ts: Option<Timestamp>,
+        new_mps: Vec<MicroPartitionMeta>,
+        replace_active_set: bool,
+    ) -> Result<()> {
+        if replace_active_set {
+            self.replace_active_mps(dt.output_table_id, new_mps).await?;
+        } else {
+            for mp in new_mps {
+                self.insert_mp(mp).await?;
+            }
+        }
+        self.finish_dynamic_table_refresh(dt, previous_last_refresh_ts)
+            .await
     }
 
     async fn drop_dynamic_table(&self, dt_id: TableId) -> Result<()> {

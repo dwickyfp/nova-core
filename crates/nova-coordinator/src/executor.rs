@@ -781,8 +781,15 @@ impl Executor {
                     SecurityPrivilege::CreateTable,
                 )
                 .await?;
-                self.exec_clone(&db, &schema, &clone_table, &source_table, at_timestamp)
-                    .await
+                self.exec_clone(
+                    security,
+                    &db,
+                    &schema,
+                    &clone_table,
+                    &source_table,
+                    at_timestamp,
+                )
+                .await
             }
             ResolvedStatement::CreateStream {
                 db,
@@ -2700,6 +2707,7 @@ impl Executor {
     /// Supports AT(TIMESTAMP => ...) for cloning at a point in time.
     async fn exec_clone(
         &self,
+        security: &SecurityContext,
         db: &str,
         schema: &str,
         clone_table: &str,
@@ -3120,6 +3128,62 @@ impl Executor {
                 name, target_lag_seconds, refresh_mode
             ),
         })
+    }
+
+    pub fn dynamic_table_uses_source_watermark(dt: &DynamicTableMeta) -> Result<bool> {
+        Ok(matches!(
+            dt.refresh_mode,
+            DtRefreshMode::Auto | DtRefreshMode::Incremental
+        ))
+    }
+
+    pub async fn dynamic_table_source_backlog_watermark(
+        &self,
+        dt: &DynamicTableMeta,
+    ) -> Result<Option<Timestamp>> {
+        let max_commit_ts = self
+            .meta
+            .get_active_mps(dt.output_table_id)
+            .await?
+            .into_iter()
+            .map(|mp| mp.commit_ts)
+            .max();
+        Ok(max_commit_ts)
+    }
+
+    pub async fn exec_refresh_dynamic_table_meta(
+        &self,
+        dt: DynamicTableMeta,
+    ) -> Result<QueryResult> {
+        let started = self.meta.begin_dynamic_table_refresh(dt).await?;
+        let previous_last_refresh_ts = started.last_refresh_ts;
+        let result = self
+            .exec_refresh_dynamic_table_by_id(
+                started.id,
+                &started.query_definition,
+                started.output_table_id,
+                started.refresh_mode,
+            )
+            .await;
+        match result {
+            Ok(rows) => {
+                self.meta
+                    .finish_dynamic_table_refresh(started, previous_last_refresh_ts)
+                    .await?;
+                Ok(QueryResult::Success {
+                    message: format!("Dynamic table refreshed ({} rows)", rows),
+                })
+            }
+            Err(err) => {
+                let mut failed = started;
+                failed.refresh_status = DtRefreshStatus::Failed {
+                    error: err.to_string(),
+                };
+                failed.last_refresh_ts = Some(now_micros());
+                self.meta.update_dynamic_table(failed).await?;
+                Err(err)
+            }
+        }
     }
 
     /// Refresh a dynamic table by name (called from ALTER DT REFRESH + scheduler).
