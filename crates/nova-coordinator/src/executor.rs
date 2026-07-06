@@ -1078,6 +1078,8 @@ impl Executor {
         security: &SecurityContext,
         name: String,
     ) -> Result<QueryResult> {
+        self.require_primary_role_exists(security).await?;
+
         let db = DatabaseMeta {
             id: 0,
             name: name.clone(),
@@ -1101,6 +1103,8 @@ impl Executor {
         table: String,
         columns: Vec<crate::analyzer::ResolvedColumn>,
     ) -> Result<QueryResult> {
+        self.require_primary_role_exists(security).await?;
+
         // Find database
         let dbs = self.meta.list_databases().await?;
         let db_meta =
@@ -2702,6 +2706,8 @@ impl Executor {
         source_table: &str,
         at_timestamp: Option<u64>,
     ) -> Result<QueryResult> {
+        self.require_primary_role_exists(security).await?;
+
         let source_meta = self.find_table(db, schema, source_table).await?;
 
         // Get source MPs (current or at timestamp)
@@ -2784,6 +2790,8 @@ impl Executor {
         table: &str,
         _append_only: bool,
     ) -> Result<QueryResult> {
+        self.require_primary_role_exists(security).await?;
+
         let table_meta = self.find_table(db, schema, table).await?;
         let stream_id = generate_id();
         let now = now_micros();
@@ -3019,6 +3027,8 @@ impl Executor {
         initialize_on_create: bool,
     ) -> Result<QueryResult> {
         use nova_common::{DtRefreshStatus, DynamicTableMeta, generate_id, now_micros};
+
+        self.require_primary_role_exists(security).await?;
         // 1. Resolve db + schema to get IDs
         let db_meta = self
             .meta
@@ -3054,6 +3064,8 @@ impl Executor {
             properties: std::collections::HashMap::new(),
         };
         self.meta.create_table(output_table).await?;
+        self.set_primary_role_owner(security, ObjectRef::new(ObjectType::Table, output_table_id))
+            .await?;
 
         // 3. Store DynamicTableMeta
         let dt_id = generate_id();
