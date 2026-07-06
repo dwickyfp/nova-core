@@ -375,6 +375,30 @@ SELECT SYSTEM$STREAM_HAS_DATA('orders_stream');
 
 Stream rows include source columns plus metadata columns: `METADATA$ACTION`, `METADATA$ISUPDATE`, `METADATA$ROW_ID`, `METADATA$TXN_ID`, `METADATA$COMMIT_TS`, and `METADATA$SEQUENCE`. UPDATE emits a `DELETE` row for the old version and an `INSERT` row for the new version, both with `METADATA$ISUPDATE = true`. Filter/projection/LIMIT can reduce returned rows, but a consuming `SELECT` still commits the full unconsumed backlog.
 
+### SQL Functions & RBAC
+
+Create SQL scalar functions and manage invocation access with FUNCTION-scoped RBAC grants.
+
+```sql
+-- Create a SQL scalar function
+CREATE FUNCTION add_one(x INT)
+RETURNS INT
+LANGUAGE SQL
+AS 'x + 1';
+
+-- Grant invocation access to a role
+GRANT USAGE ON FUNCTION add_one(INT) TO ROLE analyst;
+
+-- Inspect FUNCTION grants
+SHOW GRANTS ON FUNCTION add_one(INT);
+SHOW GRANTS TO ROLE analyst;
+
+-- Revoke invocation access
+REVOKE USAGE ON FUNCTION add_one(INT) FROM ROLE analyst;
+```
+
+This increment supports `USAGE` on `FUNCTION` only. Generic object grants, grant options, `GRANTED BY`, and `CASCADE` are not supported yet.
+
 ### Garbage Collection & Auto Compaction
 
 Nova uses **immutable copy-on-write micro-partitions (MPs)**. Every UPDATE/DELETE creates new MPs and marks old ones as superseded — they are kept for Time Travel but accumulate over time. GC removes superseded MPs older than the retention window.
