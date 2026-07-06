@@ -98,3 +98,24 @@ STATUS: DONE
 
 ## Concerns
 - Cargo output was abbreviated by the harness for successful commands, but all requested commands returned exit 0.
+
+---
+
+# Task 1 Review Fix Report: Fail-closed role hierarchy revokes/lists
+
+STATUS: DONE
+
+## Fixes
+- `atomic_revoke_role_from_role` now deserializes the existing `role_child(parent, child)` `RoleGrantMeta` before clearing hierarchy indexes or bumping `security_epoch`.
+- `list_role_children(parent_role_id)` now validates the parent role exists before scanning child edges.
+- Added regression coverage for corrupt role-child revoke preserving epoch and missing-parent child listing failing closed.
+- Added rustdoc comments for public `SecurityStore` role hierarchy methods.
+
+## Verification
+- `NOVA_FDB_CLUSTER_FILE='docker:docker@127.0.0.1:4500' cargo test -p nova-storage role_inheritance` — exit 0
+- `cargo test -p nova-storage` — exit 0
+- `cargo clippy -p nova-storage -- -D warnings` — exit 0
+- `cargo fmt --all -- --check` — exit 0
+
+## Concerns
+- Cargo output was abbreviated by the harness for successful commands, but all requested commands returned exit 0.

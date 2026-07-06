@@ -277,17 +277,31 @@ pub trait SecurityStore: Send + Sync {
     ) -> Result<()>;
     async fn revoke_role_from_user(&self, user_id: UserId, role_id: RoleId) -> Result<()>;
     async fn list_user_roles(&self, user_id: UserId) -> Result<Vec<RoleId>>;
+    /// Grants `child_role_id` to `parent_role_id`, making the parent inherit the child role.
+    ///
+    /// Implementations must validate all referenced roles, reject cycles, write role hierarchy
+    /// indexes, and bump the security epoch atomically. Missing or corrupt metadata must fail
+    /// closed without partially updating hierarchy state.
     async fn grant_role_to_role(
         &self,
         parent_role_id: RoleId,
         child_role_id: RoleId,
         granted_by: RoleId,
     ) -> Result<()>;
+    /// Revokes `child_role_id` from `parent_role_id`.
+    ///
+    /// Implementations must validate the parent, child, and existing hierarchy edge before
+    /// clearing indexes and bumping the security epoch atomically. A missing edge is a no-op;
+    /// missing or corrupt role/edge metadata must fail closed.
     async fn revoke_role_from_role(
         &self,
         parent_role_id: RoleId,
         child_role_id: RoleId,
     ) -> Result<()>;
+    /// Lists direct child roles inherited by `parent_role_id`.
+    ///
+    /// Implementations must validate the parent role and each stored child edge before returning
+    /// results. Missing or corrupt hierarchy metadata must fail closed.
     async fn list_role_children(&self, parent_role_id: RoleId) -> Result<Vec<RoleId>>;
     async fn set_object_owner(&self, owner: ObjectOwnerMeta) -> Result<()>;
     async fn get_object_owner(&self, object: ObjectRef) -> Result<Option<ObjectOwnerMeta>>;

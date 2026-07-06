@@ -322,14 +322,15 @@ impl FdbMetadataStore {
                             .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
                     }
 
-                    if trx
+                    let Some(parent_child_value) = trx
                         .get(&parent_child_key, false)
                         .await
                         .map_err(fdb::FdbBindingError::from)?
-                        .is_none()
-                    {
+                    else {
                         return Ok::<(), fdb::FdbBindingError>(());
-                    }
+                    };
+                    bincode::deserialize::<RoleGrantMeta>(parent_child_value.as_ref())
+                        .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
 
                     trx.clear(&parent_child_key);
                     trx.clear(&role_parent_key);
@@ -776,6 +777,11 @@ impl SecurityStore for FdbMetadataStore {
     }
 
     async fn list_role_children(&self, parent_role_id: RoleId) -> Result<Vec<RoleId>> {
+        let Some(_) = self.get_role(parent_role_id).await? else {
+            return Err(NovaError::Internal {
+                message: format!("role parent not found: {}", parent_role_id),
+            });
+        };
         let (start, end) = self.category_range(&("role_child", parent_role_id));
         let mut children = vec![];
         for (key, value) in self.fdb_get_range(start, end).await? {
@@ -1221,6 +1227,47 @@ mod tests {
         assert!(
             store
                 .grant_role_to_role(grandchild, parent, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_revoke_rejects_corrupt_child_grant_metadata() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_revoke_child_corrupt_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let parent = store.create_role(role("parent_role")).await?;
+        let child = store.create_role(role("child_role")).await?;
+        store
+            .grant_role_to_role(parent, child, ACCOUNTADMIN_ROLE_ID)
+            .await?;
+        let epoch_before = store.security_epoch().await?;
+        store
+            .fdb_set(store.pack(&("role_child", parent, child)), vec![1, 2, 3])
+            .await?;
+
+        assert!(store.revoke_role_from_role(parent, child).await.is_err());
+        assert_eq!(store.security_epoch().await?, epoch_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_list_rejects_missing_parent() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_list_missing_parent_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+
+        assert!(
+            store
+                .list_role_children(PUBLIC_ROLE_ID + 10_000)
                 .await
                 .is_err()
         );
