@@ -243,6 +243,21 @@ impl FdbMetadataStore {
                             let unpacked: (String, RoleId, RoleId) = subspace
                                 .unpack(kv.key())
                                 .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
+                            let child_role_key = subspace.pack(&("role", unpacked.2));
+                            let Some(child_role_value) = trx
+                                .get(&child_role_key, false)
+                                .await
+                                .map_err(fdb::FdbBindingError::from)?
+                            else {
+                                return Err(fdb::FdbBindingError::CustomError(Box::new(
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::NotFound,
+                                        "role child not found",
+                                    ),
+                                )));
+                            };
+                            bincode::deserialize::<RoleMeta>(child_role_value.as_ref())
+                                .map_err(|e| fdb::FdbBindingError::CustomError(Box::new(e)))?;
                             queue.push_back((unpacked.2, depth + 1));
                         }
                     }
@@ -771,6 +786,11 @@ impl SecurityStore for FdbMetadataStore {
                     .map_err(|e| NovaError::Internal {
                         message: format!("FDB tuple unpack failed: {}", e),
                     })?;
+            if self.get_role(unpacked.2).await?.is_none() {
+                return Err(NovaError::Internal {
+                    message: format!("role child not found: {}", unpacked.2),
+                });
+            }
             children.push(unpacked.2);
         }
         Ok(children)
@@ -1201,6 +1221,54 @@ mod tests {
         assert!(
             store
                 .grant_role_to_role(grandchild, parent, ACCOUNTADMIN_ROLE_ID)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_rejects_dangling_child_edge_on_list() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_child_dangling_list_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let parent = store.create_role(role("parent_role")).await?;
+        let child = store.create_role(role("child_role")).await?;
+        store
+            .grant_role_to_role(parent, child, ACCOUNTADMIN_ROLE_ID)
+            .await?;
+        store
+            .fdb_write_batch(vec![], vec![store.pack(&("role", child))], false)
+            .await?;
+
+        assert!(store.list_role_children(parent).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn role_inheritance_rejects_dangling_child_edge_on_closure_scan() -> Result<()> {
+        let Ok(cluster_file) = std::env::var("NOVA_FDB_CLUSTER_FILE") else {
+            return Ok(());
+        };
+        let subspace = format!("nova_test_role_child_dangling_scan_{}", now_micros()).into_bytes();
+        let store = FdbMetadataStore::open_test(&cluster_file, subspace)?;
+        store.bootstrap_security().await?;
+        let parent = store.create_role(role("parent_role")).await?;
+        let child = store.create_role(role("child_role")).await?;
+        let grandchild = store.create_role(role("grandchild_role")).await?;
+        store
+            .grant_role_to_role(child, grandchild, ACCOUNTADMIN_ROLE_ID)
+            .await?;
+        store
+            .fdb_write_batch(vec![], vec![store.pack(&("role", grandchild))], false)
+            .await?;
+
+        assert!(
+            store
+                .grant_role_to_role(parent, child, ACCOUNTADMIN_ROLE_ID)
                 .await
                 .is_err()
         );
