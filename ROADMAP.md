@@ -24,7 +24,7 @@
 | 13 | Dynamic Tables | — | ✅ Complete | CREATE/ALTER/DROP/SHOW DYNAMIC TABLE + scheduler |
 | 14 | Production Deployment | — | ✅ Complete | Docker Rust 1.91, fixed worker gRPC args |
 | 15 | Distributed Cluster Wire-up | — | ✅ Complete | Raft gRPC server mounted, AutoScaler loop wired |
-| 16 | Enterprise Security & Governance | — | 📋 Planned | Snowflake-style RBAC, policies, tags, audit, identity |
+| 16 | Enterprise Security & Governance | — | 🚧 In Progress | Snowflake-style RBAC, policies, tags, audit, identity |
 | 17 | Enterprise Task Orchestration | — | 📋 Planned | Snowflake-style TASK, scheduler, stream triggers, DAGs, RBAC, audit |
 | 18 | Snowflake MERGE INTO | — | 📋 Planned | Snowflake-compatible MERGE subset, deterministic duplicate handling, RBAC, TASK integration |
 
@@ -480,8 +480,8 @@
 - [ ] Store object ownership as role-owned metadata, not user-owned metadata
 - [ ] Assign every new object to the session primary role as owner
 - [ ] Migrate legacy objects without ownership metadata to `ACCOUNTADMIN` ownership
-- [ ] Implement role-to-user grants and role-to-role hierarchy grants
-- [ ] Implement role inheritance traversal with cycle detection and recursion/depth guards
+- [x] Implement role-to-user grants and role-to-role hierarchy grants
+- [x] Implement role inheritance traversal with cycle detection and recursion/depth guards
 - [ ] Add security epoch and bump it on user, role, grant, revoke, ownership, policy, and tag changes
 - [ ] Add authorization cache keyed by security epoch
 - [ ] Add negative tests for missing grants, stale cache, role hierarchy cycles, and dropped roles
@@ -495,7 +495,7 @@
 - [ ] Implement `USE SECONDARY ROLES NONE | ALL` and reserve explicit secondary role lists
 - [ ] Implement `current_user()`, `current_role()`, `current_secondary_roles()`, and `is_role_in_session()`
 - [ ] Enforce Snowflake-style rule: `CREATE` authorization and new object ownership use primary role only
-- [ ] Enforce non-CREATE authorization using primary role plus active secondary roles and inherited roles
+- [x] Enforce non-CREATE authorization using primary role plus active secondary roles and inherited roles
 - [ ] Add tests for role switching, secondary role activation, inherited privileges, and unauthorized role activation
 
 ### Milestone 16.3: Grant Management
