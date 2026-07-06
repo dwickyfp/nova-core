@@ -233,6 +233,38 @@ impl Executor {
         Ok(false)
     }
 
+    async fn has_primary_role_privilege(
+        &self,
+        security: &SecurityContext,
+        object: ObjectRef,
+        privilege: SecurityPrivilege,
+    ) -> Result<bool> {
+        if self
+            .meta
+            .get_role(security.primary_role_id)
+            .await?
+            .is_none()
+        {
+            return Err(NovaError::PermissionDenied {
+                user: security.username.clone(),
+                action: format!("use missing role {}", security.primary_role_id),
+            });
+        }
+        if security.primary_role_id == ACCOUNTADMIN_ROLE_ID {
+            return Ok(true);
+        }
+        if let Some(owner) = self.meta.get_object_owner(object).await?
+            && owner.owner_role_id == security.primary_role_id
+        {
+            return Ok(true);
+        }
+        Ok(self
+            .meta
+            .get_grant(security.primary_role_id, object)
+            .await?
+            .is_some_and(|grant| grant.privileges.contains(privilege)))
+    }
+
     async fn require_privilege(
         &self,
         security: &SecurityContext,
@@ -247,6 +279,28 @@ impl Executor {
                 action: format!(
                     "{} on {}:{}",
                     privilege, object.object_type, object.object_id
+                ),
+            })
+        }
+    }
+
+    async fn require_primary_role_privilege(
+        &self,
+        security: &SecurityContext,
+        object: ObjectRef,
+        privilege: SecurityPrivilege,
+    ) -> Result<()> {
+        if self
+            .has_primary_role_privilege(security, object, privilege)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(NovaError::PermissionDenied {
+                user: security.username.clone(),
+                action: format!(
+                    "{} on {}:{} with primary role {}",
+                    privilege, object.object_type, object.object_id, security.primary_role_id
                 ),
             })
         }
@@ -414,7 +468,7 @@ impl Executor {
     ) -> Result<QueryResult> {
         match stmt {
             ResolvedStatement::CreateDatabase { name } => {
-                self.require_privilege(
+                self.require_primary_role_privilege(
                     security,
                     ObjectRef::new(ObjectType::Account, ACCOUNT_OBJECT_ID),
                     SecurityPrivilege::CreateDatabase,
@@ -430,14 +484,14 @@ impl Executor {
             } => {
                 let db_meta = self.find_database(&db).await?;
                 if let Ok(schema_meta) = self.find_schema_meta(db_meta.id, &schema).await {
-                    self.require_privilege(
+                    self.require_primary_role_privilege(
                         security,
                         ObjectRef::new(ObjectType::Schema, schema_meta.id),
                         SecurityPrivilege::CreateTable,
                     )
                     .await?;
                 } else {
-                    self.require_privilege(
+                    self.require_primary_role_privilege(
                         security,
                         ObjectRef::new(ObjectType::Database, db_meta.id),
                         SecurityPrivilege::CreateSchema,
@@ -694,7 +748,7 @@ impl Executor {
                 .await?;
                 let db_meta = self.find_database(&db).await?;
                 let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
-                self.require_privilege(
+                self.require_primary_role_privilege(
                     security,
                     ObjectRef::new(ObjectType::Schema, schema_meta.id),
                     SecurityPrivilege::CreateTable,
@@ -714,7 +768,7 @@ impl Executor {
                     .await?;
                 let db_meta = self.find_database(&db).await?;
                 let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
-                self.require_privilege(
+                self.require_primary_role_privilege(
                     security,
                     ObjectRef::new(ObjectType::Schema, schema_meta.id),
                     SecurityPrivilege::CreateStream,
@@ -927,7 +981,7 @@ impl Executor {
             } => {
                 let db_meta = self.find_database(&db).await?;
                 let schema_meta = self.find_schema_meta(db_meta.id, &schema).await?;
-                self.require_privilege(
+                self.require_primary_role_privilege(
                     security,
                     ObjectRef::new(ObjectType::Schema, schema_meta.id),
                     SecurityPrivilege::CreateDynamicTable,
